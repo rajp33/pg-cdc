@@ -81,3 +81,67 @@ async fn an_unwritable_root_reports_the_store_unavailable() -> TestResult {
     ));
     Ok(())
 }
+
+#[cfg(unix)]
+mod unsyncable_directories {
+    use std::fs::{self, File, Permissions};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    use super::{
+        FilesystemStateStore, ParkStatus, StateStore, StoreError, TestResult, event, id, key,
+    };
+
+    fn can_open(dir: &Path) -> bool {
+        File::open(dir).is_ok()
+    }
+
+    #[tokio::test]
+    async fn an_append_that_finds_the_entry_linked_still_syncs_the_directory() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let store = FilesystemStateStore::new(dir.path(), "orders", 4);
+        let queue = key(0x01, 1)?;
+        let parked = event(queue, id(7, 0), ParkStatus::Retrying);
+        store.append_parked(std::slice::from_ref(&parked)).await?;
+        let queue_dir = dir
+            .path()
+            .join("orders")
+            .join("parked")
+            .join(queue.to_string());
+        fs::set_permissions(&queue_dir, Permissions::from_mode(0o300))?;
+        let unsyncable = !can_open(&queue_dir);
+        let result = store.append_parked(std::slice::from_ref(&parked)).await;
+        fs::set_permissions(&queue_dir, Permissions::from_mode(0o700))?;
+        if unsyncable {
+            assert!(
+                matches!(result, Err(StoreError::Unavailable(_))),
+                "{result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_append_into_an_existing_queue_directory_syncs_its_parent() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let store = FilesystemStateStore::new(dir.path(), "orders", 4);
+        let queue = key(0x01, 1)?;
+        store
+            .append_parked(&[event(queue, id(7, 0), ParkStatus::Retrying)])
+            .await?;
+        let parked_dir = dir.path().join("orders").join("parked");
+        fs::set_permissions(&parked_dir, Permissions::from_mode(0o300))?;
+        let unsyncable = !can_open(&parked_dir);
+        let result = store
+            .append_parked(&[event(queue, id(8, 0), ParkStatus::Retrying)])
+            .await;
+        fs::set_permissions(&parked_dir, Permissions::from_mode(0o700))?;
+        if unsyncable {
+            assert!(
+                matches!(result, Err(StoreError::Unavailable(_))),
+                "{result:?}"
+            );
+        }
+        Ok(())
+    }
+}

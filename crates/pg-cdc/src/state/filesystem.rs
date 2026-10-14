@@ -81,9 +81,6 @@ fn temp_path(dir: &Path, name: &str) -> PathBuf {
 }
 
 fn ensure_dir(root: &Path, dir: &Path) -> Result<(), StoreError> {
-    if dir.is_dir() {
-        return Ok(());
-    }
     fs::create_dir_all(dir).map_err(|error| unavailable(dir, &error))?;
     for ancestor in dir.ancestors().skip(1) {
         sync_dir(ancestor)?;
@@ -112,7 +109,7 @@ fn create_once(root: &Path, dir: &Path, name: &str, bytes: &[u8]) -> Result<(), 
         let _ = fs::remove_file(&temp);
         return match linked {
             Ok(()) => sync_dir(dir),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => sync_dir(dir),
             Err(error) => Err(unavailable(&target, &error)),
         };
     }
