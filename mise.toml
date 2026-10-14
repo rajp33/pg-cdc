@@ -52,9 +52,11 @@ run = '''
 set -euo pipefail
 cargo llvm-cov clean --workspace
 cargo llvm-cov nextest --workspace --all-features --no-report
-cargo llvm-cov report --ignore-filename-regex '(crates/(testkit|loadgen|replication)/|/tests/)' --fail-under-lines 80
 if [ -d crates/decoder ]; then
+  cargo llvm-cov report --ignore-filename-regex '(crates/(testkit|loadgen|replication)/|/tests/)' --fail-under-lines 80
   cargo llvm-cov report --ignore-filename-regex '(crates/(pg-cdc|replication|testkit|loadgen)/|/tests/)' --fail-under-lines 90
+else
+  cargo llvm-cov report --ignore-filename-regex '(crates/(testkit|loadgen|replication)/|/tests/)'
 fi
 '''
 

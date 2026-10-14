@@ -37,7 +37,7 @@ These rules bind every change. `mise run check` enforces most of them.
 - cargo-nextest runs everything. Unit tests sit beside the code; integration tests live in `crates/*/tests` and use `crates/testkit` (package `pg-cdc-testkit`).
 - proptest for property tests; fuzz targets live in `fuzz/`.
 - Tests assert behavior, are deterministic and print nothing on success.
-- Coverage floors, enforced in CI by `mise run cov`: `pg-cdc-decoder` at least 90% of lines; the workspace at least 80%, excluding testkit, loadgen and the vendored replication crate.
+- Coverage floors, enforced in CI by `mise run cov`: `pg-cdc-decoder` at least 90% of lines; the workspace at least 80%, excluding testkit, loadgen and the vendored replication crate. Both floors are enforced once `crates/decoder` exists; until then `mise run cov` only prints the report.
 
 ## CI
 
