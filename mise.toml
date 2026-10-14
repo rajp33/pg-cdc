@@ -16,8 +16,8 @@ FUZZ_TOOLCHAIN = "nightly-2026-10-01"
 description = "Format Rust and TOML sources"
 run = ["cargo fmt --all", "taplo fmt"]
 
-[tasks.lint]
-description = "The gate without tests"
+[tasks.lint-code]
+description = "Formatting, spelling, clippy and docs"
 env = { RUSTDOCFLAGS = "-D warnings" }
 run = [
   "cargo fmt --all --check",
@@ -25,9 +25,15 @@ run = [
   "typos",
   "cargo clippy --workspace --all-targets --all-features -- -D warnings",
   "cargo doc --workspace --no-deps --all-features",
-  "cargo deny check",
-  "cargo machete",
 ]
+
+[tasks.lint-deps]
+description = "Supply-chain and unused-dependency checks"
+run = ["cargo deny check", "cargo machete"]
+
+[tasks.lint]
+description = "The gate without tests"
+run = ["mise run lint-code", "mise run lint-deps"]
 
 [tasks.test]
 description = "All tests, Docker-backed integration tests included"
@@ -39,7 +45,7 @@ run = "cargo nextest run --workspace --all-features -E 'kind(test)'"
 
 [tasks.check]
 description = "The single local gate"
-run = ["mise run lint", "mise run test"]
+run = ["mise run lint-code", "mise run test", "mise run lint-deps"]
 
 [tasks.actionlint]
 description = "Lint GitHub Actions workflows"
