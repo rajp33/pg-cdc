@@ -177,7 +177,7 @@ admin HTTP: /healthz /readyz /status /parked
 - **Primary key.** It comes from the catalog over the control connection: `pg_index.indisprimary`, in index column order.
   - Without one, the replica-identity index (`indisreplident`) is used; otherwise the relation has no key.
   - Keys are cached per relation OID and refreshed when a new Relation message for that OID arrives.
-- **Non-built-in types.** Enums, domains, arrays, composites, ranges and custom types are resolved from `pg_type` over the control connection and cached for the life of the process.
+- **Non-built-in types.** Enums, domains, arrays, composites, ranges and custom types are resolved from `pg_type` over the control connection and cached for the life of a connection, like relations (D4).
 
 ### 6.4 Value mapping
 
