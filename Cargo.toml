@@ -42,9 +42,12 @@ clap = { version = "4.6.7", default-features = false, features = [
   "usage",
   "error-context",
 ] }
+fallible-iterator = "0.2.0"
 fastrand = "2.5.0"
 pg-cdc-decoder = { path = "crates/decoder", version = "0.1.0" }
+pg-cdc-replication = { path = "crates/replication", version = "0.1.0" }
 pg-cdc-testkit = { path = "crates/testkit", version = "0.1.0" }
+postgres-protocol = "0.6.12"
 proptest = "1.12.0"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
@@ -59,6 +62,7 @@ thiserror = "2.0.21"
 tokio = { version = "1.53.3", default-features = false }
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
 tokio-postgres-rustls = { version = "0.14.0", default-features = false }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7.20", default-features = false }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [

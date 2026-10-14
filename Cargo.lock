@@ -2225,6 +2225,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg-cdc-replication"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fallible-iterator",
+ "pg-cdc-decoder",
+ "pg-cdc-testkit",
+ "postgres-protocol",
+ "rustls",
+ "rustls-pki-types",
+ "secrecy",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "pg-cdc-testkit"
 version = "0.1.0"
 dependencies = [
