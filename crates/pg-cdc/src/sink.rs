@@ -45,6 +45,10 @@ impl<W: AsyncWrite + Unpin> StdoutSink<W> {
         })
     }
 
+    pub async fn reset_pending(&mut self) -> std::io::Result<()> {
+        self.flush().await.map(drop)
+    }
+
     pub fn pending(&self) -> u64 {
         self.pending
     }
@@ -67,6 +71,17 @@ mod tests {
         assert_eq!(sink.pending(), 0);
         assert_eq!(sink.flush().await.unwrap().into_events(), 0);
         assert_eq!(sink.out.get_ref().as_slice(), b"{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[tokio::test]
+    async fn reset_pending_emits_buffered_lines_and_clears_the_count() {
+        let mut sink = StdoutSink::new(Vec::new());
+        sink.write(b"{}").await.unwrap();
+        sink.write(b"{}").await.unwrap();
+        sink.reset_pending().await.unwrap();
+        assert_eq!(sink.pending(), 0);
+        assert_eq!(sink.out.get_ref().as_slice(), b"{}\n{}\n");
+        assert_eq!(sink.flush().await.unwrap().into_events(), 0);
     }
 
     #[tokio::test]

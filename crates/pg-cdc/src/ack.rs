@@ -128,6 +128,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reconnect_mid_transaction_replays_against_a_fresh_progress() {
+        let mut sink = StdoutSink::new(Vec::new());
+        {
+            let mut first = AckProgress::new(Lsn(100));
+            first.begin().unwrap();
+            for _ in 0..3 {
+                sink.write(b"{}").await.unwrap();
+                first.sent().unwrap();
+            }
+        }
+
+        sink.reset_pending().await.unwrap();
+
+        let mut second = AckProgress::new(Lsn(100));
+        second.begin().unwrap();
+        for _ in 0..3 {
+            sink.write(b"{}").await.unwrap();
+            second.sent().unwrap();
+        }
+        second.settle(sink.flush().await.unwrap()).unwrap();
+        assert_eq!(second.commit(Lsn(200)), Ok(Lsn(200)));
+    }
+
+    #[tokio::test]
     async fn a2_confirmed_lsn_never_decreases() {
         let mut ack = AckProgress::new(Lsn(500));
         ack.begin().unwrap();
