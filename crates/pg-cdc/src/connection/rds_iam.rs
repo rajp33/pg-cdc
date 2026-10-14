@@ -1,8 +1,9 @@
 use async_trait::async_trait;
-use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_config::SdkConfig;
 use aws_sdk_rds::auth_token::{AuthTokenGenerator, Config};
-use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use secrecy::SecretString;
+
+use crate::aws::aws_loader;
 
 use super::{ConnectError, ConnectParams, ConnectionProvider};
 
@@ -18,14 +19,7 @@ impl RdsIamProvider {
     }
 
     pub async fn from_environment(base: ConnectParams, region: Option<String>) -> Self {
-        let http_client = aws_smithy_http_client::Builder::new()
-            .tls_provider(Provider::Rustls(CryptoMode::Ring))
-            .build_https();
-        let mut loader = aws_config::defaults(BehaviorVersion::latest()).http_client(http_client);
-        if let Some(region) = region {
-            loader = loader.region(Region::new(region));
-        }
-        Self::new(base, loader.load().await)
+        Self::new(base, aws_loader(region).load().await)
     }
 }
 

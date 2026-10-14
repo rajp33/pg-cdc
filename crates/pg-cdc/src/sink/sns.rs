@@ -6,12 +6,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
-use aws_config::{BehaviorVersion, Region};
 use aws_sdk_sns::Client;
 use aws_sdk_sns::error::DisplayErrorContext;
 use aws_sdk_sns::operation::publish_batch::PublishBatchError;
 use aws_sdk_sns::types::{MessageAttributeValue, PublishBatchRequestEntry};
-use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
+
+use crate::aws::aws_loader;
 
 use super::{AttributeValue, Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 
@@ -104,20 +104,13 @@ impl SnsSink {
         region: Option<String>,
         fair_queue_group: Option<String>,
     ) -> Self {
-        let http_client = aws_smithy_http_client::Builder::new()
-            .tls_provider(Provider::Rustls(CryptoMode::Ring))
-            .build_https();
-        let mut loader = aws_config::defaults(BehaviorVersion::latest())
-            .http_client(http_client)
+        let loader = aws_loader(region)
             .retry_config(RetryConfig::disabled())
             .timeout_config(
                 TimeoutConfig::builder()
                     .operation_timeout(SNS_OPERATION_TIMEOUT)
                     .build(),
             );
-        if let Some(region) = region {
-            loader = loader.region(Region::new(region));
-        }
         Self::new(
             Client::new(&loader.load().await),
             topic_arn,

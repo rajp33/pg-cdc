@@ -1,4 +1,5 @@
 pub mod ack;
+mod aws;
 pub mod catalog;
 pub mod config;
 pub mod connection;

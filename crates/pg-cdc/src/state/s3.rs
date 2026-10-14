@@ -4,11 +4,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
-use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 
@@ -17,6 +15,7 @@ use super::{
     StoreError, SwapOutcome, Version, Versioned, decode_leader, decode_parked, encode_parked,
     parse_parked_name, store_root,
 };
+use crate::aws::aws_loader;
 use crate::event::EventId;
 use crate::order::OrderKeyId;
 
@@ -27,11 +26,7 @@ pub const S3_LIST_PAGE: i32 = 1000;
 const JSON: &str = "application/json";
 
 pub async fn s3_client(region: Option<String>) -> Client {
-    let http_client = aws_smithy_http_client::Builder::new()
-        .tls_provider(Provider::Rustls(CryptoMode::Ring))
-        .build_https();
-    let mut loader = aws_config::defaults(BehaviorVersion::latest())
-        .http_client(http_client)
+    let loader = aws_loader(region)
         .retry_config(RetryConfig::standard().with_max_attempts(S3_MAX_ATTEMPTS))
         .timeout_config(
             TimeoutConfig::builder()
@@ -39,9 +34,6 @@ pub async fn s3_client(region: Option<String>) -> Client {
                 .operation_timeout(S3_OPERATION_TIMEOUT)
                 .build(),
         );
-    if let Some(region) = region {
-        loader = loader.region(Region::new(region));
-    }
     Client::new(&loader.load().await)
 }
 
