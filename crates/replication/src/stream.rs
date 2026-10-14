@@ -14,8 +14,7 @@ use tokio::time::MissedTickBehavior;
 use crate::config::ReplicationConfig;
 use crate::error::ReplicationError;
 use crate::protocol::{
-    Backend, ReplicationEvent, parse_backend, parse_copy_data, pg_time, protocol, server_error,
-    status_update,
+    Backend, ReplicationEvent, parse_copy_data, pg_time, protocol, status_update,
 };
 use crate::startup::{self, Conn, Io};
 
@@ -146,12 +145,13 @@ impl Worker {
             }
             Err(error) => {
                 tracing::debug!(%error, "replication stream failed");
+                let failure = ReplicationError::Worker(error.to_string());
                 tokio::select! {
                     biased;
                     _ = stop => {}
                     _ = events.send(Err(error)) => {}
                 }
-                Ok(())
+                Err(failure)
             }
         }
     }
@@ -194,22 +194,18 @@ impl Worker {
     }
 
     async fn drain_buffer(&mut self) -> Result<Step, ReplicationError> {
-        while let Some(message) = parse_backend(&mut self.conn.read)? {
-            match message {
-                Backend::Message(Message::CopyData(body)) => {
-                    let (event, reply_requested) = parse_copy_data(body.into_bytes())?;
-                    if reply_requested {
-                        self.send_status().await?;
-                    }
-                    return Ok(Step::Event(event));
+        match self.conn.try_next()? {
+            None => Ok(Step::Idle),
+            Some(Backend::Message(Message::CopyData(body))) => {
+                let (event, reply_requested) = parse_copy_data(body.into_bytes())?;
+                if reply_requested {
+                    self.send_status().await?;
                 }
-                Backend::Message(Message::CopyDone) => return Ok(Step::Done),
-                Backend::Message(Message::ErrorResponse(body)) => return Err(server_error(&body)),
-                Backend::Message(Message::NoticeResponse(_) | Message::ParameterStatus(_)) => {}
-                _ => return Err(protocol("unexpected message while streaming")),
+                Ok(Step::Event(event))
             }
+            Some(Backend::Message(Message::CopyDone)) => Ok(Step::Done),
+            Some(_) => Err(protocol("unexpected message while streaming")),
         }
-        Ok(Step::Idle)
     }
 
     async fn send_status(&mut self) -> Result<(), ReplicationError> {
@@ -227,9 +223,6 @@ impl Worker {
                 Ok(Backend::Message(
                     Message::CopyDone | Message::CommandComplete(_) | Message::ReadyForQuery(_),
                 )) => break,
-                Ok(Backend::Message(Message::ErrorResponse(body))) => {
-                    return Err(server_error(&body));
-                }
                 Ok(_) => {}
                 Err(ReplicationError::Closed) => return Ok(()),
                 Err(error) => return Err(error),
@@ -359,6 +352,52 @@ mod tests {
         server.read_status().await;
         drop(server);
         assert!(matches!(stream.recv().await, Err(ReplicationError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn stop_reports_a_stream_failure_the_consumer_already_saw() {
+        let (mut stream, mut server) = fake::started(fake::config()).await;
+        server
+            .error(
+                "57P01",
+                "terminating connection due to administrator command",
+            )
+            .await;
+        assert_eq!(stream.recv().await.unwrap_err().sqlstate(), Some("57P01"));
+        let error = stream.stop().await.unwrap_err();
+        assert!(
+            matches!(&error, ReplicationError::Worker(message) if message.contains("57P01")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_reports_a_stream_failure_stuck_behind_a_full_channel() {
+        let mut config = fake::config();
+        config.buffer = 1;
+        let (stream, mut server) = fake::started(config).await;
+        for n in 1..=2_u64 {
+            server.xlog(n * 0x100, n * 0x100 + 0x10, b"B").await;
+        }
+        drop(server);
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let error = stream.stop().await.unwrap_err();
+        assert!(
+            matches!(&error, ReplicationError::Worker(message) if message.contains("connection failed")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn notices_and_parameter_changes_are_skipped_while_streaming() {
+        let (mut stream, mut server) = fake::started(fake::config()).await;
+        server.send(b'S', b"TimeZone\0UTC\0").await;
+        server.send(b'N', b"\0").await;
+        server.xlog(0x100, 0x110, b"B").await;
+        assert!(matches!(
+            stream.recv().await,
+            Ok(Some(ReplicationEvent::XLogData { .. }))
+        ));
     }
 
     #[tokio::test]

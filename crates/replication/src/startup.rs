@@ -41,9 +41,23 @@ impl Conn {
         Ok(())
     }
 
+    pub(crate) fn try_next(&mut self) -> Result<Option<Backend>, ReplicationError> {
+        loop {
+            match parse_backend(&mut self.read)? {
+                Some(Backend::Message(Message::ErrorResponse(body))) => {
+                    return Err(server_error(&body));
+                }
+                Some(Backend::Message(
+                    Message::NoticeResponse(_) | Message::ParameterStatus(_),
+                )) => {}
+                other => return Ok(other),
+            }
+        }
+    }
+
     pub(crate) async fn next(&mut self) -> Result<Backend, ReplicationError> {
         loop {
-            if let Some(message) = parse_backend(&mut self.read)? {
+            if let Some(message) = self.try_next()? {
                 return Ok(message);
             }
             if self.io.read_buf(&mut self.read).await? == 0 {
@@ -125,8 +139,6 @@ async fn authenticate(conn: &mut Conn, config: &ReplicationConfig) -> Result<(),
             Backend::Message(Message::AuthenticationSasl(body)) => {
                 scram(conn, config, &body).await?;
             }
-            Backend::Message(Message::NoticeResponse(_)) => {}
-            Backend::Message(Message::ErrorResponse(body)) => return Err(server_error(&body)),
             _ => return Err(protocol("unexpected message during authentication")),
         }
     }
@@ -160,7 +172,6 @@ async fn scram(
         Backend::Message(Message::AuthenticationSaslContinue(body)) => {
             scram.update(body.data()).map_err(ReplicationError::Scram)?;
         }
-        Backend::Message(Message::ErrorResponse(body)) => return Err(server_error(&body)),
         _ => return Err(protocol("unexpected message during SCRAM authentication")),
     }
     frontend::sasl_response(scram.message(), &mut conn.write)?;
@@ -169,7 +180,6 @@ async fn scram(
         Backend::Message(Message::AuthenticationSaslFinal(body)) => {
             scram.finish(body.data()).map_err(ReplicationError::Scram)
         }
-        Backend::Message(Message::ErrorResponse(body)) => Err(server_error(&body)),
         _ => Err(protocol("unexpected message during SCRAM authentication")),
     }
 }
@@ -182,23 +192,15 @@ async fn wait_until_ready(conn: &mut Conn) -> Result<u32, ReplicationError> {
                 backend_pid = body.process_id().cast_unsigned();
             }
             Backend::Message(Message::ReadyForQuery(_)) => return Ok(backend_pid),
-            Backend::Message(Message::ParameterStatus(_) | Message::NoticeResponse(_)) => {}
-            Backend::Message(Message::ErrorResponse(body)) => return Err(server_error(&body)),
             _ => return Err(protocol("unexpected message before ReadyForQuery")),
         }
     }
 }
 
 async fn expect_copy_both(conn: &mut Conn) -> Result<(), ReplicationError> {
-    loop {
-        match conn.next().await? {
-            Backend::CopyBothResponse => return Ok(()),
-            Backend::Message(Message::ParameterStatus(_) | Message::NoticeResponse(_)) => {}
-            Backend::Message(Message::ErrorResponse(body)) => return Err(server_error(&body)),
-            Backend::Message(_) => {
-                return Err(protocol("unexpected reply to START_REPLICATION"));
-            }
-        }
+    match conn.next().await? {
+        Backend::CopyBothResponse => Ok(()),
+        Backend::Message(_) => Err(protocol("unexpected reply to START_REPLICATION")),
     }
 }
 
