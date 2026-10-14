@@ -12,6 +12,7 @@ pub const ENV_PREFIX: &str = "PGCDC__";
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(deserialize_with = "de_string")]
     pub pipeline: String,
     pub source: SourceConfig,
     pub sink: SinkConfig,
@@ -20,15 +21,20 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
+    #[serde(deserialize_with = "de_string")]
     pub host: String,
     #[serde(default = "default_port", deserialize_with = "de_port")]
     pub port: u16,
+    #[serde(deserialize_with = "de_string")]
     pub database: String,
+    #[serde(deserialize_with = "de_string")]
     pub user: String,
     pub credentials: Credentials,
     #[serde(default)]
     pub tls: TlsSection,
+    #[serde(deserialize_with = "de_string")]
     pub slot: String,
+    #[serde(deserialize_with = "de_string")]
     pub publication: String,
     #[serde(default = "default_status_interval", deserialize_with = "de_duration")]
     pub status_interval: Duration,
@@ -37,8 +43,13 @@ pub struct SourceConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Credentials {
-    Password { password: Option<SecretString> },
-    AwsRdsIam { region: Option<String> },
+    Password {
+        password: Option<SecretString>,
+    },
+    AwsRdsIam {
+        #[serde(default, deserialize_with = "de_opt_string")]
+        region: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -46,7 +57,7 @@ pub enum Credentials {
 pub struct TlsSection {
     #[serde(default)]
     pub mode: TlsMode,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_path")]
     pub ca_file: Option<PathBuf>,
 }
 
@@ -108,8 +119,11 @@ pub fn parse(
     yaml: &str,
     env: impl IntoIterator<Item = (String, String)>,
 ) -> Result<Config, ConfigError> {
-    let mut tree: Value =
-        serde_saphyr::from_str(yaml).map_err(|error| ConfigError::Yaml(error.to_string()))?;
+    let mut options = serde_saphyr::Options::default();
+    options.with_snippet = false;
+    options.strict_booleans = true;
+    let mut tree: Value = serde_saphyr::from_str_with_options(yaml, options)
+        .map_err(|error| ConfigError::Yaml(error.to_string()))?;
     if tree.pointer("/source/credentials/password").is_some() {
         return Err(ConfigError::PasswordInFile);
     }
@@ -235,12 +249,66 @@ fn default_status_interval() -> Duration {
 }
 
 fn de_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
-    let text = String::deserialize(deserializer)?;
+    let text = de_string(deserializer)?;
     parse_duration(&text).ok_or_else(|| {
         de::Error::custom(format!(
             "invalid duration {text:?}; use an integer with ms, s, m or h"
         ))
     })
+}
+
+fn de_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    struct StringVisitor;
+
+    impl Visitor<'_> for StringVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a string")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<String, E> {
+            Ok(value)
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_bool<E: de::Error>(self, value: bool) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(StringVisitor)
+}
+
+fn de_opt_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Option::<StringField>::deserialize(deserializer).map(|field| field.map(|field| field.0))
+}
+
+fn de_opt_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<PathBuf>, D::Error> {
+    de_opt_string(deserializer).map(|text| text.map(PathBuf::from))
+}
+
+struct StringField(String);
+
+impl<'de> Deserialize<'de> for StringField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        de_string(deserializer).map(Self)
+    }
 }
 
 fn de_port<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
@@ -389,6 +457,67 @@ sink:
         assert!(matches!(
             parse("pipeline: [", with_password()),
             Err(ConfigError::Yaml(_))
+        ));
+    }
+
+    #[test]
+    fn yaml_errors_do_not_echo_file_contents() {
+        for yaml in [
+            "source:\n  credentials:\n    password: leak-me\n  host: [\n",
+            "pipeline: orders\nsource:\n  credentials:\n    password: leak-me\n   bad: indent\n",
+            "password: leak-me\n\t- : :\n",
+        ] {
+            let Err(ConfigError::Yaml(text)) = parse(yaml, env(&[])) else {
+                panic!("expected a YAML error for {yaml:?}");
+            };
+            assert!(!text.contains("leak-me"), "{text}");
+        }
+    }
+
+    #[test]
+    fn accepts_scalar_looking_values_for_string_fields() {
+        let yaml = "
+pipeline: 2024
+source:
+  host: 127.1
+  database: 1234
+  user: 12345
+  credentials:
+    type: aws_rds_iam
+    region: 42
+  tls:
+    ca_file: 7
+  slot: 123
+  publication: true
+  status_interval: 5s
+sink:
+  type: stdout
+";
+        let config = parse(yaml, env(&[])).unwrap();
+        assert_eq!(config.pipeline, "2024");
+        assert_eq!(config.source.host, "127.1");
+        assert_eq!(config.source.database, "1234");
+        assert_eq!(config.source.user, "12345");
+        assert_eq!(config.source.slot, "123");
+        assert_eq!(config.source.publication, "true");
+        assert_eq!(config.source.tls.ca_file, Some(PathBuf::from("7")));
+        assert!(
+            matches!(&config.source.credentials, Credentials::AwsRdsIam { region: Some(region) } if region == "42")
+        );
+    }
+
+    #[test]
+    fn yes_and_no_stay_strings() {
+        let yaml = MINIMAL.replace("user: pgcdc", "user: on");
+        assert_eq!(parse(&yaml, with_password()).unwrap().source.user, "on");
+    }
+
+    #[test]
+    fn rejects_non_scalar_values_for_string_fields() {
+        let yaml = MINIMAL.replace("pipeline: orders", "pipeline: [orders]");
+        assert!(matches!(
+            parse(&yaml, with_password()),
+            Err(ConfigError::Invalid(_))
         ));
     }
 
