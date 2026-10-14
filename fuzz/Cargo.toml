@@ -1,0 +1,23 @@
+[package]
+name = "pg-cdc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+pg-cdc-decoder = { path = "../crates/decoder" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_message"
+path = "fuzz_targets/decode_message.rs"
+test = false
+doc = false
+bench = false
