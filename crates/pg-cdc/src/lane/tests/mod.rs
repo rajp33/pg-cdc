@@ -1,9 +1,11 @@
 mod model;
+mod offload;
 mod park;
 mod stored;
 
 use super::*;
 use crate::ack::AckTracker;
+use crate::payload::PayloadRef;
 use crate::state::memory::MemoryStateStore;
 use crate::state::{
     LeaderRecord, ParkStatus, ParkedEvent, StoreError, SwapOutcome, Version, Versioned,
@@ -41,6 +43,7 @@ struct ScriptedSink {
     active: AtomicUsize,
     most_active: AtomicUsize,
     drop_outcomes_once: AtomicBool,
+    bodies: Mutex<HashMap<u32, Bytes>>,
 }
 
 impl std::fmt::Debug for ScriptedSink {
@@ -60,6 +63,7 @@ impl ScriptedSink {
             active: AtomicUsize::new(0),
             most_active: AtomicUsize::new(0),
             drop_outcomes_once: AtomicBool::new(false),
+            bodies: Mutex::new(HashMap::new()),
         }
     }
 
@@ -108,6 +112,10 @@ impl Sink for ScriptedSink {
                 *count
             };
             let outcome = (self.script)(ordinal, attempt);
+            self.bodies
+                .lock()
+                .unwrap()
+                .insert(ordinal, outbound.body.clone());
             sent.push(Sent {
                 ordinal,
                 at,
@@ -261,6 +269,37 @@ impl StateStore for TestStore {
     }
 }
 
+#[derive(Debug, Default)]
+struct TestPayloads {
+    stored: Mutex<HashMap<EventId, Bytes>>,
+    fail: AtomicU32,
+}
+
+#[async_trait]
+impl PayloadStore for TestPayloads {
+    async fn put(&self, id: &EventId, body: &[u8]) -> Result<PayloadRef, StoreError> {
+        if take_failure(&self.fail) {
+            return Err(outage());
+        }
+        self.stored
+            .lock()
+            .unwrap()
+            .insert(*id, Bytes::copy_from_slice(body));
+        Ok(PayloadRef {
+            uri: format!("memory://{id}"),
+            bytes: u64::try_from(body.len()).unwrap(),
+        })
+    }
+}
+
+fn envelope(ordinal: u32, padding: usize) -> Bytes {
+    let id = EventId::new(Lsn(0x10), ordinal);
+    Bytes::from(format!(
+        r#"{{"id":"{id}","op":"insert","key":{{"id":1}},"before":null,"after":{{"pad":"{}"}},"source":{{"pipeline":"p"}}}}"#,
+        "x".repeat(padding)
+    ))
+}
+
 fn parked(key: &[u8], ordinal: u32, status: ParkStatus) -> ParkedEvent {
     ParkedEvent {
         order_key: OrderKeyId::of(key),
@@ -315,6 +354,15 @@ impl Harness {
     }
 
     async fn start(setup: Setup, sink: ScriptedSink, store: TestStore) -> Self {
+        Self::start_with_payloads(setup, sink, store, None).await
+    }
+
+    async fn start_with_payloads(
+        setup: Setup,
+        sink: ScriptedSink,
+        store: TestStore,
+        payloads: Option<Arc<TestPayloads>>,
+    ) -> Self {
         let sink = Arc::new(sink);
         let store = Arc::new(store);
         let (reports, receiver) = mpsc::unbounded_channel();
@@ -327,7 +375,7 @@ impl Harness {
         };
         let stores = Stores {
             state: store.clone(),
-            payload: None,
+            payload: payloads.map(|payloads| payloads as Arc<dyn PayloadStore>),
         };
         let lanes = Lanes::spawn(
             settings,
@@ -365,8 +413,12 @@ impl Harness {
     }
 
     fn send(&mut self, ordinal: u32, key: &[u8], body: usize) -> Result<(), LaneStopped> {
+        self.send_body(ordinal, key, Bytes::from(vec![b'x'; body]))
+    }
+
+    fn send_body(&mut self, ordinal: u32, key: &[u8], body: Bytes) -> Result<(), LaneStopped> {
         self.ack.begin().unwrap();
-        let ticket = self.ack.track(u64::try_from(body).unwrap()).unwrap();
+        let ticket = self.ack.track(u64::try_from(body.len()).unwrap()).unwrap();
         self.ack.commit(Lsn(100 + self.commits)).unwrap();
         self.commits += 1;
         self.lanes.dispatch(Pending {
@@ -374,7 +426,7 @@ impl Harness {
                 id: EventId::new(Lsn(0x10), ordinal),
                 order_key: OrderKeyId::of(key),
                 attributes: Vec::new(),
-                body: Bytes::from(vec![b'x'; body]),
+                body,
             },
             ticket,
             arrived: Instant::now(),

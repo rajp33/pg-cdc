@@ -74,21 +74,31 @@ impl Lane {
     }
 
     pub(super) fn oversize(&mut self, key: OrderKeyId, bytes: usize) {
+        if self.payload.is_some() {
+            if !self.to_offload.contains(&key) {
+                self.to_offload.push_back(key);
+            }
+            return;
+        }
         let error = SinkError(format!(
             "the event is {bytes} bytes, above the sink's limit of {}",
             self.capabilities.max_message_bytes
         ));
+        self.give_up(key, &error);
+    }
+
+    pub(super) fn give_up(&mut self, key: OrderKeyId, error: &SinkError) {
         let Some(state) = self.keys.get_mut(&key) else {
             return;
         };
         if let Some(stored) = state.stored.as_mut() {
             if let Some(head) = stored.head.take() {
-                tracing::error!(order_key = %key, id = %head.id, %error, "a parked event is too large to send; marking it dead");
+                tracing::error!(order_key = %key, id = %head.id, %error, "a parked event cannot be sent; marking it dead");
                 self.to_kill.push((key, head.id));
             }
         } else {
-            tracing::error!(order_key = %key, %error, "an event is too large to send; parking it dead");
-            state.record_failure(&error);
+            tracing::error!(order_key = %key, %error, "an event cannot be sent; parking it dead");
+            state.record_failure(error);
             self.start_parking(key, true);
         }
     }

@@ -1,4 +1,5 @@
 mod loader;
+mod offload;
 mod park;
 mod stored;
 
@@ -101,6 +102,8 @@ impl Lanes {
                     index,
                     sink: Arc::clone(sink),
                     store: Arc::clone(&stores.state),
+                    payload: stores.payload.clone(),
+                    to_offload: VecDeque::new(),
                     permits: Arc::clone(permits),
                     capabilities,
                     inbox: receiver,
@@ -195,6 +198,8 @@ struct Lane {
     index: usize,
     sink: Arc<dyn Sink>,
     store: Arc<dyn StateStore>,
+    payload: Option<Arc<dyn PayloadStore>>,
+    to_offload: VecDeque<OrderKeyId>,
     permits: Arc<Semaphore>,
     capabilities: SinkCapabilities,
     inbox: mpsc::UnboundedReceiver<Inbound>,
@@ -237,6 +242,10 @@ impl Lane {
                 if !self.wait(self.store_wake()).await {
                     return;
                 }
+                continue;
+            }
+            if !self.to_offload.is_empty() {
+                self.offload().await;
                 continue;
             }
             let (count, full) = self.plan_batch();
