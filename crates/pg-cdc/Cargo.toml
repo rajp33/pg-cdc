@@ -43,6 +43,7 @@ tokio-postgres-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+twox-hash.workspace = true
 webpki-roots.workspace = true
 
 [dev-dependencies]

@@ -5,3 +5,6 @@ mod id;
 pub use builder::{BuildError, Builder, Built, ColumnInfo, Fallback, RelationInfo};
 pub use envelope::{ENVELOPE_VERSION, Envelope, Op, Row, Source};
 pub use id::EventId;
+
+#[cfg(test)]
+pub(crate) use envelope::sample_envelope;

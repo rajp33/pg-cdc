@@ -43,3 +43,29 @@ impl Envelope {
         serde_json::to_vec(self)
     }
 }
+
+#[cfg(test)]
+pub(crate) fn sample_envelope(
+    op: Op,
+    key: Option<Value>,
+    before: Option<Value>,
+    after: Option<Value>,
+) -> Envelope {
+    let row = |value: Option<Value>| value.and_then(|value| value.as_object().cloned());
+    Envelope {
+        id: EventId::new(pg_cdc_decoder::Lsn(0x1A2B_3C4D), 0),
+        version: ENVELOPE_VERSION,
+        op,
+        schema: "public".to_owned(),
+        table: "orders".to_owned(),
+        key: row(key),
+        before: row(before),
+        after: row(after),
+        unchanged_toast: Vec::new(),
+        source: Source {
+            pipeline: "orders".to_owned(),
+            commit_lsn: "0/1A2B3C4D".to_owned(),
+            commit_ts: "2026-10-14T12:00:00.123456+00:00".to_owned(),
+        },
+    }
+}

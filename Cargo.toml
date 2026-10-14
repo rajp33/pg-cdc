@@ -71,6 +71,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
   "env-filter",
   "std",
 ] }
+twox-hash = { version = "2.1.5", default-features = false, features = ["xxhash3_128"] }
 webpki-roots = "1.0.9"
 
 [workspace.lints.rust]
