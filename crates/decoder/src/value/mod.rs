@@ -6,7 +6,7 @@ use serde_json::{Number, Value};
 
 pub use datetime::format_commit_ts;
 
-const MAX_JSON_NUMBER_EXPANSION: usize = 1 << 20;
+const MAX_NUMBER_EXPANSION: usize = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
@@ -73,39 +73,50 @@ fn builtin_scalar(oid: u32) -> Option<TypeKind> {
     }
 }
 
-pub fn map_value(kind: &TypeKind, text: &str) -> Mapped {
-    let mut fallback = false;
-    let value = map_into(kind, text, &mut fallback);
-    Mapped { value, fallback }
+struct State {
+    fallback: bool,
+    budget: usize,
 }
 
-fn map_into(kind: &TypeKind, text: &str, fallback: &mut bool) -> Value {
+pub fn map_value(kind: &TypeKind, text: &str) -> Mapped {
+    let mut state = State {
+        fallback: false,
+        budget: MAX_NUMBER_EXPANSION,
+    };
+    let value = map_into(kind, text, &mut state);
+    Mapped {
+        value,
+        fallback: state.fallback,
+    }
+}
+
+fn map_into(kind: &TypeKind, text: &str, state: &mut State) -> Value {
     let typed = match kind {
         TypeKind::Array { element, delimiter } => {
-            array::parse(text, *delimiter).map(|node| array_value(node, element, fallback))
+            array::parse(text, *delimiter).map(|node| array_value(node, element, state))
         }
-        scalar => map_scalar(scalar, text),
+        scalar => map_scalar(scalar, text, &mut state.budget),
     };
     typed.unwrap_or_else(|| {
-        *fallback = true;
+        state.fallback = true;
         Value::String(text.to_owned())
     })
 }
 
-fn array_value(node: array::Node, element: &TypeKind, fallback: &mut bool) -> Value {
+fn array_value(node: array::Node, element: &TypeKind, state: &mut State) -> Value {
     match node {
         array::Node::Null => Value::Null,
-        array::Node::Element(text) => map_into(element, &text, fallback),
+        array::Node::Element(text) => map_into(element, &text, state),
         array::Node::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|item| array_value(item, element, fallback))
+                .map(|item| array_value(item, element, state))
                 .collect(),
         ),
     }
 }
 
-fn map_scalar(kind: &TypeKind, text: &str) -> Option<Value> {
+fn map_scalar(kind: &TypeKind, text: &str, budget: &mut usize) -> Option<Value> {
     match kind {
         TypeKind::Bool => match text {
             "t" => Some(Value::Bool(true)),
@@ -114,9 +125,9 @@ fn map_scalar(kind: &TypeKind, text: &str) -> Option<Value> {
         },
         TypeKind::Integer => integer(text),
         TypeKind::Float | TypeKind::Numeric => {
-            non_finite(text).or_else(|| number::to_json_number(text))
+            non_finite(text).or_else(|| number::to_json_number_within(text, budget))
         }
-        TypeKind::Json => json(text),
+        TypeKind::Json => json(text, budget),
         TypeKind::Timestamp => datetime::timestamp(text).map(Value::String),
         TypeKind::Timestamptz => datetime::timestamptz(text).map(Value::String),
         TypeKind::Text | TypeKind::Array { .. } => Some(Value::String(text.to_owned())),
@@ -135,9 +146,8 @@ fn integer(text: &str) -> Option<Value> {
     serde_json::from_str::<Number>(text).ok().map(Value::Number)
 }
 
-fn json(text: &str) -> Option<Value> {
-    let mut budget = MAX_JSON_NUMBER_EXPANSION;
-    normalize_numbers(serde_json::from_str(text).ok()?, &mut budget)
+fn json(text: &str, budget: &mut usize) -> Option<Value> {
+    normalize_numbers(serde_json::from_str(text).ok()?, budget)
 }
 
 fn normalize_numbers(value: Value, budget: &mut usize) -> Option<Value> {
@@ -288,6 +298,17 @@ mod tests {
         let result = map_value(&TypeKind::Json, &modest);
         assert!(!result.fallback);
         assert_eq!(result.value.to_string().len(), 100 * 101 + 99 + 2);
+    }
+
+    #[test]
+    fn number_expansion_budget_is_shared_across_array_elements() {
+        let elements = vec!["1e131071"; 1000].join(",");
+        for element in [TypeKind::Json, TypeKind::Float, TypeKind::Numeric] {
+            let text = format!("{{{elements}}}");
+            let result = map_value(&array_of(element), &text);
+            assert!(result.fallback);
+            assert!(result.value.to_string().len() < 4 * MAX_NUMBER_EXPANSION);
+        }
     }
 
     #[test]
