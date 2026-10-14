@@ -1,0 +1,28 @@
+[package]
+name = "pg-cdc-testkit"
+description = "Containers and fixtures for pg-cdc tests"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+aws-sdk-sns.workspace = true
+aws-sdk-sqs.workspace = true
+aws-smithy-http-client.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true
+testcontainers.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+tokio-postgres.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
