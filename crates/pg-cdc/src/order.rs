@@ -4,7 +4,7 @@ use std::str::FromStr;
 use serde_json::Value;
 use twox_hash::XxHash3_128;
 
-use crate::event::Envelope;
+use crate::event::{Envelope, lower_hex};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum OrderBy {
@@ -46,6 +46,28 @@ impl OrderKeyId {
     pub fn lane(self, lanes: usize) -> usize {
         let lanes = u128::try_from(lanes.max(1)).unwrap_or(u128::MAX);
         usize::try_from(self.0 % lanes).unwrap_or(0)
+    }
+
+    pub fn partition(self) -> u8 {
+        u8::try_from(self.0 >> 120).unwrap_or(u8::MAX)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not an order key id")]
+pub struct InvalidOrderKeyId(pub String);
+
+impl FromStr for OrderKeyId {
+    type Err = InvalidOrderKeyId;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidOrderKeyId(text.to_owned());
+        if !lower_hex(text, 32) {
+            return Err(invalid());
+        }
+        u128::from_str_radix(text, 16)
+            .map(Self)
+            .map_err(|_| invalid())
     }
 }
 
@@ -230,7 +252,45 @@ mod tests {
         assert_eq!(OrderKeyId(7).lane(0), 0);
     }
 
+    #[test]
+    fn the_partition_is_the_first_byte_of_the_id() {
+        assert_eq!(OrderKeyId(0xAB << 120).partition(), 0xAB);
+        assert_eq!(OrderKeyId(u128::MAX).partition(), 0xFF);
+        assert_eq!(OrderKeyId(0xFF).partition(), 0);
+        let id = order_key(&OrderBy::Key, &insert(json!({"id": 42, "status": "paid"})));
+        assert_eq!(format!("{:02x}", id.partition()), GOLDEN_ORDER_KEY_ID[..2]);
+    }
+
+    #[test]
+    fn order_key_ids_parse_from_32_lowercase_hex_digits() {
+        assert_eq!(
+            GOLDEN_ORDER_KEY_ID
+                .parse::<OrderKeyId>()
+                .map(|id| id.to_string()),
+            Ok(GOLDEN_ORDER_KEY_ID.to_owned())
+        );
+        for bad in [
+            "",
+            "aad3af5acd2e8f21df406c0c1530774",
+            "aad3af5acd2e8f21df406c0c1530774c0",
+            "AAD3AF5ACD2E8F21DF406C0C1530774C",
+            "+ad3af5acd2e8f21df406c0c1530774c",
+            "aad3af5acd2e8f21df406c0c1530774g",
+        ] {
+            assert_eq!(
+                bad.parse::<OrderKeyId>(),
+                Err(InvalidOrderKeyId(bad.to_owned())),
+                "{bad:?}"
+            );
+        }
+    }
+
     proptest! {
+        #[test]
+        fn order_key_id_text_round_trips(id in any::<u128>()) {
+            prop_assert_eq!(OrderKeyId(id).to_string().parse::<OrderKeyId>(), Ok(OrderKeyId(id)));
+        }
+
         #[test]
         fn every_order_key_maps_to_a_lane_in_range(id in any::<u128>(), lanes in 1usize..4096) {
             let lane = OrderKeyId(id).lane(lanes);

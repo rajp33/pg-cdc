@@ -55,7 +55,11 @@ rustls-pki-types = { version = "1.15.1", features = ["std"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
-serde_json = { version = "1.0.154", features = ["arbitrary_precision", "preserve_order"] }
+serde_json = { version = "1.0.154", features = [
+  "arbitrary_precision",
+  "preserve_order",
+  "raw_value",
+] }
 tempfile = "3.27.0"
 testcontainers = { version = "0.28.0", default-features = false }
 thiserror = "2.0.21"
