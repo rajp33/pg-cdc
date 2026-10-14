@@ -1,13 +1,13 @@
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pg_cdc_decoder::Lsn;
-use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::ConnectionProvider;
 use crate::session::{SessionConfig, SessionError, run_session};
-use crate::sink::StdoutSink;
+use crate::sink::Sink;
 
 pub const HALT_AFTER_FAULTS: u32 = 3;
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -17,14 +17,14 @@ pub trait Attempt {
     fn run(&mut self) -> impl Future<Output = Result<(), SessionError>> + Send;
 }
 
-pub struct LiveSession<'a, W> {
+pub struct LiveSession<'a> {
     pub config: &'a SessionConfig,
     pub provider: &'a dyn ConnectionProvider,
-    pub sink: &'a mut StdoutSink<W>,
+    pub sink: &'a Arc<dyn Sink>,
     pub shutdown: &'a CancellationToken,
 }
 
-impl<W> fmt::Debug for LiveSession<'_, W> {
+impl fmt::Debug for LiveSession<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LiveSession")
             .field("config", &self.config)
@@ -32,7 +32,7 @@ impl<W> fmt::Debug for LiveSession<'_, W> {
     }
 }
 
-impl<W: AsyncWrite + Unpin + Send> Attempt for LiveSession<'_, W> {
+impl Attempt for LiveSession<'_> {
     fn run(&mut self) -> impl Future<Output = Result<(), SessionError>> + Send {
         run_session(self.config, self.provider, self.sink, self.shutdown)
     }

@@ -1,6 +1,7 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -9,7 +10,9 @@ use pg_cdc::connection::{
     ConnectParams, ConnectionProvider, PasswordProvider, RdsIamProvider, TlsConfig,
 };
 use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig};
-use pg_cdc::sink::StdoutSink;
+use pg_cdc::sink::Sink;
+use pg_cdc::sink::discard::DiscardSink;
+use pg_cdc::sink::stdout::StdoutSink;
 use pg_cdc::supervisor::{LiveSession, supervise};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::sync::CancellationToken;
@@ -61,6 +64,7 @@ fn init_logging(sink: &SinkConfig) {
     let builder = tracing_subscriber::fmt().json().with_env_filter(filter);
     match sink {
         SinkConfig::Stdout => builder.with_writer(std::io::stderr).init(),
+        SinkConfig::Discard => builder.with_writer(std::io::stdout).init(),
     }
 }
 
@@ -83,12 +87,16 @@ async fn run(config: Config) -> anyhow::Result<()> {
         publication: config.source.publication.clone(),
         status_interval: config.source.status_interval,
         buffer: REPLICATION_BUFFER,
+        order_by: config.delivery.order_by.clone(),
+        lanes: config.delivery.lanes,
+        sink_concurrency: config.sink.max_concurrency(),
+        attribute_columns: Vec::new(),
     };
-    let mut sink = StdoutSink::stdout();
+    let sink = sink(&config.sink);
     let mut live = LiveSession {
         config: &session,
         provider: provider.as_ref(),
-        sink: &mut sink,
+        sink: &sink,
         shutdown: &shutdown,
     };
     supervise(&mut live, &shutdown)
@@ -96,6 +104,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .context("replication stopped")?;
     tracing::info!("pg-cdc stopped cleanly");
     Ok(())
+}
+
+fn sink(config: &SinkConfig) -> Arc<dyn Sink> {
+    match config {
+        SinkConfig::Stdout => Arc::new(StdoutSink::stdout()),
+        SinkConfig::Discard => Arc::new(DiscardSink::new()),
+    }
 }
 
 async fn provider(source: &SourceConfig) -> Box<dyn ConnectionProvider> {

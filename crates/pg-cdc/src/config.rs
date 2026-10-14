@@ -13,6 +13,7 @@ pub const ENV_PREFIX: &str = "PGCDC__";
 pub const DEFAULT_LANES: usize = 64;
 pub const MAX_LANES: usize = 4096;
 pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 << 20;
+pub const DEFAULT_SINK_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,6 +104,15 @@ impl Default for DeliveryConfig {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SinkConfig {
     Stdout,
+    Discard,
+}
+
+impl SinkConfig {
+    pub fn max_concurrency(&self) -> usize {
+        match self {
+            Self::Stdout | Self::Discard => DEFAULT_SINK_CONCURRENCY,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -692,6 +702,15 @@ sink:
         ] {
             assert_eq!(parse_duration(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn parses_the_discard_sink() {
+        let yaml = MINIMAL.replace("type: stdout", "type: discard");
+        let config = parse(&yaml, with_password()).unwrap();
+        assert_eq!(config.sink, SinkConfig::Discard);
+        assert_eq!(config.sink.max_concurrency(), DEFAULT_SINK_CONCURRENCY);
+        assert_eq!(SinkConfig::Stdout.max_concurrency(), 32);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pg_cdc_decoder::Lsn;
@@ -6,19 +7,22 @@ use pg_cdc_decoder::message::{DecodeError, LogicalMessage, Relation, decode};
 use pg_cdc_replication::{
     ReplicationConfig, ReplicationError, ReplicationEvent, ReplicationStream,
 };
-use tokio::io::AsyncWrite;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::ack::{AckError, AckProgress};
+use crate::ack::{AckError, AckTracker};
 use crate::catalog::{self, CatalogError, TypeResolver};
 use crate::connection::{
     CONNECT_TIMEOUT, ConnectError, ConnectParams, ConnectionProvider, ControlConnection,
     SESSION_OPTIONS, connect_control, replication_tls,
 };
 use crate::event::{BuildError, Builder, Built, ColumnInfo, RelationInfo};
-use crate::sink::StdoutSink;
+use crate::lane::{LaneError, LaneStopped, Lanes, Pending, Report};
+use crate::order::{OrderBy, order_key};
+use crate::sink::{Outbound, Sink};
 
-pub const REPLICATION_BUFFER: usize = 1024;
+pub const REPLICATION_BUFFER: usize = 64;
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +32,10 @@ pub struct SessionConfig {
     pub publication: String,
     pub status_interval: Duration,
     pub buffer: usize,
+    pub order_by: OrderBy,
+    pub lanes: usize,
+    pub sink_concurrency: usize,
+    pub attribute_columns: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,8 +60,12 @@ pub enum SessionError {
     UnknownRelation { wal_start: Lsn, oid: u32 },
     #[error("acknowledgement invariant violated: {0}")]
     Ack(#[from] AckError),
-    #[error("sink write failed: {0}")]
-    Sink(std::io::Error),
+    #[error("ordering invariant violated: {0}")]
+    Lane(#[from] LaneError),
+    #[error(transparent)]
+    LaneStopped(#[from] LaneStopped),
+    #[error("every delivery lane has stopped")]
+    LanesStopped,
     #[error("cannot encode an event: {0}")]
     Encode(#[from] serde_json::Error),
 }
@@ -70,17 +82,23 @@ impl SessionError {
     }
 
     pub fn is_fatal(&self) -> bool {
-        matches!(self, Self::Ack(_) | Self::Sink(_) | Self::Encode(_))
+        matches!(
+            self,
+            Self::Ack(_)
+                | Self::Encode(_)
+                | Self::Lane(_)
+                | Self::LaneStopped(_)
+                | Self::LanesStopped
+        )
     }
 }
 
-pub async fn run_session<W: AsyncWrite + Unpin + Send>(
+pub async fn run_session(
     config: &SessionConfig,
     provider: &dyn ConnectionProvider,
-    sink: &mut StdoutSink<W>,
+    sink: &Arc<dyn Sink>,
     shutdown: &CancellationToken,
 ) -> Result<(), SessionError> {
-    sink.reset_pending().await.map_err(SessionError::Sink)?;
     let params = provider.params().await?;
     let control = connect_control(&params).await?;
     let start = catalog::slot_confirmed_flush(control.client(), &config.slot)
@@ -94,34 +112,24 @@ pub async fn run_session<W: AsyncWrite + Unpin + Send>(
     let mut stream = ReplicationStream::start(replication_config(&params, config, start).await?)
         .await
         .map_err(|error| stream_fault(error, start))?;
-    let mut position = start;
+    let (reports, mut settled) = mpsc::unbounded_channel();
+    let permits = Arc::new(Semaphore::new(config.sink_concurrency.max(1)));
     let mut session = Session {
         control: &control,
         types: TypeResolver::new(),
-        sink,
-        ack: AckProgress::new(start),
-        builder: Builder::new(config.pipeline.clone()),
         relations: HashMap::new(),
+        builder: Builder::new(config.pipeline.clone()),
+        ack: AckTracker::new(start),
+        lanes: Lanes::spawn(config.lanes, sink, &permits, &reports),
+        order_by: &config.order_by,
+        attribute_columns: &config.attribute_columns,
     };
-    loop {
-        let received = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => break,
-            received = stream.recv() => received,
-        };
-        let event = next_event(received, &mut position)?;
-        let Some(handled) = finish_or_abandon(session.handle(event), shutdown, DRAIN_TIMEOUT).await
-        else {
-            tracing::warn!(
-                timeout_ms = DRAIN_TIMEOUT.as_millis(),
-                "abandoned an event still being written at shutdown"
-            );
-            break;
-        };
-        if let Some(lsn) = handled? {
-            stream.confirm(lsn);
-        }
-    }
+    drop(reports);
+    session
+        .stream(&mut stream, &mut settled, shutdown, start)
+        .await?;
+    session.drain(&stream, &mut settled).await?;
+    session.lanes.shutdown().await;
     if let Err(error) = stream.stop().await {
         tracing::warn!(%error, "replication stream did not stop cleanly");
     }
@@ -148,20 +156,6 @@ fn stream_fault(error: ReplicationError, at: Lsn) -> SessionError {
     }
 }
 
-async fn finish_or_abandon<F: Future>(
-    work: F,
-    shutdown: &CancellationToken,
-    grace: Duration,
-) -> Option<F::Output> {
-    let mut work = std::pin::pin!(work);
-    tokio::select! {
-        biased;
-        output = &mut work => return Some(output),
-        () = shutdown.cancelled() => {}
-    }
-    tokio::time::timeout(grace, work).await.ok()
-}
-
 async fn replication_config(
     params: &ConnectParams,
     config: &SessionConfig,
@@ -185,16 +179,81 @@ async fn replication_config(
     })
 }
 
-struct Session<'a, W> {
+struct Session<'a> {
     control: &'a ControlConnection,
     types: TypeResolver,
-    sink: &'a mut StdoutSink<W>,
-    ack: AckProgress,
-    builder: Builder,
     relations: HashMap<u32, RelationInfo>,
+    builder: Builder,
+    ack: AckTracker,
+    lanes: Lanes,
+    order_by: &'a OrderBy,
+    attribute_columns: &'a [String],
 }
 
-impl<W: AsyncWrite + Unpin + Send> Session<'_, W> {
+impl Session<'_> {
+    async fn stream(
+        &mut self,
+        stream: &mut ReplicationStream,
+        settled: &mut mpsc::UnboundedReceiver<Report>,
+        shutdown: &CancellationToken,
+        start: Lsn,
+    ) -> Result<(), SessionError> {
+        let mut position = start;
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return Ok(()),
+                report = settled.recv() => self.report(report, stream)?,
+                received = stream.recv() => {
+                    let event = next_event(received, &mut position)?;
+                    let Some(handled) = shutdown.run_until_cancelled(self.handle(event)).await else {
+                        return Ok(());
+                    };
+                    if let Some(lsn) = handled? {
+                        stream.confirm(lsn);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn drain(
+        &mut self,
+        stream: &ReplicationStream,
+        settled: &mut mpsc::UnboundedReceiver<Report>,
+    ) -> Result<(), SessionError> {
+        let settle_all = async {
+            while self.ack.inflight_events() > 0 {
+                self.report(settled.recv().await, stream)?;
+            }
+            Ok(())
+        };
+        if let Ok(result) = tokio::time::timeout(DRAIN_TIMEOUT, settle_all).await {
+            return result;
+        }
+        tracing::warn!(
+            unsettled = self.ack.inflight_events(),
+            timeout_ms = DRAIN_TIMEOUT.as_millis(),
+            "events still in flight after the drain timeout will replay"
+        );
+        Ok(())
+    }
+
+    fn report(
+        &mut self,
+        report: Option<Report>,
+        stream: &ReplicationStream,
+    ) -> Result<(), SessionError> {
+        match report {
+            Some(Report::Settled(settled)) => {
+                stream.confirm(self.ack.settle(settled)?);
+                Ok(())
+            }
+            Some(Report::Fatal(error)) => Err(error.into()),
+            None => Err(SessionError::LanesStopped),
+        }
+    }
+
     async fn handle(&mut self, event: ReplicationEvent) -> Result<Option<Lsn>, SessionError> {
         match event {
             ReplicationEvent::XLogData {
@@ -218,8 +277,6 @@ impl<W: AsyncWrite + Unpin + Send> Session<'_, W> {
             }
             LogicalMessage::Commit(commit) => {
                 self.builder.commit().map_err(build_error)?;
-                let receipt = self.sink.flush().await.map_err(SessionError::Sink)?;
-                self.ack.settle(receipt)?;
                 return Ok(Some(self.ack.commit(commit.end_lsn)?));
             }
             LogicalMessage::Relation(relation) => {
@@ -249,12 +306,12 @@ impl<W: AsyncWrite + Unpin + Send> Session<'_, W> {
                 for oid in truncate.relation_oids {
                     let relation = known(&self.relations, wal_start, oid)?;
                     let event = self.builder.truncate(relation).map_err(build_error)?;
-                    self.emit(event).await?;
+                    self.emit(&event)?;
                 }
                 return Ok(None);
             }
         };
-        self.emit(built).await?;
+        self.emit(&built)?;
         Ok(None)
     }
 
@@ -287,7 +344,7 @@ impl<W: AsyncWrite + Unpin + Send> Session<'_, W> {
         Ok(())
     }
 
-    async fn emit(&mut self, built: Built) -> Result<(), SessionError> {
+    fn emit(&mut self, built: &Built) -> Result<(), SessionError> {
         for fallback in &built.fallbacks {
             tracing::error!(
                 id = %built.envelope.id,
@@ -296,9 +353,15 @@ impl<W: AsyncWrite + Unpin + Send> Session<'_, W> {
                 "value fell back to its text form"
             );
         }
-        let body = built.envelope.encode()?;
-        self.sink.write(&body).await.map_err(SessionError::Sink)?;
-        self.ack.sent()?;
+        let key = order_key(self.order_by, &built.envelope);
+        let outbound = Outbound::encode(&built.envelope, key, self.attribute_columns)?;
+        let bytes = u64::try_from(outbound.body.len()).unwrap_or(u64::MAX);
+        let ticket = self.ack.track(bytes)?;
+        self.lanes.dispatch(Pending {
+            outbound,
+            ticket,
+            arrived: Instant::now(),
+        })?;
         Ok(())
     }
 }
@@ -362,48 +425,5 @@ mod tests {
             stream_fault(ReplicationError::Protocol("startup".to_owned()), Lsn(0x20)).fault_lsn(),
             Some(Lsn(0x20))
         ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn work_started_before_shutdown_finishes_within_the_grace_period() {
-        let shutdown = CancellationToken::new();
-        shutdown.cancel();
-        let work = async {
-            tokio::time::sleep(Duration::from_secs(4)).await;
-            7
-        };
-        assert_eq!(
-            finish_or_abandon(work, &shutdown, DRAIN_TIMEOUT).await,
-            Some(7)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn work_still_running_after_the_grace_period_is_abandoned() {
-        let shutdown = CancellationToken::new();
-        let token = shutdown.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            token.cancel();
-        });
-        let started = tokio::time::Instant::now();
-        let work = tokio::time::sleep(Duration::from_secs(60));
-        assert_eq!(
-            finish_or_abandon(work, &shutdown, DRAIN_TIMEOUT).await,
-            None
-        );
-        assert_eq!(started.elapsed(), Duration::from_secs(1) + DRAIN_TIMEOUT);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn work_runs_to_completion_without_shutdown() {
-        let work = async {
-            tokio::time::sleep(Duration::from_secs(600)).await;
-            "done"
-        };
-        assert_eq!(
-            finish_or_abandon(work, &CancellationToken::new(), DRAIN_TIMEOUT).await,
-            Some("done")
-        );
     }
 }

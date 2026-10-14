@@ -20,7 +20,7 @@ fn write_config(
     let mut file = tempfile::NamedTempFile::new()?;
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\nsink:\n  type: stdout\n",
+        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\ndelivery:\n  order_by: pipeline\nsink:\n  type: stdout\n",
         host = pg.host(),
         port = pg.port(),
         database = pg.database(),

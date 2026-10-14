@@ -1,9 +1,6 @@
 pub mod discard;
-mod legacy;
 pub mod sns;
 pub mod stdout;
-
-pub use legacy::{Delivered, StdoutSink};
 
 use std::fmt;
 

@@ -6,7 +6,10 @@ use pg_cdc_testkit::{Postgres, PostgresOptions};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 
-use crate::support::{self, SLOT, TestResult, WAIT};
+use pg_cdc::order::OrderBy;
+use pg_cdc::session::DRAIN_TIMEOUT;
+
+use crate::support::{self, Mode, SLOT, TestResult, WAIT};
 
 const FAST: Duration = Duration::from_millis(200);
 const BUFFER: usize = 1 << 16;
@@ -72,6 +75,7 @@ async fn a2_slot_not_acknowledged_before_delivery() -> TestResult {
     )
     .await?;
     let mut session = support::spawn_session(support::params(&pg), FAST, 64);
+    session.set_mode(Mode::Hold);
     pg.execute("INSERT INTO orders VALUES (1, 'blocked')")
         .await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -81,6 +85,7 @@ async fn a2_slot_not_acknowledged_before_delivery() -> TestResult {
         .ok_or("slot missing")?
         .confirmed_flush_lsn
         .ok_or("no position")?;
+    session.set_mode(Mode::Deliver);
     let event = session.next_event().await?;
     let commit = support::commit_lsn(&event)?;
     assert!(
@@ -215,34 +220,6 @@ async fn tls_require_streams_over_an_encrypted_replication_connection() -> TestR
 }
 
 #[tokio::test]
-async fn a_new_session_starts_from_a_sink_with_no_pending_events() -> TestResult {
-    let pg = Postgres::start().await?;
-    support::prepare(
-        &pg,
-        &["CREATE TABLE orders (id int PRIMARY KEY)"],
-        &["orders"],
-    )
-    .await?;
-    let mut session = support::spawn_after_abandoned_writes(support::params(&pg), FAST, BUFFER, 3);
-    pg.execute("INSERT INTO orders VALUES (1), (2)").await?;
-    for n in 0..3 {
-        assert_eq!(session.next_event().await?, json!({"abandoned": n}));
-    }
-    let first = session.next_event().await?;
-    let second = session.next_event().await?;
-    assert_eq!(
-        (&first["after"]["id"], &second["after"]["id"]),
-        (&json!(1), &json!(2))
-    );
-    let commit = support::commit_lsn(&first)?;
-    pg.wait_for_slot(SLOT, WAIT, |state| {
-        state.confirmed_flush_lsn.is_some_and(|lsn| lsn > commit)
-    })
-    .await?;
-    session.stop().await
-}
-
-#[tokio::test]
 async fn special_character_password_streams() -> TestResult {
     let pg = Postgres::start().await?;
     support::prepare(
@@ -272,7 +249,7 @@ async fn shutdown_during_a_wide_event_write_leaves_only_whole_lines() -> TestRes
         &["docs"],
     )
     .await?;
-    let session = support::spawn_session(support::params(&pg), FAST, 1024);
+    let session = support::spawn_stdout_session(support::params(&pg), FAST, 1024);
     pg.execute("INSERT INTO docs VALUES (1, repeat('x', 65536))")
         .await?;
     let output = session.stop_once_output_starts().await?;
@@ -288,4 +265,131 @@ async fn shutdown_during_a_wide_event_write_leaves_only_whole_lines() -> TestRes
         Some(65536)
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_with_a_failing_sink_stops_cleanly_and_replays_the_undelivered_event() -> TestResult
+{
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &["CREATE TABLE orders (id int PRIMARY KEY)"],
+        &["orders"],
+    )
+    .await?;
+    let mut first = support::spawn_session(support::params(&pg), Duration::from_secs(3600), BUFFER);
+    pg.execute("INSERT INTO orders VALUES (1)").await?;
+    let delivered = first.next_event().await?;
+    let first_commit = support::commit_lsn(&delivered)?;
+    first.set_mode(Mode::Fail);
+    pg.execute("INSERT INTO orders VALUES (2)").await?;
+    first.wait_for_failures(1).await?;
+    let stopping = tokio::time::Instant::now();
+    first.stop().await?;
+    assert!(
+        stopping.elapsed() < DRAIN_TIMEOUT + Duration::from_secs(5),
+        "shutdown took {:?}",
+        stopping.elapsed()
+    );
+    let state = pg.wait_for_slot(SLOT, WAIT, |state| !state.active).await?;
+    let confirmed = state.confirmed_flush_lsn.ok_or("no position")?;
+    assert!(
+        confirmed > first_commit,
+        "the final status update did not confirm the delivered transaction"
+    );
+    let mut second = support::spawn_session(support::params(&pg), FAST, BUFFER);
+    let replayed = second.next_event().await?;
+    assert_eq!(replayed["after"]["id"], 2);
+    assert!(
+        confirmed <= support::commit_lsn(&replayed)?,
+        "the undelivered transaction was confirmed"
+    );
+    second.stop().await
+}
+
+#[tokio::test]
+async fn a2_the_slot_waits_for_an_earlier_transaction_held_by_a_retrying_key() -> TestResult {
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &["CREATE TABLE orders (id int PRIMARY KEY, status text)"],
+        &["orders"],
+    )
+    .await?;
+    let mut config = support::config(FAST, BUFFER);
+    config.order_by = OrderBy::Key;
+    config.lanes = 4;
+    let mut session = support::spawn_with(support::params(&pg), config);
+    session.set_mode(Mode::FailContaining("stuck".to_owned()));
+    let before = pg.current_wal_lsn().await?;
+    pg.execute("INSERT INTO orders VALUES (1, 'stuck')").await?;
+    pg.execute("INSERT INTO orders VALUES (2, 'fine')").await?;
+    let later = session.next_event().await?;
+    assert_eq!(later["after"]["id"], 2);
+    session.wait_for_failures(2).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let held = pg
+        .slot_state(SLOT)
+        .await?
+        .ok_or("slot missing")?
+        .confirmed_flush_lsn
+        .ok_or("no position")?;
+    assert!(
+        held <= before,
+        "slot confirmed {held:X} past the unsettled transaction after {before:X}"
+    );
+    session.set_mode(Mode::Deliver);
+    let earlier = session.next_event().await?;
+    assert_eq!(earlier["after"]["id"], 1);
+    let last = support::commit_lsn(&later)?;
+    pg.wait_for_slot(SLOT, WAIT, |state| {
+        state.confirmed_flush_lsn.is_some_and(|lsn| lsn > last)
+    })
+    .await?;
+    session.stop().await
+}
+
+#[tokio::test]
+async fn o2_each_key_reaches_the_sink_in_id_order_across_lanes() -> TestResult {
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &["CREATE TABLE counters (id int PRIMARY KEY, n int)"],
+        &["counters"],
+    )
+    .await?;
+    let mut config = support::config(FAST, BUFFER);
+    config.order_by = OrderBy::Key;
+    config.lanes = 4;
+    let mut session = support::spawn_with(support::params(&pg), config);
+    pg.execute("INSERT INTO counters SELECT g, 0 FROM generate_series(1, 8) g")
+        .await?;
+    for _ in 0..10 {
+        pg.execute("UPDATE counters SET n = n + 1").await?;
+        pg.execute("UPDATE counters SET n = n + 1 WHERE id % 2 = 0")
+            .await?;
+    }
+    let events = session.next_events(8 + 10 * 12).await?;
+    for key in 1..=8 {
+        let per_key: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["key"]["id"] == key)
+            .collect();
+        let ids: Vec<&str> = per_key
+            .iter()
+            .map(|event| event["id"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "key {key}: {ids:?}"
+        );
+        let counts: Vec<i64> = per_key
+            .iter()
+            .filter_map(|event| event["after"]["n"].as_i64())
+            .collect();
+        let expected: Vec<i64> = (0..=if key % 2 == 0 { 20 } else { 10 }).collect();
+        assert_eq!(counts, expected, "key {key}");
+    }
+    assert!(session.no_event_within(Duration::from_millis(500)).await?);
+    session.stop().await
 }
