@@ -77,3 +77,13 @@ done
 [tasks.ci]
 description = "Everything CI runs, locally"
 run = ["mise run lint", "mise run actionlint", "mise run test", "mise run cov"]
+
+[tasks.fixtures]
+description = "Regenerate the decoder's golden pgoutput fixtures on Postgres 14 to 18"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+for v in 14 15 16 17 18; do
+  PGCDC_TEST_PG_VERSION=$v cargo nextest run -p pg-cdc-decoder --test golden --run-ignored only -E 'test(capture_golden_fixtures)'
+done
+'''
