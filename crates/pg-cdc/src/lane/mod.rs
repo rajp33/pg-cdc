@@ -1,0 +1,456 @@
+mod loader;
+mod stored;
+
+#[cfg(test)]
+mod tests;
+
+use std::cmp::Reverse;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
+use tokio::time::Instant;
+
+use crate::ack::{Settled, Ticket};
+use crate::event::EventId;
+use crate::order::OrderKeyId;
+use crate::payload::PayloadStore;
+use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
+use crate::state::{PARTITIONS, ParkedHead, StateStore};
+use crate::supervisor::Backoff;
+
+pub const LINGER: Duration = Duration::from_millis(5);
+pub const RETRY_BASE: Duration = Duration::from_millis(100);
+pub const RETRY_CAP: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+pub struct Pending {
+    pub outbound: Outbound,
+    pub ticket: Ticket,
+    pub arrived: Instant,
+}
+
+#[derive(Debug)]
+pub enum Report {
+    Settled(Settled),
+    Fatal(LaneError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LaneError {
+    #[error("event {id} reached lane {lane} after event {previous}")]
+    OutOfOrder {
+        lane: usize,
+        previous: EventId,
+        id: EventId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("lane {0} has stopped")]
+pub struct LaneStopped(pub usize);
+
+#[derive(Debug, Clone)]
+pub struct Stores {
+    pub state: Arc<dyn StateStore>,
+    pub payload: Option<Arc<dyn PayloadStore>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneSettings {
+    pub lanes: usize,
+    pub park_after: Duration,
+    pub max_parked_events: u64,
+    pub store_concurrency: usize,
+}
+
+#[derive(Debug)]
+enum Inbound {
+    Event(Pending),
+    Head(ParkedHead),
+    Loaded(u8),
+}
+
+#[derive(Debug)]
+pub struct Lanes {
+    inboxes: Vec<mpsc::UnboundedSender<Inbound>>,
+    tasks: JoinSet<()>,
+}
+
+impl Lanes {
+    pub fn spawn(
+        settings: LaneSettings,
+        sink: &Arc<dyn Sink>,
+        stores: &Stores,
+        permits: &Arc<Semaphore>,
+        reports: &mpsc::UnboundedSender<Report>,
+    ) -> Self {
+        let capabilities = sink.capabilities();
+        let mut tasks = JoinSet::new();
+        let inboxes: Vec<_> = (0..settings.lanes.max(1))
+            .map(|index| {
+                let (inbox, receiver) = mpsc::unbounded_channel();
+                let lane = Lane {
+                    index,
+                    sink: Arc::clone(sink),
+                    store: Arc::clone(&stores.state),
+                    permits: Arc::clone(permits),
+                    capabilities,
+                    inbox: receiver,
+                    reports: reports.clone(),
+                    keys: HashMap::new(),
+                    ready: VecDeque::new(),
+                    retries: BinaryHeap::new(),
+                    last: None,
+                    loaded: [false; PARTITIONS],
+                    to_append: BTreeSet::new(),
+                    to_load: VecDeque::new(),
+                    to_remove: Vec::new(),
+                    to_kill: Vec::new(),
+                    heads_in_memory: 0,
+                    store_backoff: Backoff::new(RETRY_BASE, RETRY_CAP),
+                    store_due: None,
+                };
+                tasks.spawn(lane.run());
+                inbox
+            })
+            .collect();
+        tasks.spawn(loader::load(
+            Arc::clone(&stores.state),
+            inboxes.clone(),
+            settings.store_concurrency,
+        ));
+        Self { inboxes, tasks }
+    }
+
+    pub fn dispatch(&self, pending: Pending) -> Result<(), LaneStopped> {
+        let index = pending.outbound.order_key.lane(self.inboxes.len());
+        let inbox = self.inboxes.get(index).ok_or(LaneStopped(index))?;
+        inbox
+            .send(Inbound::Event(pending))
+            .map_err(|_| LaneStopped(index))
+    }
+
+    pub async fn shutdown(mut self) {
+        self.tasks.shutdown().await;
+    }
+}
+
+#[derive(Debug)]
+struct Key {
+    queue: VecDeque<Pending>,
+    backoff: Backoff,
+    failing: bool,
+    stored: Option<Stored>,
+}
+
+impl Key {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            backoff: Backoff::new(RETRY_BASE, RETRY_CAP),
+            failing: false,
+            stored: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Stored {
+    floor: Option<EventId>,
+    head: Option<Outbound>,
+    dead: bool,
+}
+
+struct Lane {
+    index: usize,
+    sink: Arc<dyn Sink>,
+    store: Arc<dyn StateStore>,
+    permits: Arc<Semaphore>,
+    capabilities: SinkCapabilities,
+    inbox: mpsc::UnboundedReceiver<Inbound>,
+    reports: mpsc::UnboundedSender<Report>,
+    keys: HashMap<OrderKeyId, Key>,
+    ready: VecDeque<OrderKeyId>,
+    retries: BinaryHeap<Reverse<(Instant, OrderKeyId)>>,
+    last: Option<EventId>,
+    loaded: [bool; PARTITIONS],
+    to_append: BTreeSet<OrderKeyId>,
+    to_load: VecDeque<OrderKeyId>,
+    to_remove: Vec<(OrderKeyId, EventId)>,
+    to_kill: Vec<(OrderKeyId, EventId)>,
+    heads_in_memory: usize,
+    store_backoff: Backoff,
+    store_due: Option<Instant>,
+}
+
+impl Lane {
+    async fn run(mut self) {
+        loop {
+            while let Ok(inbound) = self.inbox.try_recv() {
+                if !self.accept(inbound) {
+                    return;
+                }
+            }
+            let now = Instant::now();
+            self.promote_due_retries(now);
+            if self.store_work(now).await {
+                continue;
+            }
+            let (count, full) = self.plan_batch();
+            let linger = self.linger_deadline();
+            if let Some(deadline) = linger
+                && (full || Instant::now() >= deadline)
+            {
+                self.send_batch(count).await;
+                continue;
+            }
+            let next_retry = self.retries.peek().map(|Reverse((due, _))| *due);
+            let until = [linger, next_retry, self.store_wake()]
+                .into_iter()
+                .flatten()
+                .min();
+            if !self.wait(until).await {
+                return;
+            }
+        }
+    }
+
+    fn accept(&mut self, inbound: Inbound) -> bool {
+        match inbound {
+            Inbound::Event(pending) => self.accept_event(pending),
+            Inbound::Head(head) => {
+                self.accept_head(head);
+                true
+            }
+            Inbound::Loaded(partition) => {
+                self.partition_loaded(partition);
+                true
+            }
+        }
+    }
+
+    fn accept_event(&mut self, pending: Pending) -> bool {
+        let id = pending.outbound.id;
+        if let Some(previous) = self.last
+            && id <= previous
+        {
+            let error = LaneError::OutOfOrder {
+                lane: self.index,
+                previous,
+                id,
+            };
+            let _ = self.reports.send(Report::Fatal(error));
+            return false;
+        }
+        self.last = Some(id);
+        let key = pending.outbound.order_key;
+        match self.keys.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                if let Some(stored) = &state.stored {
+                    if let Some(floor) = stored.floor
+                        && id < floor
+                    {
+                        if let Ok(settled) = pending.ticket.skip_replayed(id, floor) {
+                            let _ = self.reports.send(Report::Settled(settled));
+                        }
+                        return true;
+                    }
+                    self.to_append.insert(key);
+                }
+                state.queue.push_back(pending);
+            }
+            Entry::Vacant(entry) => {
+                let mut state = Key::new();
+                state.queue.push_back(pending);
+                entry.insert(state);
+                self.make_ready(key);
+            }
+        }
+        true
+    }
+
+    fn is_loaded(&self, key: OrderKeyId) -> bool {
+        self.loaded
+            .get(usize::from(key.partition()))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn make_ready(&mut self, key: OrderKeyId) {
+        if !self.is_loaded(key) {
+            return;
+        }
+        let Some(state) = self.keys.get(&key) else {
+            return;
+        };
+        let head = match &state.stored {
+            Some(stored) => stored.head.as_ref(),
+            None => state.queue.front().map(|pending| &pending.outbound),
+        };
+        let Some(head) = head else {
+            return;
+        };
+        let bytes = head.encoded_len();
+        if bytes > self.capabilities.max_message_bytes {
+            tracing::error!(
+                order_key = %key,
+                id = %head.id,
+                bytes,
+                max_message_bytes = self.capabilities.max_message_bytes,
+                "event exceeds the sink's message size; its order key is blocked"
+            );
+            return;
+        }
+        self.ready.push_back(key);
+    }
+
+    fn promote_due_retries(&mut self, now: Instant) {
+        while let Some(Reverse((due, key))) = self.retries.peek().copied() {
+            if due > now {
+                break;
+            }
+            self.retries.pop();
+            match self.keys.get(&key) {
+                Some(Key {
+                    stored: Some(_), ..
+                }) => self.to_load.push_back(key),
+                Some(_) => self.make_ready(key),
+                None => {}
+            }
+        }
+    }
+
+    fn front(&self, key: &OrderKeyId) -> Option<&Outbound> {
+        let state = self.keys.get(key)?;
+        match &state.stored {
+            Some(stored) => stored.head.as_ref(),
+            None => state.queue.front().map(|pending| &pending.outbound),
+        }
+    }
+
+    fn linger_deadline(&self) -> Option<Instant> {
+        let key = self.ready.front()?;
+        let state = self.keys.get(key)?;
+        match &state.stored {
+            Some(_) => Some(Instant::now()),
+            None => Some(state.queue.front()?.arrived + LINGER),
+        }
+    }
+
+    fn plan_batch(&self) -> (usize, bool) {
+        let limits = self.capabilities;
+        let mut count = 0;
+        let mut bytes = 0_usize;
+        for key in &self.ready {
+            let Some(head) = self.front(key) else {
+                continue;
+            };
+            let size = head.encoded_len();
+            if count == limits.max_batch_messages
+                || (count > 0 && bytes.saturating_add(size) > limits.max_batch_bytes)
+            {
+                return (count, true);
+            }
+            count += 1;
+            bytes = bytes.saturating_add(size);
+        }
+        (count, count >= limits.max_batch_messages)
+    }
+
+    async fn wait(&mut self, until: Option<Instant>) -> bool {
+        let timer = async {
+            match until {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            received = self.inbox.recv() => match received {
+                Some(inbound) => self.accept(inbound),
+                None => false,
+            },
+            () = timer => true,
+        }
+    }
+
+    async fn send_batch(&mut self, count: usize) {
+        let mut keys = Vec::with_capacity(count);
+        let mut batch = Vec::with_capacity(count);
+        for key in self.ready.drain(..count).collect::<Vec<_>>() {
+            if let Some(head) = self.front(&key) {
+                batch.push(head.clone());
+                keys.push(key);
+            }
+        }
+        let outcomes = match self.permits.acquire().await {
+            Ok(_permit) => self.sink.send(&batch).await,
+            Err(_) => Vec::new(),
+        };
+        if outcomes.len() != batch.len() {
+            tracing::error!(
+                sent = batch.len(),
+                outcomes = outcomes.len(),
+                "the sink broke its contract of one outcome per message"
+            );
+        }
+        let mut outcomes = outcomes.into_iter();
+        for key in keys {
+            let outcome = outcomes.next().unwrap_or_else(|| {
+                Outcome::Retryable(SinkError("the sink returned no outcome".to_owned()))
+            });
+            self.complete(key, &outcome);
+        }
+    }
+
+    fn complete(&mut self, key: OrderKeyId, outcome: &Outcome) {
+        let Some(state) = self.keys.get_mut(&key) else {
+            return;
+        };
+        if state.stored.is_some() {
+            self.complete_stored(key, outcome);
+            return;
+        }
+        match outcome {
+            Outcome::Delivered => {
+                let Some(head) = state.queue.pop_front() else {
+                    return;
+                };
+                if let Ok(settled) = head.ticket.settle(outcome) {
+                    let _ = self.reports.send(Report::Settled(settled));
+                }
+                if state.queue.is_empty() {
+                    self.keys.remove(&key);
+                } else {
+                    state.backoff.reset();
+                    state.failing = false;
+                    self.make_ready(key);
+                }
+            }
+            Outcome::Retryable(error) => {
+                let delay = state.backoff.next_delay();
+                let id = state.queue.front().map(|head| head.outbound.id);
+                if state.failing {
+                    tracing::debug!(order_key = %key, ?id, %error, ?delay, "delivery failed again; retrying");
+                } else {
+                    tracing::warn!(order_key = %key, ?id, %error, ?delay, "delivery failed; retrying");
+                }
+                state.failing = true;
+                self.retries.push(Reverse((Instant::now() + delay, key)));
+            }
+            Outcome::Terminal(error) => {
+                let id = state.queue.front().map(|head| head.outbound.id);
+                tracing::error!(
+                    order_key = %key,
+                    ?id,
+                    %error,
+                    "the sink rejected the event for good; its order key is blocked"
+                );
+            }
+        }
+    }
+}

@@ -69,6 +69,16 @@ pub(crate) fn config(status_interval: Duration, buffer: usize) -> SessionConfig 
     }
 }
 
+pub(crate) fn order_key(id: i64) -> Vec<u8> {
+    format!(r#"["public","orders",{id}]"#).into_bytes()
+}
+
+pub(crate) const LIMITS: SinkCapabilities = SinkCapabilities {
+    max_batch_messages: 10,
+    max_batch_bytes: 1 << 20,
+    max_message_bytes: 1 << 20,
+};
+
 pub(crate) fn memory_stores() -> Stores {
     Stores {
         state: Arc::new(MemoryStateStore::new()),
@@ -86,6 +96,7 @@ pub(crate) enum Mode {
 
 #[derive(Debug)]
 pub(crate) struct TestSink {
+    limits: SinkCapabilities,
     mode: watch::Receiver<Mode>,
     failures: watch::Sender<u64>,
     delivered: mpsc::UnboundedSender<Bytes>,
@@ -94,11 +105,7 @@ pub(crate) struct TestSink {
 #[async_trait]
 impl Sink for TestSink {
     fn capabilities(&self) -> SinkCapabilities {
-        SinkCapabilities {
-            max_batch_messages: 10,
-            max_batch_bytes: 1 << 20,
-            max_message_bytes: 1 << 20,
-        }
+        self.limits
     }
 
     async fn preflight(&self) -> Result<(), SinkError> {
@@ -154,16 +161,34 @@ pub(crate) fn spawn_session(
 }
 
 pub(crate) fn spawn_with(params: ConnectParams, config: SessionConfig) -> Running {
+    spawn_full(params, config, memory_stores(), LIMITS)
+}
+
+pub(crate) fn spawn_with_stores(
+    params: ConnectParams,
+    config: SessionConfig,
+    stores: Stores,
+) -> Running {
+    spawn_full(params, config, stores, LIMITS)
+}
+
+pub(crate) fn spawn_full(
+    params: ConnectParams,
+    config: SessionConfig,
+    stores: Stores,
+    limits: SinkCapabilities,
+) -> Running {
     let (mode, mode_receiver) = watch::channel(Mode::Deliver);
     let (failures_sender, failures) = watch::channel(0);
     let (delivered, events) = mpsc::unbounded_channel();
     let sink: Arc<dyn Sink> = Arc::new(TestSink {
+        limits,
         mode: mode_receiver,
         failures: failures_sender,
         delivered,
     });
     let shutdown = CancellationToken::new();
-    let task = spawn_run(params, config, sink, memory_stores(), shutdown.clone());
+    let task = spawn_run(params, config, sink, stores, shutdown.clone());
     Running {
         shutdown,
         task,

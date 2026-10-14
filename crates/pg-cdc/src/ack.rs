@@ -2,7 +2,9 @@ use std::collections::VecDeque;
 
 use pg_cdc_decoder::Lsn;
 
+use crate::event::EventId;
 use crate::sink::Outcome;
+use crate::state::StoreError;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AckError {
@@ -34,6 +36,27 @@ impl Ticket {
                 bytes: self.bytes,
             }),
             Outcome::Retryable(_) | Outcome::Terminal(_) => Err(self),
+        }
+    }
+
+    pub fn park(self, appended: &Result<(), StoreError>) -> Result<Settled, Self> {
+        match appended {
+            Ok(()) => Ok(Settled {
+                txn: self.txn,
+                bytes: self.bytes,
+            }),
+            Err(_) => Err(self),
+        }
+    }
+
+    pub fn skip_replayed(self, id: EventId, floor: EventId) -> Result<Settled, Self> {
+        if id < floor {
+            Ok(Settled {
+                txn: self.txn,
+                bytes: self.bytes,
+            })
+        } else {
+            Err(self)
         }
     }
 }
@@ -195,6 +218,38 @@ mod tests {
         assert_eq!(ticket.bytes(), 7);
         assert_eq!(ack.commit(Lsn(200)), Ok(Lsn(100)));
         assert_eq!(ack.settle(delivered(ticket)), Ok(Lsn(200)));
+    }
+
+    #[test]
+    fn a1_a_park_settles_a_ticket_only_once_the_store_confirms_it() {
+        let mut ack = AckTracker::new(Lsn(100));
+        ack.begin().unwrap();
+        let ticket = ack.track(5).unwrap();
+        let failed = Err(StoreError::Unavailable("SlowDown".to_owned()));
+        let ticket = ticket.park(&failed).unwrap_err();
+        assert_eq!(ack.commit(Lsn(200)), Ok(Lsn(100)));
+        let settled = ticket.park(&Ok(())).unwrap();
+        assert_eq!(ack.settle(settled), Ok(Lsn(200)));
+        assert_eq!(ack.inflight_bytes(), 0);
+    }
+
+    #[test]
+    fn a1_a_replayed_event_settles_only_below_its_queues_floor() {
+        let mut ack = AckTracker::new(Lsn(100));
+        ack.begin().unwrap();
+        let ticket = ack.track(5).unwrap();
+        let floor = EventId::new(Lsn(0x50), 2);
+        let ticket = ticket
+            .skip_replayed(EventId::new(Lsn(0x50), 2), floor)
+            .unwrap_err();
+        let ticket = ticket
+            .skip_replayed(EventId::new(Lsn(0x60), 0), floor)
+            .unwrap_err();
+        let settled = ticket
+            .skip_replayed(EventId::new(Lsn(0x50), 1), floor)
+            .unwrap();
+        ack.commit(Lsn(200)).unwrap();
+        assert_eq!(ack.settle(settled), Ok(Lsn(200)));
     }
 
     #[test]
