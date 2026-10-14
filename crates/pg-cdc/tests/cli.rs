@@ -340,6 +340,10 @@ async fn run_publishes_to_sns_with_attributes_and_logs_to_stdout() -> TestResult
     )?;
     let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
     wait_for_line(&mut stdout, "pg-cdc starting").await?;
+    let ready: Value = serde_json::from_str(&wait_for_line(&mut stdout, "SNS topic ready").await?)?;
+    assert_eq!(ready["fields"]["max_message_bytes"], 256 * 1024);
+    assert_eq!(ready["fields"]["limit_from_topic"], false);
+    assert_eq!(ready["fields"]["fifo"], false);
     pg.execute("INSERT INTO orders VALUES (1, 'paid')").await?;
     let messages = aws.receive(&route.queue_url, 1, WAIT).await?;
     let message = messages.first().ok_or("no message")?;

@@ -251,6 +251,13 @@ impl Sink for SnsSink {
                 SinkError(format!("cannot read SNS topic {}: {error}", self.topic_arn))
             })?;
         let topic = Topic::from_attributes(&attributes);
+        tracing::info!(
+            topic_arn = %self.topic_arn,
+            fifo = topic.fifo,
+            max_message_bytes = topic.max_message_bytes,
+            limit_from_topic = attributes.contains_key("MaximumMessageSize"),
+            "SNS topic ready"
+        );
         if topic.fifo && self.fair_queue_group.is_some() {
             tracing::warn!(
                 "sink.fair_queue_group is ignored on a FIFO topic, where the order key is the message group"
