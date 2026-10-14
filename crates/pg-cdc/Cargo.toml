@@ -16,6 +16,7 @@ aws-config.workspace = true
 aws-sdk-rds.workspace = true
 aws-smithy-http-client.workspace = true
 pg-cdc-decoder.workspace = true
+pg-cdc-replication.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 secrecy.workspace = true
@@ -23,9 +24,10 @@ serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
 tokio-postgres.workspace = true
 tokio-postgres-rustls.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 webpki-roots.workspace = true
 
@@ -33,4 +35,11 @@ webpki-roots.workspace = true
 pg-cdc-testkit.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "time",
+] }

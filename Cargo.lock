@@ -2196,6 +2196,7 @@ dependencies = [
  "aws-sdk-rds",
  "aws-smithy-http-client",
  "pg-cdc-decoder",
+ "pg-cdc-replication",
  "pg-cdc-testkit",
  "proptest",
  "rustls",
@@ -2209,6 +2210,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tokio-util",
  "tracing",
  "webpki-roots",
 ]
