@@ -13,7 +13,7 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use super::{ConnectError, TlsConfig};
 use crate::config::TlsMode;
 
-pub(super) fn client_config(tls: &TlsConfig) -> Result<Option<ClientConfig>, ConnectError> {
+pub(super) async fn client_config(tls: &TlsConfig) -> Result<Option<ClientConfig>, ConnectError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()?;
@@ -24,7 +24,7 @@ pub(super) fn client_config(tls: &TlsConfig) -> Result<Option<ClientConfig>, Con
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate { provider }))
             .with_no_client_auth(),
         TlsMode::VerifyCa => {
-            let roots = Arc::new(root_store(tls.ca_file.as_deref())?);
+            let roots = Arc::new(root_store(tls.ca_file.as_deref()).await?);
             let inner = WebPkiServerVerifier::builder_with_provider(roots, provider).build()?;
             builder
                 .dangerous()
@@ -32,13 +32,13 @@ pub(super) fn client_config(tls: &TlsConfig) -> Result<Option<ClientConfig>, Con
                 .with_no_client_auth()
         }
         TlsMode::VerifyFull => builder
-            .with_root_certificates(root_store(tls.ca_file.as_deref())?)
+            .with_root_certificates(root_store(tls.ca_file.as_deref()).await?)
             .with_no_client_auth(),
     };
     Ok(Some(config))
 }
 
-fn root_store(ca_file: Option<&Path>) -> Result<RootCertStore, ConnectError> {
+async fn root_store(ca_file: Option<&Path>) -> Result<RootCertStore, ConnectError> {
     let Some(path) = ca_file else {
         return Ok(webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect());
     };
@@ -46,8 +46,11 @@ fn root_store(ca_file: Option<&Path>) -> Result<RootCertStore, ConnectError> {
         path: path.to_owned(),
         source,
     };
+    let pem = tokio::fs::read(path)
+        .await
+        .map_err(|error| ca_error(rustls_pki_types::pem::Error::Io(error)))?;
     let mut store = RootCertStore::empty();
-    for certificate in CertificateDer::pem_file_iter(path).map_err(ca_error)? {
+    for certificate in CertificateDer::pem_slice_iter(&pem) {
         store.add(certificate.map_err(ca_error)?)?;
     }
     if store.is_empty() {
@@ -156,5 +159,38 @@ impl ServerCertVerifier for IgnoreHostName {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.inner.supported_verify_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_missing_ca_file_is_an_error_naming_the_file() {
+        let error = root_store(Some(Path::new("/nonexistent/ca.pem")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ConnectError::CaFile { path, source: rustls_pki_types::pem::Error::Io(_) } if path == Path::new("/nonexistent/ca.pem")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ca_file_without_certificates_is_rejected() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "not a certificate\n").unwrap();
+        let error = root_store(Some(file.path())).await.unwrap_err();
+        assert!(
+            matches!(&error, ConnectError::EmptyCaFile(path) if path == file.path()),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_ca_file_the_webpki_roots_are_trusted() {
+        let store = root_store(None).await.unwrap();
+        assert_eq!(store.len(), webpki_roots::TLS_SERVER_ROOTS.len());
     }
 }

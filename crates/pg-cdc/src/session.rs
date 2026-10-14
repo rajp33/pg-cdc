@@ -91,7 +91,7 @@ pub async fn run_session<W: AsyncWrite + Unpin + Send>(
     {
         tracing::warn!(%schema, %table, "published table does not use REPLICA IDENTITY FULL");
     }
-    let mut stream = ReplicationStream::start(replication_config(&params, config, start)?)
+    let mut stream = ReplicationStream::start(replication_config(&params, config, start).await?)
         .await
         .map_err(|error| stream_fault(error, start))?;
     let mut position = start;
@@ -162,7 +162,7 @@ async fn finish_or_abandon<F: Future>(
     tokio::time::timeout(grace, work).await.ok()
 }
 
-fn replication_config(
+async fn replication_config(
     params: &ConnectParams,
     config: &SessionConfig,
     start: Lsn,
@@ -175,7 +175,7 @@ fn replication_config(
         database: params.database.clone(),
         options: SESSION_OPTIONS.to_owned(),
         application_name: "pg-cdc".to_owned(),
-        tls: replication_tls(params)?,
+        tls: replication_tls(params).await?,
         slot: config.slot.clone(),
         publication: config.publication.clone(),
         start_lsn: start,

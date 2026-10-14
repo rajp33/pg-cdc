@@ -65,8 +65,8 @@ pub enum ConnectError {
     ServerName(String),
 }
 
-pub fn replication_tls(params: &ConnectParams) -> Result<Option<TlsSetup>, ConnectError> {
-    let Some(config) = tls::client_config(&params.tls)? else {
+pub async fn replication_tls(params: &ConnectParams) -> Result<Option<TlsSetup>, ConnectError> {
+    let Some(config) = tls::client_config(&params.tls).await? else {
         return Ok(None);
     };
     let server_name = ServerName::try_from(params.host.clone())
@@ -113,14 +113,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replication_tls_follows_the_mode_and_takes_the_server_name_from_the_host() {
+    #[tokio::test]
+    async fn replication_tls_follows_the_mode_and_takes_the_server_name_from_the_host() {
         assert!(
             replication_tls(&params("db.internal", TlsMode::Disable))
+                .await
                 .unwrap()
                 .is_none()
         );
         let by_name = replication_tls(&params("db.internal", TlsMode::VerifyFull))
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -128,10 +130,13 @@ mod tests {
             ServerName::try_from("db.internal").unwrap()
         );
         let by_address = replication_tls(&params("127.0.0.1", TlsMode::Require))
+            .await
             .unwrap()
             .unwrap();
         assert!(matches!(by_address.server_name, ServerName::IpAddress(_)));
-        let error = replication_tls(&params("not a host!", TlsMode::Require)).unwrap_err();
+        let error = replication_tls(&params("not a host!", TlsMode::Require))
+            .await
+            .unwrap_err();
         assert!(matches!(error, ConnectError::ServerName(host) if host == "not a host!"));
     }
 }

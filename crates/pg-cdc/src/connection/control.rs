@@ -64,7 +64,7 @@ async fn establish(
     if let Some(password) = &params.password {
         config.password(password.expose_secret());
     }
-    match tls::client_config(&params.tls)? {
+    match tls::client_config(&params.tls).await? {
         None => {
             config.ssl_mode(SslMode::Disable);
             let (client, connection) = config.connect(NoTls).await?;
