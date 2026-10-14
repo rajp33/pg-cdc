@@ -79,7 +79,7 @@ The sink, the state store, the payload store and the Postgres connection are ada
 
 - **supabase/etl is not a good base.** It is git-only, its destination trait is shaped for warehouses, and its fixed password breaks IAM tokens.
   - Its feedback rules are adopted: the checkpoint is a commit's end LSN, recorded only once the commit's events are durable, and the keepalive's `wal_end` is acknowledged when idle.
-- **pg-cdc vendors the pgwire-replication transport** and writes its own pgoutput decoder.
+- **pg-cdc writes its own replication transport and pgoutput decoder.** The transport is a small client built on `postgres-protocol`, the message codec and SCRAM implementation behind tokio-postgres. pgwire-replication informed its design and is not vendored.
 - **Status updates keep flowing under backpressure.** pgwire-replication and SpiceAI learned this the hard way: stopping feedback while a channel is full lets `wal_sender_timeout` drop the connection.
 - **A keepalive's `wal_end` is safe to acknowledge when nothing is pending,** as in Materialize.
 
@@ -133,9 +133,9 @@ admin HTTP: /healthz /readyz /status /parked
 **Workspace**
 
 - `crates/decoder` (package `pg-cdc-decoder`): a pure, fuzzed decoder for pgoutput messages and Postgres text values. The name avoids the unrelated `pgoutput` crate on crates.io.
-- `crates/replication` (package `pg-cdc-replication`): the vendored pgwire-replication transport (MIT/Apache-2.0).
-  - It is renamed so it can't clash with the published crate.
-  - It is patched only to expose the backend PID.
+- `crates/replication` (package `pg-cdc-replication`): the replication transport.
+  - It covers startup, TLS, authentication (cleartext, MD5 and SCRAM-SHA-256), `START_REPLICATION`, and standby status updates on its own timer.
+  - It exposes the walsender's backend PID from BackendKeyData.
 - `crates/pg-cdc`: the binary and library.
 - `crates/loadgen`: a load generator, not shipped.
 
@@ -939,7 +939,7 @@ GitHub Actions runs:
 Each milestone ends in working, tested software and gets its own implementation plan.
 
 1. **Stream.**
-   - Build: the workspace, the vendored transport, the ConnectionProvider (`password`, `aws_rds_iam`), the decoder and value mapping (with fixtures, fuzzing and `to_jsonb` tests), the envelope, and the `stdout` sink.
+   - Build: the workspace, the replication transport, the ConnectionProvider (`password`, `aws_rds_iam`), the decoder and value mapping (with fixtures, fuzzing and `to_jsonb` tests), the envelope, and the `stdout` sink.
    - Outcome: changes stream end to end, and the slot is acknowledged after delivery.
 2. **Deliver.** Order keys, lanes, the ack tracker, the status task, backpressure, the Sink trait, the SNS and `discard` sinks, and retries.
 3. **Park.**
@@ -994,7 +994,7 @@ Each milestone ends in working, tested software and gets its own implementation 
 |---|---|
 | Aurora may drop logical slots on writer failover. AWS doesn't document it, and one AWS post says it does. | Test in staging before production; alert and follow the runbook (§13.3); backfills arrive in v1.1 |
 | SNS topics above 256 KiB may restrict subscription types, and the `PublishBatch` aggregate limit for such topics is unverified | Verify during milestone 2; `preflight` reads limits from the topic |
-| The vendored transport needs a patch (backend PID) and ongoing maintenance | Keep patches minimal, behind an internal trait |
+| The in-house transport is protocol code pg-cdc maintains | Keep it small and behind the transport crate's API; test it against a fake server and against Postgres 14 to 18 |
 | Fencing assumes no process pauses for longer than `fence_delay` | Only duplicates result; documented |
 | Parking during a long outage costs about $5 per million events on S3 | `max_parked_events`; a segmented layout in v1.1 if needed |
 | Primary keys are read from the current catalog, not as of the WAL position | A key change during traffic can mis-key a few events; documented |
