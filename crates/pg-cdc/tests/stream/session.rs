@@ -262,3 +262,30 @@ async fn special_character_password_streams() -> TestResult {
     assert_eq!(session.next_event().await?["after"]["id"], 3);
     session.stop().await
 }
+
+#[tokio::test]
+async fn shutdown_during_a_wide_event_write_leaves_only_whole_lines() -> TestResult {
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &["CREATE TABLE docs (id int PRIMARY KEY, body text)"],
+        &["docs"],
+    )
+    .await?;
+    let session = support::spawn_session(support::params(&pg), FAST, 1024);
+    pg.execute("INSERT INTO docs VALUES (1, repeat('x', 65536))")
+        .await?;
+    let output = session.stop_once_output_starts().await?;
+    assert_eq!(output.last(), Some(&b'\n'), "output ends mid-line");
+    let lines: Vec<Value> = output
+        .split_inclusive(|&byte| byte == b'\n')
+        .map(serde_json::from_slice)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["after"]["id"], 1);
+    assert_eq!(
+        lines[0]["after"]["body"].as_str().map(str::len),
+        Some(65536)
+    );
+    Ok(())
+}

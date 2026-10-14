@@ -19,6 +19,7 @@ use crate::event::{BuildError, Builder, Built, ColumnInfo, RelationInfo};
 use crate::sink::StdoutSink;
 
 pub const REPLICATION_BUFFER: usize = 1024;
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -104,12 +105,15 @@ pub async fn run_session<W: AsyncWrite + Unpin + Send>(
             received = stream.recv() => received,
         };
         let event = received?.ok_or(SessionError::StreamEnded)?;
-        let confirmed = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => break,
-            handled = session.handle(event) => handled?,
+        let Some(handled) = finish_or_abandon(session.handle(event), shutdown, DRAIN_TIMEOUT).await
+        else {
+            tracing::warn!(
+                timeout_ms = DRAIN_TIMEOUT.as_millis(),
+                "abandoned an event still being written at shutdown"
+            );
+            break;
         };
-        if let Some(lsn) = confirmed {
+        if let Some(lsn) = handled? {
             stream.confirm(lsn);
         }
     }
@@ -117,6 +121,20 @@ pub async fn run_session<W: AsyncWrite + Unpin + Send>(
         tracing::warn!(%error, "replication stream did not stop cleanly");
     }
     Ok(())
+}
+
+async fn finish_or_abandon<F: Future>(
+    work: F,
+    shutdown: &CancellationToken,
+    grace: Duration,
+) -> Option<F::Output> {
+    let mut work = std::pin::pin!(work);
+    tokio::select! {
+        biased;
+        output = &mut work => return Some(output),
+        () = shutdown.cancelled() => {}
+    }
+    tokio::time::timeout(grace, work).await.ok()
 }
 
 fn replication_config(
@@ -268,4 +286,52 @@ fn known(
     relations
         .get(&oid)
         .ok_or(SessionError::UnknownRelation { wal_start, oid })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn work_started_before_shutdown_finishes_within_the_grace_period() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let work = async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            7
+        };
+        assert_eq!(
+            finish_or_abandon(work, &shutdown, DRAIN_TIMEOUT).await,
+            Some(7)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_still_running_after_the_grace_period_is_abandoned() {
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            token.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        let work = tokio::time::sleep(Duration::from_secs(60));
+        assert_eq!(
+            finish_or_abandon(work, &shutdown, DRAIN_TIMEOUT).await,
+            None
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(1) + DRAIN_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_runs_to_completion_without_shutdown() {
+        let work = async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            "done"
+        };
+        assert_eq!(
+            finish_or_abandon(work, &CancellationToken::new(), DRAIN_TIMEOUT).await,
+            Some("done")
+        );
+    }
 }

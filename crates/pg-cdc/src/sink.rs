@@ -1,5 +1,7 @@
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter, Stdout};
 
+const BUFFER_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Delivered {
     events: u64,
@@ -26,14 +28,21 @@ impl StdoutSink<Stdout> {
 impl<W: AsyncWrite + Unpin> StdoutSink<W> {
     pub fn new(writer: W) -> Self {
         Self {
-            out: BufWriter::new(writer),
+            out: BufWriter::with_capacity(BUFFER_BYTES, writer),
             pending: 0,
         }
     }
 
     pub async fn write(&mut self, body: &[u8]) -> std::io::Result<()> {
-        self.out.write_all(body).await?;
-        self.out.write_all(b"\n").await?;
+        let mut line = Vec::with_capacity(body.len() + 1);
+        line.extend_from_slice(body);
+        line.push(b'\n');
+        if line.len() < BUFFER_BYTES {
+            self.out.write_all(&line).await?;
+        } else {
+            self.out.flush().await?;
+            self.out.get_mut().write_all(&line).await?;
+        }
         self.pending += 1;
         Ok(())
     }
@@ -57,8 +66,46 @@ impl<W: AsyncWrite + Unpin> StdoutSink<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+
+    #[derive(Default)]
+    struct Chunks(Vec<Vec<u8>>);
+
+    impl AsyncWrite for Chunks {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_larger_than_the_buffer_reaches_the_writer_as_one_chunk() {
+        let mut sink = StdoutSink::new(Chunks::default());
+        sink.write(b"{}").await.unwrap();
+        let wide = vec![b'x'; 64 * 1024];
+        sink.write(&wide).await.unwrap();
+        sink.flush().await.unwrap();
+        let chunks = &sink.out.get_ref().0;
+        let sizes: Vec<usize> = chunks.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [3, wide.len() + 1]);
+        assert_eq!(chunks[0], b"{}\n");
+        assert_eq!(chunks[1].last(), Some(&b'\n'));
+    }
 
     #[tokio::test]
     async fn writes_json_lines_and_receipts_count_flushed_events() {

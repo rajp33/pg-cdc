@@ -8,7 +8,7 @@ use pg_cdc::sink::StdoutSink;
 use pg_cdc_testkit::Postgres;
 use secrecy::SecretString;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, DuplexStream, Lines};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -109,6 +109,16 @@ impl Running {
         self.shutdown.cancel();
         self.task.await??;
         Ok(())
+    }
+
+    pub(crate) async fn stop_once_output_starts(self) -> TestResult<Vec<u8>> {
+        let mut reader = self.lines.into_inner();
+        let mut output = vec![0u8];
+        tokio::time::timeout(WAIT, reader.read_exact(&mut output)).await??;
+        self.shutdown.cancel();
+        tokio::time::timeout(WAIT, reader.read_to_end(&mut output)).await??;
+        self.task.await??;
+        Ok(output)
     }
 
     pub(crate) async fn abort(self) -> TestResult {
