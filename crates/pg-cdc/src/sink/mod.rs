@@ -111,7 +111,7 @@ fn attribute_value(value: &Value) -> Option<AttributeValue> {
         Value::Number(number) => {
             let text = number.to_string();
             let digits = text.bytes().filter(u8::is_ascii_digit).count();
-            if digits <= SNS_MAX_NUMBER_DIGITS {
+            if digits <= SNS_MAX_NUMBER_DIGITS && !text.contains(['e', 'E']) {
                 Some(AttributeValue::Number(text))
             } else {
                 Some(AttributeValue::String(text))
@@ -203,11 +203,14 @@ mod tests {
                 "blank": "",
                 "huge": serde_json::Number::from_string_unchecked("1".repeat(39)),
                 "wide": serde_json::Number::from_string_unchecked("1".repeat(38)),
+                "vast": serde_json::Number::from_string_unchecked("1e+300".to_owned()),
+                "tiny": serde_json::Number::from_string_unchecked("1.5e-7".to_owned()),
+                "large": serde_json::Number::from_string_unchecked("1e+15".to_owned()),
             })),
         );
         let names = columns(&[
             "tenant", "count", "ratio", "flag", "tags", "doc", "nothing", "blank", "absent",
-            "huge", "wide",
+            "huge", "wide", "vast", "tiny", "large",
         ]);
         let outbound = Outbound::encode(&envelope, OrderKeyId::of(b"[]"), &names).unwrap();
         let extra: Vec<(&str, &AttributeValue)> = outbound
@@ -227,10 +230,25 @@ mod tests {
                 ("doc", &string(r#"{"k":1}"#)),
                 ("huge", &string(&"1".repeat(39))),
                 ("wide", &number(&"1".repeat(38))),
+                ("vast", &string("1e+300")),
+                ("tiny", &string("1.5e-7")),
+                ("large", &string("1e+15")),
             ]
         );
         assert_eq!(outbound.attribute("tenant"), Some(&string("acme")));
         assert_eq!(outbound.attribute("nothing"), None);
+    }
+
+    #[test]
+    fn numbers_in_exponent_form_are_strings_whatever_the_exponent_case() {
+        for text in ["2.5E-200", "1E+15", "-3e7", "0e0"] {
+            let value = Value::Number(serde_json::Number::from_string_unchecked(text.to_owned()));
+            assert_eq!(attribute_value(&value), Some(string(text)), "{text}");
+        }
+        for text in ["-12.5", "0.000001", "100000000000000000000"] {
+            let value = Value::Number(serde_json::Number::from_string_unchecked(text.to_owned()));
+            assert_eq!(attribute_value(&value), Some(number(text)), "{text}");
+        }
     }
 
     #[test]
