@@ -800,5 +800,95 @@ mod tests {
                 Ok(())
             })?;
         }
+
+        #[test]
+        fn o2_a1_a_terminal_event_blocks_only_its_key_and_never_settles(
+            keys in proptest::collection::vec(0u8..5, 1..40),
+            fates in proptest::collection::vec(0u32..6, 40),
+            lanes in 1usize..4,
+        ) {
+            const TERMINAL: u32 = 5;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            let fate = |ordinal: usize| fates[ordinal % fates.len()];
+            let mut blocked = [false; 5];
+            let mut settled = Vec::new();
+            let mut terminal = Vec::new();
+            for (ordinal, key) in keys.iter().enumerate() {
+                let key = usize::from(*key);
+                if blocked[key] {
+                    continue;
+                }
+                if fate(ordinal) == TERMINAL {
+                    blocked[key] = true;
+                    terminal.push(u32::try_from(ordinal).unwrap());
+                } else {
+                    settled.push(u32::try_from(ordinal).unwrap());
+                }
+            }
+            let first_unsettled = (0..keys.len())
+                .find(|ordinal| !settled.contains(&u32::try_from(*ordinal).unwrap()));
+            let confirmed = match first_unsettled {
+                None => Lsn(100 + u64::try_from(keys.len() - 1).unwrap()),
+                Some(0) => Lsn(0),
+                Some(ordinal) => Lsn(100 + u64::try_from(ordinal - 1).unwrap()),
+            };
+            runtime.block_on(async {
+                let fates = fates.clone();
+                let script: Script = Box::new(move |ordinal, attempt| {
+                    let fate = fates[usize::try_from(ordinal).unwrap() % fates.len()];
+                    if fate == TERMINAL && attempt > 1 {
+                        Outcome::Terminal(SinkError("rejected".to_owned()))
+                    } else if attempt <= fate {
+                        Outcome::Retryable(SinkError("flaky".to_owned()))
+                    } else {
+                        Outcome::Delivered
+                    }
+                });
+                let mut harness = Harness::new(lanes, 2, ScriptedSink::new(LIMITS, script));
+                for (ordinal, key) in keys.iter().enumerate() {
+                    harness.send(u32::try_from(ordinal).unwrap(), &[*key], 10).unwrap();
+                }
+                prop_assert_eq!(harness.settle(settled.len()).await, confirmed);
+                prop_assert!(harness.quiet_for(Duration::from_secs(600)).await);
+                prop_assert_eq!(harness.ack.confirmed(), confirmed);
+                prop_assert_eq!(harness.ack.inflight_events(), u64::try_from(keys.len() - settled.len()).unwrap());
+                let sends = harness.sink.sends();
+                let delivered: Vec<u32> = sends
+                    .iter()
+                    .filter(|sent| sent.delivered)
+                    .map(|sent| sent.ordinal)
+                    .collect();
+                let mut delivered_sorted = delivered.clone();
+                delivered_sorted.sort_unstable();
+                prop_assert_eq!(&delivered_sorted, &settled);
+                let mut sent: Vec<u32> = sends.iter().map(|sent| sent.ordinal).collect();
+                sent.sort_unstable();
+                sent.dedup();
+                let mut expected_sent: Vec<u32> = settled.iter().chain(&terminal).copied().collect();
+                expected_sent.sort_unstable();
+                prop_assert_eq!(sent, expected_sent);
+                for ordinal in &terminal {
+                    let attempts = sends.iter().filter(|sent| sent.ordinal == *ordinal).count();
+                    prop_assert_eq!(attempts, 2, "terminal event {} was sent again", ordinal);
+                }
+                for key in 0u8..5 {
+                    let per_key: Vec<&Sent> = sends
+                        .iter()
+                        .filter(|sent| keys[usize::try_from(sent.ordinal).unwrap()] == key)
+                        .collect();
+                    for pair in per_key.windows(2) {
+                        prop_assert!(pair[0].ordinal <= pair[1].ordinal);
+                        if pair[0].ordinal != pair[1].ordinal {
+                            prop_assert!(pair[0].delivered, "{} sent before {} was delivered", pair[1].ordinal, pair[0].ordinal);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
     }
 }
