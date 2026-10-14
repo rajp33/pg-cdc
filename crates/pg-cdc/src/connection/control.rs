@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use secrecy::ExposeSecret;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -32,7 +33,25 @@ impl Drop for ControlConnection {
     }
 }
 
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn connect_control(params: &ConnectParams) -> Result<ControlConnection, ConnectError> {
+    connect_control_with_timeout(params, CONNECT_TIMEOUT).await
+}
+
+pub async fn connect_control_with_timeout(
+    params: &ConnectParams,
+    timeout: Duration,
+) -> Result<ControlConnection, ConnectError> {
+    tokio::time::timeout(timeout, establish(params, timeout))
+        .await
+        .map_err(|_| ConnectError::Timeout(timeout))?
+}
+
+async fn establish(
+    params: &ConnectParams,
+    timeout: Duration,
+) -> Result<ControlConnection, ConnectError> {
     let mut config = tokio_postgres::Config::new();
     config
         .host(&params.host)
@@ -40,7 +59,8 @@ pub async fn connect_control(params: &ConnectParams) -> Result<ControlConnection
         .dbname(&params.database)
         .user(&params.user)
         .options(SESSION_OPTIONS)
-        .application_name("pg-cdc");
+        .application_name("pg-cdc")
+        .connect_timeout(timeout);
     if let Some(password) = &params.password {
         config.password(password.expose_secret());
     }

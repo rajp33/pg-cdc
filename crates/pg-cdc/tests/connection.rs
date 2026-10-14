@@ -2,7 +2,8 @@ use aws_config::{BehaviorVersion, Region};
 use aws_sdk_rds::config::Credentials;
 use pg_cdc::config::TlsMode;
 use pg_cdc::connection::{
-    ConnectParams, ConnectionProvider, PasswordProvider, RdsIamProvider, TlsConfig, connect_control,
+    ConnectError, ConnectParams, ConnectionProvider, PasswordProvider, RdsIamProvider, TlsConfig,
+    connect_control, connect_control_with_timeout,
 };
 use pg_cdc_testkit::{Postgres, PostgresOptions};
 use secrecy::{ExposeSecret, SecretString};
@@ -217,5 +218,42 @@ async fn missing_ca_file_is_a_clear_error() -> TestResult {
         .err()
         .ok_or("expected an error")?;
     assert!(error.to_string().contains("/nonexistent/ca.pem"), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn silent_server_times_out_instead_of_hanging() -> TestResult {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let accepted = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    for mode in [TlsMode::Disable, TlsMode::Require] {
+        let params = ConnectParams {
+            host: "127.0.0.1".to_owned(),
+            port,
+            database: "postgres".to_owned(),
+            user: "postgres".to_owned(),
+            password: None,
+            tls: TlsConfig {
+                mode,
+                ca_file: None,
+            },
+        };
+        let timeout = std::time::Duration::from_millis(300);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            connect_control_with_timeout(&params, timeout),
+        )
+        .await?;
+        assert!(
+            matches!(outcome, Err(ConnectError::Timeout(t)) if t == timeout),
+            "{mode:?}: {outcome:?}"
+        );
+    }
+    accepted.abort();
     Ok(())
 }

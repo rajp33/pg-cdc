@@ -10,7 +10,9 @@ use secrecy::SecretString;
 
 use crate::config::TlsMode;
 
-pub use control::{ControlConnection, connect_control};
+pub use control::{
+    CONNECT_TIMEOUT, ControlConnection, connect_control, connect_control_with_timeout,
+};
 pub use password::PasswordProvider;
 pub use rds_iam::RdsIamProvider;
 
@@ -54,6 +56,8 @@ pub enum ConnectError {
     Verifier(#[from] rustls::client::VerifierBuilderError),
     #[error("control connection failed: {0}")]
     Postgres(#[from] tokio_postgres::Error),
+    #[error("control connection timed out after {0:?}")]
+    Timeout(std::time::Duration),
 }
 
 #[cfg(test)]
