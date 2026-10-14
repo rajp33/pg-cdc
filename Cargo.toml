@@ -43,6 +43,7 @@ clap = { version = "4.6.7", default-features = false, features = [
   "error-context",
 ] }
 fastrand = "2.5.0"
+pg-cdc-decoder = { path = "crates/decoder", version = "0.1.0" }
 pg-cdc-testkit = { path = "crates/testkit", version = "0.1.0" }
 proptest = "1.12.0"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
