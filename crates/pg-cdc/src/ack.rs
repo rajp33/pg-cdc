@@ -60,7 +60,6 @@ pub struct AckTracker {
     confirmed: Lsn,
     txns: VecDeque<Txn>,
     next_seq: u64,
-    open: bool,
     last_commit: Option<Lsn>,
     inflight_events: u64,
     inflight_bytes: u64,
@@ -72,7 +71,6 @@ impl AckTracker {
             confirmed: start,
             txns: VecDeque::new(),
             next_seq: 0,
-            open: false,
             last_commit: None,
             inflight_events: 0,
             inflight_bytes: 0,
@@ -92,11 +90,18 @@ impl AckTracker {
     }
 
     pub fn is_idle(&self) -> bool {
-        !self.open && self.txns.is_empty()
+        self.txns.is_empty()
+    }
+
+    fn open_txn(&mut self) -> Result<&mut Txn, AckError> {
+        self.txns
+            .back_mut()
+            .filter(|txn| txn.end_lsn.is_none())
+            .ok_or(AckError::NotOpen)
     }
 
     pub fn begin(&mut self) -> Result<(), AckError> {
-        if self.open {
+        if self.open_txn().is_ok() {
             return Err(AckError::AlreadyOpen);
         }
         self.txns.push_back(Txn {
@@ -105,22 +110,16 @@ impl AckTracker {
             unsettled: 0,
         });
         self.next_seq += 1;
-        self.open = true;
         Ok(())
     }
 
     pub fn track(&mut self, bytes: u64) -> Result<Ticket, AckError> {
-        let txn = match self.txns.back_mut() {
-            Some(txn) if self.open => txn,
-            _ => return Err(AckError::NotOpen),
-        };
+        let txn = self.open_txn()?;
         txn.unsettled += 1;
+        let seq = txn.seq;
         self.inflight_events += 1;
         self.inflight_bytes = self.inflight_bytes.saturating_add(bytes);
-        Ok(Ticket {
-            txn: txn.seq,
-            bytes,
-        })
+        Ok(Ticket { txn: seq, bytes })
     }
 
     pub fn commit(&mut self, end_lsn: Lsn) -> Result<Lsn, AckError> {
@@ -129,12 +128,8 @@ impl AckTracker {
         {
             return Err(AckError::CommitOutOfOrder { previous, end_lsn });
         }
-        let txn = match self.txns.back_mut() {
-            Some(txn) if self.open => txn,
-            _ => return Err(AckError::NotOpen),
-        };
+        let txn = self.open_txn()?;
         txn.end_lsn = Some(end_lsn);
-        self.open = false;
         self.last_commit = Some(end_lsn);
         self.advance();
         Ok(self.confirmed)
