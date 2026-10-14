@@ -12,8 +12,9 @@ use pg_cdc::connection::{
 use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig};
 use pg_cdc::sink::Sink;
 use pg_cdc::sink::discard::DiscardSink;
+use pg_cdc::sink::sns::SnsSink;
 use pg_cdc::sink::stdout::StdoutSink;
-use pg_cdc::supervisor::{LiveSession, supervise};
+use pg_cdc::supervisor::{LiveSession, preflight, supervise};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -64,7 +65,7 @@ fn init_logging(sink: &SinkConfig) {
     let builder = tracing_subscriber::fmt().json().with_env_filter(filter);
     match sink {
         SinkConfig::Stdout => builder.with_writer(std::io::stderr).init(),
-        SinkConfig::Discard => builder.with_writer(std::io::stdout).init(),
+        SinkConfig::Discard | SinkConfig::Sns(_) => builder.with_writer(std::io::stdout).init(),
     }
 }
 
@@ -81,6 +82,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!("pg-cdc stopped cleanly");
         return Ok(());
     };
+    let Some(sink) = shutdown
+        .run_until_cancelled(Box::pin(sink(&config.sink)))
+        .await
+    else {
+        tracing::info!("pg-cdc stopped cleanly");
+        return Ok(());
+    };
+    if !preflight(sink.as_ref(), &shutdown).await {
+        tracing::info!("pg-cdc stopped cleanly");
+        return Ok(());
+    }
     let session = SessionConfig {
         pipeline: config.pipeline.clone(),
         slot: config.source.slot.clone(),
@@ -90,10 +102,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
         order_by: config.delivery.order_by.clone(),
         lanes: config.delivery.lanes,
         sink_concurrency: config.sink.max_concurrency(),
-        attribute_columns: Vec::new(),
+        attribute_columns: config.sink.attribute_columns().to_vec(),
         max_inflight_bytes: config.delivery.max_inflight_bytes,
     };
-    let sink = sink(&config.sink);
     let mut live = LiveSession {
         config: &session,
         provider: provider.as_ref(),
@@ -107,10 +118,18 @@ async fn run(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sink(config: &SinkConfig) -> Arc<dyn Sink> {
+async fn sink(config: &SinkConfig) -> Arc<dyn Sink> {
     match config {
         SinkConfig::Stdout => Arc::new(StdoutSink::stdout()),
         SinkConfig::Discard => Arc::new(DiscardSink::new()),
+        SinkConfig::Sns(sns) => Arc::new(
+            SnsSink::from_environment(
+                sns.topic_arn.clone(),
+                sns.region.clone(),
+                sns.fair_queue_group.clone(),
+            )
+            .await,
+        ),
     }
 }
 

@@ -134,19 +134,47 @@ pub async fn supervise<A: Attempt>(
         let delay = backoff.next_delay();
         let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         tracing::warn!(error = %error, delay_ms, "replication session ended; reconnecting");
-        tokio::select! {
-            biased;
-            () = shutdown.cancelled() => return Ok(()),
-            () = tokio::time::sleep(delay) => {}
+        if !sleep_unless_cancelled(delay, shutdown).await {
+            return Ok(());
         }
+    }
+}
+
+pub async fn preflight(sink: &dyn Sink, shutdown: &CancellationToken) -> bool {
+    let mut backoff = Backoff::default();
+    loop {
+        let Some(result) = shutdown.run_until_cancelled(sink.preflight()).await else {
+            return false;
+        };
+        let error = match result {
+            Ok(()) => return true,
+            Err(error) => error,
+        };
+        let delay = backoff.next_delay();
+        let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        tracing::warn!(%error, delay_ms, "sink preflight failed; retrying");
+        if !sleep_unless_cancelled(delay, shutdown).await {
+            return false;
+        }
+    }
+}
+
+async fn sleep_unless_cancelled(delay: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => false,
+        () = tokio::time::sleep(delay) => true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::{Outbound, Outcome, SinkCapabilities, SinkError};
+    use async_trait::async_trait;
     use pg_cdc_decoder::message::DecodeError;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct Scripted {
         outcomes: VecDeque<Result<(), SessionError>>,
@@ -172,6 +200,63 @@ mod tests {
             }
             std::future::ready(self.outcomes.pop_front().unwrap_or(Ok(())))
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct FlakySink {
+        failures_left: AtomicU32,
+        calls: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Sink for FlakySink {
+        fn capabilities(&self) -> SinkCapabilities {
+            SinkCapabilities {
+                max_batch_messages: 1,
+                max_batch_bytes: 1,
+                max_message_bytes: 1,
+            }
+        }
+
+        async fn preflight(&self) -> Result<(), SinkError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let left = self.failures_left.load(Ordering::SeqCst);
+            if left == 0 {
+                return Ok(());
+            }
+            self.failures_left.store(left - 1, Ordering::SeqCst);
+            Err(SinkError("topic not found".to_owned()))
+        }
+
+        async fn send(&self, batch: &[Outbound]) -> Vec<Outcome> {
+            vec![Outcome::Delivered; batch.len()]
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preflight_retries_with_backoff_until_the_sink_is_ready() {
+        let sink = FlakySink {
+            failures_left: AtomicU32::new(2),
+            ..FlakySink::default()
+        };
+        assert!(preflight(&sink, &CancellationToken::new()).await);
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_a_failing_preflight() {
+        let sink = FlakySink {
+            failures_left: AtomicU32::new(u32::MAX),
+            ..FlakySink::default()
+        };
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            token.cancel();
+        });
+        assert!(!preflight(&sink, &shutdown).await);
+        assert!(sink.calls.load(Ordering::SeqCst) >= 3);
     }
 
     fn fault(lsn: u64) -> Result<(), SessionError> {

@@ -14,6 +14,8 @@ pub const DEFAULT_LANES: usize = 64;
 pub const MAX_LANES: usize = 4096;
 pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 << 20;
 pub const DEFAULT_SINK_CONCURRENCY: usize = 32;
+pub const MAX_ATTRIBUTE_COLUMNS: usize = 7;
+const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,14 +107,105 @@ impl Default for DeliveryConfig {
 pub enum SinkConfig {
     Stdout,
     Discard,
+    Sns(SnsConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnsConfig {
+    #[serde(deserialize_with = "de_string")]
+    pub topic_arn: String,
+    #[serde(default, deserialize_with = "de_opt_string")]
+    pub region: Option<String>,
+    #[serde(default = "default_sink_concurrency", deserialize_with = "de_count")]
+    pub max_concurrency: usize,
+    #[serde(default, deserialize_with = "de_string_list")]
+    pub attribute_columns: Vec<String>,
+    #[serde(default, deserialize_with = "de_fair_queue_group")]
+    pub fair_queue_group: Option<String>,
 }
 
 impl SinkConfig {
     pub fn max_concurrency(&self) -> usize {
         match self {
             Self::Stdout | Self::Discard => DEFAULT_SINK_CONCURRENCY,
+            Self::Sns(sns) => sns.max_concurrency,
         }
     }
+
+    pub fn attribute_columns(&self) -> &[String] {
+        match self {
+            Self::Stdout | Self::Discard => &[],
+            Self::Sns(sns) => &sns.attribute_columns,
+        }
+    }
+}
+
+impl SnsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let parts: Vec<&str> = self.topic_arn.split(':').collect();
+        if parts.len() != 6 || parts.first() != Some(&"arn") || parts.get(2) != Some(&"sns") {
+            return Err(ConfigError::InvalidValue {
+                field: "sink.topic_arn",
+                value: self.topic_arn.clone(),
+                reason: "must be an SNS topic ARN",
+            });
+        }
+        if self.max_concurrency == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "sink.max_concurrency",
+                value: "0".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.attribute_columns.len() > MAX_ATTRIBUTE_COLUMNS {
+            return Err(ConfigError::InvalidValue {
+                field: "sink.attribute_columns",
+                value: self.attribute_columns.join(","),
+                reason: "SNS allows 10 message attributes and schema, table and op use 3",
+            });
+        }
+        for (index, column) in self.attribute_columns.iter().enumerate() {
+            let duplicate = self
+                .attribute_columns
+                .iter()
+                .take(index)
+                .any(|earlier| earlier == column);
+            if duplicate
+                || RESERVED_ATTRIBUTES.contains(&column.as_str())
+                || !valid_attribute_name(column)
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "sink.attribute_columns",
+                    value: column.clone(),
+                    reason: "must be distinct SNS attribute names other than schema, table and op",
+                });
+            }
+        }
+        if let Some(column) = &self.fair_queue_group
+            && !self.attribute_columns.contains(column)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "sink.fair_queue_group",
+                value: column.clone(),
+                reason: "the column must also be listed in sink.attribute_columns",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn valid_attribute_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (1..=256).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !lower.starts_with("aws.")
+        && !lower.starts_with("amazon.")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -272,7 +365,11 @@ impl Config {
         ) {
             return Err(ConfigError::MissingPassword);
         }
-        self.delivery.validate()
+        self.delivery.validate()?;
+        match &self.sink {
+            SinkConfig::Sns(sns) => sns.validate(),
+            SinkConfig::Stdout | SinkConfig::Discard => Ok(()),
+        }
     }
 }
 
@@ -326,6 +423,44 @@ fn default_lanes() -> usize {
 
 fn default_max_inflight_bytes() -> u64 {
     DEFAULT_MAX_INFLIGHT_BYTES
+}
+
+fn default_sink_concurrency() -> usize {
+    DEFAULT_SINK_CONCURRENCY
+}
+
+fn de_string_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ListField {
+        List(Vec<StringField>),
+        Text(StringField),
+    }
+
+    Ok(match ListField::deserialize(deserializer)? {
+        ListField::List(items) => items.into_iter().map(|item| item.0).collect(),
+        ListField::Text(text) => text
+            .0
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    })
+}
+
+fn de_fair_queue_group<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let Some(text) = de_opt_string(deserializer)? else {
+        return Ok(None);
+    };
+    match text.strip_prefix("column:") {
+        Some(column) if !column.is_empty() => Ok(Some(column.to_owned())),
+        _ => Err(de::Error::custom(format!(
+            "fair_queue_group {text:?} must be column:<name>"
+        ))),
+    }
 }
 
 fn de_order_by<'de, D: Deserializer<'de>>(deserializer: D) -> Result<OrderBy, D::Error> {
@@ -702,6 +837,126 @@ sink:
         ] {
             assert_eq!(parse_duration(bad), None, "{bad:?}");
         }
+    }
+
+    const SNS: &str =
+        "sink:\n  type: sns\n  topic_arn: arn:aws:sns:us-east-1:123456789012:orders.fifo\n";
+
+    fn sns(extra: &str) -> String {
+        MINIMAL.replace("sink:\n  type: stdout\n", &format!("{SNS}{extra}"))
+    }
+
+    #[test]
+    fn parses_the_sns_sink_with_defaults() {
+        let config = parse(&sns(""), with_password()).unwrap();
+        assert_eq!(
+            config.sink,
+            SinkConfig::Sns(SnsConfig {
+                topic_arn: "arn:aws:sns:us-east-1:123456789012:orders.fifo".to_owned(),
+                region: None,
+                max_concurrency: 32,
+                attribute_columns: Vec::new(),
+                fair_queue_group: None,
+            })
+        );
+        assert_eq!(config.sink.max_concurrency(), 32);
+        assert_eq!(config.sink.attribute_columns(), &[] as &[String]);
+    }
+
+    #[test]
+    fn parses_every_sns_setting() {
+        let yaml = sns(
+            "  region: eu-west-1\n  max_concurrency: 8\n  attribute_columns: [tenant_id, region]\n  fair_queue_group: column:tenant_id\n",
+        );
+        let config = parse(&yaml, with_password()).unwrap();
+        let SinkConfig::Sns(sns) = &config.sink else {
+            panic!("expected sns");
+        };
+        assert_eq!(sns.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(sns.max_concurrency, 8);
+        assert_eq!(sns.attribute_columns, ["tenant_id", "region"]);
+        assert_eq!(sns.fair_queue_group.as_deref(), Some("tenant_id"));
+        assert_eq!(config.sink.attribute_columns(), ["tenant_id", "region"]);
+    }
+
+    #[test]
+    fn environment_overrides_sns_settings_and_lists() {
+        let mut vars = with_password();
+        vars.extend(env(&[
+            ("PGCDC__SINK__ATTRIBUTE_COLUMNS", "tenant_id, region"),
+            ("PGCDC__SINK__MAX_CONCURRENCY", "4"),
+            (
+                "PGCDC__SINK__TOPIC_ARN",
+                "arn:aws:sns:us-east-1:123456789012:other",
+            ),
+        ]));
+        let config = parse(&sns(""), vars).unwrap();
+        let SinkConfig::Sns(sns) = &config.sink else {
+            panic!("expected sns");
+        };
+        assert_eq!(sns.attribute_columns, ["tenant_id", "region"]);
+        assert_eq!(sns.max_concurrency, 4);
+        assert_eq!(sns.topic_arn, "arn:aws:sns:us-east-1:123456789012:other");
+    }
+
+    #[test]
+    fn rejects_invalid_sns_settings() {
+        for (extra, field) in [
+            ("  max_concurrency: 0\n", "sink.max_concurrency"),
+            (
+                "  attribute_columns: [a, b, c, d, e, f, g, h]\n",
+                "sink.attribute_columns",
+            ),
+            ("  attribute_columns: [op]\n", "sink.attribute_columns"),
+            (
+                "  attribute_columns: [tenant, tenant]\n",
+                "sink.attribute_columns",
+            ),
+            (
+                "  attribute_columns: [\"has space\"]\n",
+                "sink.attribute_columns",
+            ),
+            (
+                "  attribute_columns: [AWS.thing]\n",
+                "sink.attribute_columns",
+            ),
+            ("  attribute_columns: [a..b]\n", "sink.attribute_columns"),
+            (
+                "  fair_queue_group: column:tenant\n",
+                "sink.fair_queue_group",
+            ),
+        ] {
+            let error = parse(&sns(extra), with_password()).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { field: actual, .. } if *actual == field),
+                "{extra}: {error}"
+            );
+        }
+        let bad_arn = sns("").replace(
+            "arn:aws:sns:us-east-1:123456789012:orders.fifo",
+            "arn:aws:sqs:us-east-1:123456789012:orders",
+        );
+        assert!(matches!(
+            parse(&bad_arn, with_password()),
+            Err(ConfigError::InvalidValue {
+                field: "sink.topic_arn",
+                ..
+            })
+        ));
+        for extra in ["  fair_queue_group: tenant\n", "  topic: x\n"] {
+            assert!(
+                matches!(
+                    parse(&sns(extra), with_password()),
+                    Err(ConfigError::Invalid(_))
+                ),
+                "{extra}"
+            );
+        }
+        let missing_arn = MINIMAL.replace("type: stdout", "type: sns");
+        assert!(matches!(
+            parse(&missing_arn, with_password()),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]

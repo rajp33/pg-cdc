@@ -28,15 +28,23 @@ source:
     mode: verify-full
   slot: pgcdc_orders
   publication: pgcdc_orders
+delivery:
+  order_by: key
+  lanes: 64
+  max_inflight_bytes: 256MiB
 sink:
-  type: stdout
+  type: sns
+  topic_arn: arn:aws:sns:us-east-1:123456789012:orders.fifo
+  attribute_columns: [tenant_id]
 ```
 
 ```sh
 PGCDC__SOURCE__CREDENTIALS__PASSWORD=... pg-cdc run --config pg-cdc.yaml
 ```
 
-Each change is one JSON line on stdout; logs are JSON on stderr. Any key can be overridden with `PGCDC__<SECTION>__<KEY>`, and passwords come only from the environment. For Aurora with RDS IAM auth, use `credentials: { type: aws_rds_iam }` with the default AWS credential chain. pg-cdc runs on Linux and macOS.
+Each change is one SNS message whose body is the JSON envelope, with `schema`, `table`, `op` and each `attribute_columns` value as message attributes. On a FIFO topic the message group is the order key and the deduplication id is the event id. The SNS sink uses the default AWS credential chain; `sink.region` overrides the region. Retries are owned by pg-cdc: a failing order key backs off from 100 ms to 30 s while other keys keep flowing.
+
+`delivery.order_by` is `key` (default), `table`, `column:<name>` or `pipeline`. `sink: { type: stdout }` writes each change as a JSON line on stdout and logs to stderr; `sink: { type: discard }` drops every change, for load tests. With the SNS and discard sinks, logs are JSON on stdout. Any key can be overridden with `PGCDC__<SECTION>__<KEY>` (lists as comma-separated values), and passwords come only from the environment. For Aurora with RDS IAM auth, use `credentials: { type: aws_rds_iam }` with the default AWS credential chain. pg-cdc runs on Linux and macOS.
 
 ## Develop
 
