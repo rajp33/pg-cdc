@@ -13,6 +13,8 @@ use crate::state::{ParkStatus, ParkedEvent, ParkedHead, StoreError, now_ms};
 
 pub(super) const QUEUED_BEHIND: &str = "queued behind a parked event";
 
+const STORE_STEPS: usize = 4;
+
 impl Lane {
     pub(super) fn accept_head(&mut self, head: ParkedHead) {
         let key = head.order_key;
@@ -76,18 +78,33 @@ impl Lane {
         if self.store_due.is_some_and(|due| due > now) {
             return false;
         }
-        if !self.to_append.is_empty() {
-            self.flush_appends().await;
-        } else if !self.to_remove.is_empty() {
-            self.flush_removes().await;
-        } else if !self.to_kill.is_empty() {
-            self.flush_kills().await;
-        } else if !self.to_load.is_empty() && self.heads_in_memory < self.head_capacity() {
-            self.load_heads().await;
-        } else {
-            return false;
+        for offset in 0..STORE_STEPS {
+            let step = (self.store_turn + offset) % STORE_STEPS;
+            let ran = match step {
+                0 if !self.to_append.is_empty() => {
+                    self.flush_appends().await;
+                    true
+                }
+                1 if !self.to_remove.is_empty() => {
+                    self.flush_removes().await;
+                    true
+                }
+                2 if !self.to_kill.is_empty() => {
+                    self.flush_kills().await;
+                    true
+                }
+                3 if !self.to_load.is_empty() && self.heads_in_memory < self.head_capacity() => {
+                    self.load_heads().await;
+                    true
+                }
+                _ => false,
+            };
+            if ran {
+                self.store_turn = (step + 1) % STORE_STEPS;
+                return true;
+            }
         }
-        true
+        false
     }
 
     fn store_succeeded(&mut self) {
@@ -216,8 +233,11 @@ impl Lane {
             );
             return;
         }
-        stored.head = Some(head.outbound());
-        self.heads_in_memory += 1;
+        let outbound = head.outbound();
+        if outbound.encoded_len() <= self.capabilities.max_message_bytes {
+            self.heads_in_memory += 1;
+        }
+        stored.head = Some(outbound);
         self.make_ready(key);
     }
 

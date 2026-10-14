@@ -111,6 +111,7 @@ impl Lanes {
                     to_remove: Vec::new(),
                     to_kill: Vec::new(),
                     heads_in_memory: 0,
+                    store_turn: 0,
                     store_backoff: Backoff::new(RETRY_BASE, RETRY_CAP),
                     store_due: None,
                 };
@@ -183,6 +184,7 @@ struct Lane {
     to_remove: Vec<(OrderKeyId, EventId)>,
     to_kill: Vec<(OrderKeyId, EventId)>,
     heads_in_memory: usize,
+    store_turn: usize,
     store_backoff: Backoff,
     store_due: Option<Instant>,
 }
@@ -197,15 +199,16 @@ impl Lane {
             }
             let now = Instant::now();
             self.promote_due_retries(now);
-            if self.store_work(now).await {
-                continue;
-            }
+            let stored = self.store_work(now).await;
             let (count, full) = self.plan_batch();
             let linger = self.linger_deadline();
             if let Some(deadline) = linger
                 && (full || Instant::now() >= deadline)
             {
                 self.send_batch(count).await;
+                continue;
+            }
+            if stored {
                 continue;
             }
             let next_retry = self.retries.peek().map(|Reverse((due, _))| *due);

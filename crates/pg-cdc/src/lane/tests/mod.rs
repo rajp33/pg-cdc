@@ -127,6 +127,7 @@ struct TestStore {
     held: Mutex<Option<u8>>,
     release: Notify,
     load_delay: Duration,
+    append_delay: Duration,
     loads: AtomicUsize,
     loading: AtomicUsize,
     peak_loading: AtomicUsize,
@@ -162,6 +163,12 @@ impl TestStore {
             .unwrap();
     }
 
+    async fn seed_sized(&self, key: &[u8], ordinal: u32, body: usize) {
+        let mut event = parked(key, ordinal, ParkStatus::Retrying);
+        event.body = Bytes::from(vec![b'x'; body]);
+        self.inner.append_parked(&[event]).await.unwrap();
+    }
+
     async fn queue(&self, key: &[u8]) -> Vec<(u32, ParkStatus)> {
         self.inner
             .read_parked(&OrderKeyId::of(key), None, usize::MAX)
@@ -176,6 +183,7 @@ impl TestStore {
 #[async_trait]
 impl StateStore for TestStore {
     async fn append_parked(&self, events: &[ParkedEvent]) -> Result<(), StoreError> {
+        tokio::time::sleep(self.append_delay).await;
         if take_failure(&self.fail_appends) {
             return Err(outage());
         }

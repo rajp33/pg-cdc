@@ -182,3 +182,57 @@ async fn parked_heads_in_memory_never_exceed_one_batch() {
     assert!(harness.store.peak_outstanding.load(Ordering::SeqCst) <= 4);
     assert!(harness.sink.batches().iter().all(|batch| batch.len() <= 4));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_busy_parked_key_does_not_hold_up_live_keys_or_its_own_drain() {
+    let store = TestStore {
+        append_delay: Duration::from_millis(30),
+        ..TestStore::default()
+    };
+    for ordinal in 1..=200 {
+        store.seed(b"k", ordinal, ParkStatus::Retrying).await;
+    }
+    let mut sink = ScriptedSink::delivering();
+    sink.latency = Duration::from_millis(5);
+    let mut harness = Harness::start(Setup::default(), sink, store).await;
+    harness.send(1000, b"k", 10).unwrap();
+    harness.send(1001, b"live", 10).unwrap();
+    for ordinal in 1002..1052 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        harness.send(ordinal, b"k", 10).unwrap();
+    }
+    let flood_ends = Instant::now();
+    let sends = harness.sink.sends();
+    let live = sends.iter().find(|sent| sent.ordinal == 1001).unwrap();
+    assert!(live.at < flood_ends);
+    let drained = sends
+        .iter()
+        .filter(|sent| sent.ordinal <= 200 && sent.at < flood_ends)
+        .count();
+    assert!(drained >= 10);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_oversized_parked_head_blocks_only_its_own_key() {
+    let store = TestStore::default();
+    for key in 0u8..4 {
+        store.seed_sized(&[key], u32::from(key), 500).await;
+    }
+    for key in 4u8..12 {
+        store
+            .seed(&[key], u32::from(key), ParkStatus::Retrying)
+            .await;
+    }
+    let limits = SinkCapabilities {
+        max_batch_messages: 2,
+        max_message_bytes: 100,
+        ..LIMITS
+    };
+    let sink = ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered));
+    let harness = Harness::start(Setup::default(), sink, store).await;
+    let mut delivered = harness.delivered(8).await;
+    delivered.sort_unstable();
+    assert_eq!(delivered, (4..12).collect::<Vec<u32>>());
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(harness.sink.sends().len(), 8);
+}
