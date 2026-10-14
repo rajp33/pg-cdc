@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -21,8 +22,7 @@ impl Lane {
         let state = self.keys.entry(key).or_insert_with(Key::new);
         state.stored = Some(Stored {
             floor: Some(head.head),
-            head: None,
-            dead: false,
+            ..Stored::default()
         });
         let queued = std::mem::take(&mut state.queue);
         for pending in queued {
@@ -63,11 +63,22 @@ impl Lane {
     }
 
     pub(super) fn store_wake(&self) -> Option<Instant> {
-        let pending = !self.to_append.is_empty()
-            || !self.to_remove.is_empty()
+        let appending = !self.to_append.is_empty();
+        let other = !self.to_remove.is_empty()
             || !self.to_kill.is_empty()
-            || (!self.to_load.is_empty() && self.heads_in_memory < self.head_capacity());
-        if pending { self.store_due } else { None }
+            || (!self.closing
+                && !self.to_load.is_empty()
+                && self.heads_in_memory < self.head_capacity());
+        let append_at = appending
+            .then(|| {
+                [self.store_due, self.append_due]
+                    .into_iter()
+                    .flatten()
+                    .max()
+            })
+            .flatten();
+        let other_at = self.store_due.filter(|_| other);
+        [append_at, other_at].into_iter().flatten().min()
     }
 
     fn head_capacity(&self) -> usize {
@@ -81,7 +92,7 @@ impl Lane {
         for offset in 0..STORE_STEPS {
             let step = (self.store_turn + offset) % STORE_STEPS;
             let ran = match step {
-                0 if !self.to_append.is_empty() => {
+                0 if !self.to_append.is_empty() && self.append_due.is_none_or(|due| due <= now) => {
                     self.flush_appends().await;
                     true
                 }
@@ -93,7 +104,10 @@ impl Lane {
                     self.flush_kills().await;
                     true
                 }
-                3 if !self.to_load.is_empty() && self.heads_in_memory < self.head_capacity() => {
+                3 if !self.closing
+                    && !self.to_load.is_empty()
+                    && self.heads_in_memory < self.head_capacity() =>
+                {
                     self.load_heads().await;
                     true
                 }
@@ -120,25 +134,53 @@ impl Lane {
 
     fn queued_events(&self, keys: &[OrderKeyId]) -> Vec<ParkedEvent> {
         let parked_at = now_ms();
-        keys.iter()
-            .filter_map(|key| self.keys.get(key))
-            .flat_map(|state| state.queue.iter())
-            .map(|pending| ParkedEvent {
-                order_key: pending.outbound.order_key,
-                id: pending.outbound.id,
-                status: ParkStatus::Retrying,
-                attempts: 0,
-                first_failure_ms: parked_at,
-                last_error: QUEUED_BEHIND.to_owned(),
-                attributes: pending.outbound.attributes.clone(),
-                body: pending.outbound.body.clone(),
-            })
-            .collect()
+        let mut events = Vec::new();
+        for state in keys.iter().filter_map(|key| self.keys.get(key)) {
+            let dead = state
+                .stored
+                .as_ref()
+                .is_some_and(|stored| stored.dead_on_append);
+            for (index, pending) in state.queue.iter().enumerate() {
+                let failure = state.failure.as_ref().filter(|_| index == 0);
+                events.push(ParkedEvent {
+                    order_key: pending.outbound.order_key,
+                    id: pending.outbound.id,
+                    status: if dead && index == 0 {
+                        ParkStatus::Dead
+                    } else {
+                        ParkStatus::Retrying
+                    },
+                    attempts: failure.map_or(0, |failure| failure.attempts),
+                    first_failure_ms: failure.map_or(parked_at, |failure| failure.since_ms),
+                    last_error: failure
+                        .map_or_else(|| QUEUED_BEHIND.to_owned(), |failure| failure.error.clone()),
+                    attributes: pending.outbound.attributes.clone(),
+                    body: pending.outbound.body.clone(),
+                });
+            }
+        }
+        events
     }
 
     async fn flush_appends(&mut self) {
         let keys: Vec<OrderKeyId> = std::mem::take(&mut self.to_append).into_iter().collect();
         let events = self.queued_events(&keys);
+        let count = u64::try_from(events.len()).unwrap_or(u64::MAX);
+        let parked = self.parked.load(Ordering::SeqCst);
+        if self.max_parked > 0 && parked.saturating_add(count) > self.max_parked {
+            let delay = self.store_backoff.next_delay();
+            tracing::warn!(
+                lane = self.index,
+                parked,
+                max_parked_events = self.max_parked,
+                ?delay,
+                "the parked event limit is reached; events stay in flight"
+            );
+            self.append_due = Some(Instant::now() + delay);
+            self.to_append.extend(keys);
+            return;
+        }
+        self.append_due = None;
         let appended = self.store.append_parked(&events).await;
         if let Err(error) = &appended {
             self.store_failed("append", error);
@@ -146,6 +188,7 @@ impl Lane {
             return;
         }
         self.store_succeeded();
+        self.parked.fetch_add(count, Ordering::SeqCst);
         for key in keys {
             let Some(state) = self.keys.get_mut(&key) else {
                 continue;
@@ -154,6 +197,13 @@ impl Lane {
                 if let Ok(settled) = pending.ticket.park(&appended) {
                     let _ = self.reports.send(Report::Settled(settled));
                 }
+            }
+            if let Some(stored) = state.stored.as_mut()
+                && stored.dead_on_append
+            {
+                stored.dead_on_append = false;
+                stored.dead = true;
+                tracing::error!(order_key = %key, id = ?stored.floor, "a dead event is parked and blocks its order key");
             }
         }
     }
@@ -213,7 +263,7 @@ impl Lane {
         let Some(head) = head else {
             state.stored = None;
             state.backoff.reset();
-            state.failing = false;
+            state.failure = None;
             self.to_append.remove(&key);
             if state.queue.is_empty() {
                 self.keys.remove(&key);
@@ -252,15 +302,15 @@ impl Lane {
         match outcome {
             Outcome::Delivered => {
                 state.backoff.reset();
-                state.failing = false;
+                state.failure = None;
                 self.to_remove.push((key, head.id));
             }
             Outcome::Retryable(error) => {
                 let delay = state.backoff.next_delay();
-                if !state.failing {
+                if state.failure.is_none() {
                     tracing::warn!(order_key = %key, id = %head.id, %error, ?delay, "redelivery of a parked event failed; retrying");
                 }
-                state.failing = true;
+                state.record_failure(error);
                 self.retries.push(Reverse((Instant::now() + delay, key)));
             }
             Outcome::Terminal(error) => {
@@ -278,6 +328,12 @@ impl Lane {
             return;
         }
         self.store_succeeded();
+        let removed = u64::try_from(removals.len()).unwrap_or(u64::MAX);
+        let _ = self
+            .parked
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |parked| {
+                Some(parked.saturating_sub(removed))
+            });
         for (key, id) in removals {
             if let Some(stored) = self
                 .keys

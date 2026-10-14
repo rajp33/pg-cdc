@@ -1,4 +1,5 @@
 mod loader;
+mod park;
 mod stored;
 
 #[cfg(test)]
@@ -8,6 +9,7 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc};
@@ -72,6 +74,7 @@ enum Inbound {
     Event(Pending),
     Head(ParkedHead),
     Loaded(u8),
+    ParkAll,
 }
 
 #[derive(Debug)]
@@ -89,6 +92,7 @@ impl Lanes {
         reports: &mpsc::UnboundedSender<Report>,
     ) -> Self {
         let capabilities = sink.capabilities();
+        let parked = Arc::new(AtomicU64::new(0));
         let mut tasks = JoinSet::new();
         let inboxes: Vec<_> = (0..settings.lanes.max(1))
             .map(|index| {
@@ -114,6 +118,11 @@ impl Lanes {
                     store_turn: 0,
                     store_backoff: Backoff::new(RETRY_BASE, RETRY_CAP),
                     store_due: None,
+                    append_due: None,
+                    park_after: settings.park_after,
+                    max_parked: settings.max_parked_events,
+                    parked: Arc::clone(&parked),
+                    closing: false,
                 };
                 tasks.spawn(lane.run());
                 inbox
@@ -123,6 +132,7 @@ impl Lanes {
             Arc::clone(&stores.state),
             inboxes.clone(),
             settings.store_concurrency,
+            parked,
         ));
         Self { inboxes, tasks }
     }
@@ -135,6 +145,12 @@ impl Lanes {
             .map_err(|_| LaneStopped(index))
     }
 
+    pub fn park_all(&self) {
+        for inbox in &self.inboxes {
+            let _ = inbox.send(Inbound::ParkAll);
+        }
+    }
+
     pub async fn shutdown(mut self) {
         self.tasks.shutdown().await;
     }
@@ -144,7 +160,7 @@ impl Lanes {
 struct Key {
     queue: VecDeque<Pending>,
     backoff: Backoff,
-    failing: bool,
+    failure: Option<Failure>,
     stored: Option<Stored>,
 }
 
@@ -153,10 +169,18 @@ impl Key {
         Self {
             queue: VecDeque::new(),
             backoff: Backoff::new(RETRY_BASE, RETRY_CAP),
-            failing: false,
+            failure: None,
             stored: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct Failure {
+    since: Instant,
+    since_ms: u64,
+    attempts: u32,
+    error: String,
 }
 
 #[derive(Debug, Default)]
@@ -164,6 +188,7 @@ struct Stored {
     floor: Option<EventId>,
     head: Option<Outbound>,
     dead: bool,
+    dead_on_append: bool,
 }
 
 struct Lane {
@@ -187,6 +212,11 @@ struct Lane {
     store_turn: usize,
     store_backoff: Backoff,
     store_due: Option<Instant>,
+    append_due: Option<Instant>,
+    park_after: Duration,
+    max_parked: u64,
+    parked: Arc<AtomicU64>,
+    closing: bool,
 }
 
 impl Lane {
@@ -200,6 +230,15 @@ impl Lane {
             let now = Instant::now();
             self.promote_due_retries(now);
             let stored = self.store_work(now).await;
+            if self.closing {
+                if stored {
+                    continue;
+                }
+                if !self.wait(self.store_wake()).await {
+                    return;
+                }
+                continue;
+            }
             let (count, full) = self.plan_batch();
             let linger = self.linger_deadline();
             if let Some(deadline) = linger
@@ -231,6 +270,10 @@ impl Lane {
             }
             Inbound::Loaded(partition) => {
                 self.partition_loaded(partition);
+                true
+            }
+            Inbound::ParkAll => {
+                self.park_all();
                 true
             }
         }
@@ -271,7 +314,11 @@ impl Lane {
                 let mut state = Key::new();
                 state.queue.push_back(pending);
                 entry.insert(state);
-                self.make_ready(key);
+                if self.closing {
+                    self.start_parking(key, false);
+                } else {
+                    self.make_ready(key);
+                }
             }
         }
         true
@@ -285,28 +332,14 @@ impl Lane {
     }
 
     fn make_ready(&mut self, key: OrderKeyId) {
-        if !self.is_loaded(key) {
+        if self.closing || !self.is_loaded(key) {
             return;
         }
-        let Some(state) = self.keys.get(&key) else {
+        let Some(bytes) = self.front(&key).map(Outbound::encoded_len) else {
             return;
         };
-        let head = match &state.stored {
-            Some(stored) => stored.head.as_ref(),
-            None => state.queue.front().map(|pending| &pending.outbound),
-        };
-        let Some(head) = head else {
-            return;
-        };
-        let bytes = head.encoded_len();
         if bytes > self.capabilities.max_message_bytes {
-            tracing::error!(
-                order_key = %key,
-                id = %head.id,
-                bytes,
-                max_message_bytes = self.capabilities.max_message_bytes,
-                "event exceeds the sink's message size; its order key is blocked"
-            );
+            self.oversize(key, bytes);
             return;
         }
         self.ready.push_back(key);
@@ -322,6 +355,7 @@ impl Lane {
                 Some(Key {
                     stored: Some(_), ..
                 }) => self.to_load.push_back(key),
+                Some(state) if self.park_due(state, now) => self.start_parking(key, false),
                 Some(_) => self.make_ready(key),
                 None => {}
             }
@@ -430,29 +464,16 @@ impl Lane {
                     self.keys.remove(&key);
                 } else {
                     state.backoff.reset();
-                    state.failing = false;
+                    state.failure = None;
                     self.make_ready(key);
                 }
             }
-            Outcome::Retryable(error) => {
-                let delay = state.backoff.next_delay();
-                let id = state.queue.front().map(|head| head.outbound.id);
-                if state.failing {
-                    tracing::debug!(order_key = %key, ?id, %error, ?delay, "delivery failed again; retrying");
-                } else {
-                    tracing::warn!(order_key = %key, ?id, %error, ?delay, "delivery failed; retrying");
-                }
-                state.failing = true;
-                self.retries.push(Reverse((Instant::now() + delay, key)));
-            }
+            Outcome::Retryable(error) => self.retry_live(key, error),
             Outcome::Terminal(error) => {
                 let id = state.queue.front().map(|head| head.outbound.id);
-                tracing::error!(
-                    order_key = %key,
-                    ?id,
-                    %error,
-                    "the sink rejected the event for good; its order key is blocked"
-                );
+                tracing::error!(order_key = %key, ?id, %error, "the sink rejected the event for good; parking it dead");
+                state.record_failure(error);
+                self.start_parking(key, true);
             }
         }
     }

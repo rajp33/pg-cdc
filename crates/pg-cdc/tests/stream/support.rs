@@ -8,10 +8,12 @@ use pg_cdc::config::{
 };
 use pg_cdc::connection::{ConnectParams, PasswordProvider, TlsConfig};
 use pg_cdc::lane::Stores;
-use pg_cdc::order::OrderBy;
+use pg_cdc::order::{OrderBy, OrderKeyId};
 use pg_cdc::session::{SessionConfig, SessionError, run_session};
 use pg_cdc::sink::stdout::StdoutSink;
 use pg_cdc::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
+use pg_cdc::state::ParkedEvent;
+use pg_cdc::state::filesystem::FilesystemStateStore;
 use pg_cdc::state::memory::MemoryStateStore;
 use pg_cdc_testkit::Postgres;
 use secrecy::SecretString;
@@ -69,6 +71,20 @@ pub(crate) fn config(status_interval: Duration, buffer: usize) -> SessionConfig 
     }
 }
 
+pub(crate) fn filesystem_stores(path: &std::path::Path) -> Stores {
+    Stores {
+        state: Arc::new(FilesystemStateStore::new(path, PIPELINE, 4)),
+        payload: None,
+    }
+}
+
+pub(crate) async fn parked(stores: &Stores, key: &[u8]) -> TestResult<Vec<ParkedEvent>> {
+    Ok(stores
+        .state
+        .read_parked(&OrderKeyId::of(key), None, 100)
+        .await?)
+}
+
 pub(crate) fn order_key(id: i64) -> Vec<u8> {
     format!(r#"["public","orders",{id}]"#).into_bytes()
 }
@@ -92,6 +108,7 @@ pub(crate) enum Mode {
     Hold,
     Fail,
     FailContaining(String),
+    RejectContaining(String),
 }
 
 #[derive(Debug)]
@@ -100,6 +117,11 @@ pub(crate) struct TestSink {
     mode: watch::Receiver<Mode>,
     failures: watch::Sender<u64>,
     delivered: mpsc::UnboundedSender<Bytes>,
+}
+
+fn contains(body: &[u8], marker: &str) -> bool {
+    body.windows(marker.len())
+        .any(|window| window == marker.as_bytes())
 }
 
 #[async_trait]
@@ -126,13 +148,14 @@ impl Sink for TestSink {
             .map(|outbound| {
                 let fail = match &current {
                     Mode::Fail => true,
-                    Mode::FailContaining(marker) => outbound
-                        .body
-                        .windows(marker.len())
-                        .any(|window| window == marker.as_bytes()),
-                    Mode::Deliver | Mode::Hold => false,
+                    Mode::FailContaining(marker) => contains(&outbound.body, marker),
+                    Mode::Deliver | Mode::Hold | Mode::RejectContaining(_) => false,
                 };
-                if fail {
+                let reject = matches!(&current, Mode::RejectContaining(marker) if contains(&outbound.body, marker));
+                if reject {
+                    self.failures.send_modify(|count| *count += 1);
+                    Outcome::Terminal(SinkError("test sink rejects the event".to_owned()))
+                } else if fail {
                     self.failures.send_modify(|count| *count += 1);
                     Outcome::Retryable(SinkError("test sink is failing".to_owned()))
                 } else {

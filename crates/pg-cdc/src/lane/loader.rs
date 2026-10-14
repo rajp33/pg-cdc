@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 use tokio::task::{Id, JoinSet};
@@ -12,6 +13,7 @@ pub(super) async fn load(
     store: Arc<dyn StateStore>,
     inboxes: Vec<mpsc::UnboundedSender<Inbound>>,
     concurrency: usize,
+    parked: Arc<AtomicU64>,
 ) {
     let mut partitions = 0..=u8::MAX;
     let mut running = JoinSet::new();
@@ -30,6 +32,8 @@ pub(super) async fn load(
         match joined {
             Ok((id, (partition, heads))) => {
                 started.remove(&id);
+                let length: u64 = heads.iter().map(|head| head.length).sum();
+                parked.fetch_add(length, Ordering::SeqCst);
                 deliver(&inboxes, partition, heads);
             }
             Err(error) => {
