@@ -57,23 +57,26 @@ impl Outbound {
         order_key: OrderKeyId,
         attribute_columns: &[String],
     ) -> Result<Self, serde_json::Error> {
-        let mut attributes = vec![
-            (
-                "schema".to_owned(),
-                AttributeValue::String(envelope.schema.clone()),
-            ),
-            (
-                "table".to_owned(),
-                AttributeValue::String(envelope.table.clone()),
-            ),
-            (
-                "op".to_owned(),
-                AttributeValue::String(envelope.op.as_str().to_owned()),
-            ),
-        ];
-        for column in attribute_columns {
-            if let Some(value) = column_value(envelope, column).and_then(attribute_value) {
-                attributes.push((column.clone(), value));
+        let core = [
+            ("schema", envelope.schema.as_str()),
+            ("table", envelope.table.as_str()),
+            ("op", envelope.op.as_str()),
+        ]
+        .map(|(name, value)| (name.to_owned(), AttributeValue::String(value.to_owned())));
+        let columns = attribute_columns.iter().filter_map(|column| {
+            let value = column_value(envelope, column).and_then(attribute_value)?;
+            Some((column.clone(), value))
+        });
+        let mut attributes = Vec::with_capacity(3 + attribute_columns.len());
+        for (name, value) in core.into_iter().chain(columns) {
+            if sns_text(value.as_str()) {
+                attributes.push((name, value));
+            } else {
+                tracing::warn!(
+                    id = %envelope.id,
+                    attribute = %name,
+                    "omitting a message attribute whose value has characters SNS rejects"
+                );
             }
         }
         Ok(Self {
@@ -101,6 +104,15 @@ impl Outbound {
             .find(|(key, _)| key == name)
             .map(|(_, value)| value)
     }
+}
+
+fn sns_text(text: &str) -> bool {
+    text.chars().all(|character| {
+        matches!(
+            character,
+            '\t' | '\n' | '\r' | ' '..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..
+        )
+    })
 }
 
 fn attribute_value(value: &Value) -> Option<AttributeValue> {
@@ -287,6 +299,57 @@ mod tests {
             body: Bytes::from_static(b"0123456789"),
         };
         assert_eq!(outbound.encoded_len(), 10 + (2 + 6 + 6) + (1 + 6 + 2));
+    }
+
+    #[test]
+    fn sns_text_is_the_xml_character_set() {
+        for good in [
+            "",
+            "plain",
+            "tab\tnewline\ncarriage\r",
+            "\u{20}\u{D7FF}\u{E000}\u{FFFD}\u{10000}\u{10FFFF}",
+            "café 😀",
+        ] {
+            assert!(sns_text(good), "{good:?}");
+        }
+        for bad in [
+            "\u{0}",
+            "bell\u{7}",
+            "\u{1F}",
+            "\u{B}",
+            "\u{FFFE}",
+            "x\u{FFFF}",
+        ] {
+            assert!(!sns_text(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn attribute_values_with_characters_sns_rejects_are_omitted() {
+        let mut envelope = sample_envelope(
+            Op::Insert,
+            None,
+            None,
+            Some(json!({
+                "tenant": "acme",
+                "bell": "ring\u{7}",
+                "nul": "a\u{0}b",
+                "nonchar": "x\u{FFFE}",
+                "tabbed": "a\tb",
+                "doc": {"k": "\u{1}"},
+            })),
+        );
+        envelope.table = "bad\u{1}table".to_owned();
+        let names = columns(&["tenant", "bell", "nul", "nonchar", "tabbed", "doc"]);
+        let outbound = Outbound::encode(&envelope, OrderKeyId::of(b"[]"), &names).unwrap();
+        let kept: Vec<&str> = outbound
+            .attributes
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(kept, vec!["schema", "op", "tenant", "tabbed", "doc"]);
+        let escaped = json!({"k": "\u{1}"}).to_string();
+        assert_eq!(outbound.attribute("doc"), Some(&string(&escaped)));
     }
 
     #[test]

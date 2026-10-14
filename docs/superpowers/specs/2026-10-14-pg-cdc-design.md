@@ -454,6 +454,7 @@ v1 sinks:
 - **Message attributes.**
   - Every message carries `schema`, `table` and `op`, plus one attribute per column in `sink.attribute_columns`.
   - A column's value comes from `after`, or from `before` when there is no `after`. It is sent as String or Number and omitted when null.
+  - A String value containing a character SNS and SQS reject (anything outside #x9, #xA, #xD, #x20–#xD7FF, #xE000–#xFFFD and #x10000–#x10FFFF) is omitted like a null, with a warning.
   - SNS allows 10 attributes per message.
 
 ### 11.3 StateStore

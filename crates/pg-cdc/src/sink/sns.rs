@@ -64,6 +64,7 @@ trait SnsApi: Send + Sync + fmt::Debug {
 struct Topic {
     fifo: bool,
     max_message_bytes: usize,
+    declared_size: bool,
 }
 
 impl Topic {
@@ -71,16 +72,16 @@ impl Topic {
         let fifo = attributes
             .get("FifoTopic")
             .is_some_and(|value| value == "true");
-        let max_message_bytes = attributes
+        let from_topic = attributes
             .get("MaximumMessageSize")
             .and_then(|value| value.parse::<usize>().ok())
-            .filter(|bytes| *bytes > 0)
-            .map_or(SNS_DEFAULT_MESSAGE_BYTES, |bytes| {
-                bytes.min(SNS_MAX_MESSAGE_BYTES)
-            });
+            .filter(|bytes| *bytes > 0);
         Self {
             fifo,
-            max_message_bytes,
+            max_message_bytes: from_topic.map_or(SNS_DEFAULT_MESSAGE_BYTES, |bytes| {
+                bytes.min(SNS_MAX_MESSAGE_BYTES)
+            }),
+            declared_size: from_topic.is_some(),
         }
     }
 }
@@ -255,7 +256,7 @@ impl Sink for SnsSink {
             topic_arn = %self.topic_arn,
             fifo = topic.fifo,
             max_message_bytes = topic.max_message_bytes,
-            limit_from_topic = attributes.contains_key("MaximumMessageSize"),
+            limit_from_topic = topic.declared_size,
             "SNS topic ready"
         );
         if topic.fifo && self.fair_queue_group.is_some() {
@@ -466,20 +467,28 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_reads_fifo_mode_and_the_message_size_limit() {
-        for (attributes, max) in [
-            (vec![], SNS_DEFAULT_MESSAGE_BYTES),
+        for (attributes, max, from_topic) in [
+            (vec![], SNS_DEFAULT_MESSAGE_BYTES, false),
             (
                 vec![("MaximumMessageSize", "1048576")],
                 SNS_MAX_MESSAGE_BYTES,
+                true,
             ),
             (
                 vec![("MaximumMessageSize", "2000000")],
                 SNS_MAX_MESSAGE_BYTES,
+                true,
             ),
-            (vec![("MaximumMessageSize", "0")], SNS_DEFAULT_MESSAGE_BYTES),
+            (vec![("MaximumMessageSize", "65536")], 65_536, true),
+            (
+                vec![("MaximumMessageSize", "0")],
+                SNS_DEFAULT_MESSAGE_BYTES,
+                false,
+            ),
             (
                 vec![("MaximumMessageSize", "big")],
                 SNS_DEFAULT_MESSAGE_BYTES,
+                false,
             ),
         ] {
             let (sink, _) = preflighted(
@@ -497,6 +506,11 @@ mod tests {
                     max_batch_bytes: max,
                     max_message_bytes: max,
                 },
+                "{attributes:?}"
+            );
+            assert_eq!(
+                sink.topic.get().map(|topic| topic.declared_size),
+                Some(from_topic),
                 "{attributes:?}"
             );
         }
