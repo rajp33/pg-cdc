@@ -4,7 +4,7 @@ mod fixture;
 mod postgres;
 mod tls;
 
-pub use aws::{AwsEmulator, MOTO_IMAGE, MOTO_TAG};
+pub use aws::{AwsEmulator, MOTO_IMAGE, MOTO_TAG, TopicQueue};
 pub use error::TestkitError;
 pub use fixture::{read_fixture, write_fixture};
 pub use postgres::{

@@ -16,4 +16,6 @@ pub enum TestkitError {
     MalformedFixture(String),
     #[error("certificate: {0}")]
     Certificate(#[from] rcgen::Error),
+    #[error("aws: {0}")]
+    Aws(String),
 }

@@ -15,6 +15,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-rds.workspace = true
+aws-sdk-sns.workspace = true
 aws-smithy-http-client.workspace = true
 bytes.workspace = true
 clap.workspace = true
@@ -48,6 +49,7 @@ twox-hash.workspace = true
 webpki-roots.workspace = true
 
 [dev-dependencies]
+aws-sdk-sqs.workspace = true
 pg-cdc-testkit.workspace = true
 proptest.workspace = true
 tempfile.workspace = true

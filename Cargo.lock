@@ -2248,6 +2248,8 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-rds",
+ "aws-sdk-sns",
+ "aws-sdk-sqs",
  "aws-smithy-http-client",
  "bytes",
  "clap",
