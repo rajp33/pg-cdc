@@ -42,6 +42,8 @@ pub enum SessionError {
     Replication(#[from] ReplicationError),
     #[error("replication stream ended")]
     StreamEnded,
+    #[error("malformed replication stream after {at}: {source}")]
+    Malformed { at: Lsn, source: ReplicationError },
     #[error("malformed message at {wal_start}: {source}")]
     Decode { wal_start: Lsn, source: DecodeError },
     #[error("cannot build an event at {wal_start}: {source}")]
@@ -62,6 +64,7 @@ impl SessionError {
             Self::Decode { wal_start, .. }
             | Self::Build { wal_start, .. }
             | Self::UnknownRelation { wal_start, .. } => Some(*wal_start),
+            Self::Malformed { at, .. } => Some(*at),
             _ => None,
         }
     }
@@ -89,7 +92,10 @@ pub async fn run_session<W: AsyncWrite + Unpin + Send>(
     {
         tracing::warn!(%schema, %table, "published table does not use REPLICA IDENTITY FULL");
     }
-    let mut stream = ReplicationStream::start(replication_config(&params, config, start)?).await?;
+    let mut stream = ReplicationStream::start(replication_config(&params, config, start)?)
+        .await
+        .map_err(|error| stream_fault(error, start))?;
+    let mut position = start;
     let mut session = Session {
         control: &control,
         types,
@@ -104,7 +110,7 @@ pub async fn run_session<W: AsyncWrite + Unpin + Send>(
             () = shutdown.cancelled() => break,
             received = stream.recv() => received,
         };
-        let event = received?.ok_or(SessionError::StreamEnded)?;
+        let event = next_event(received, &mut position)?;
         let Some(handled) = finish_or_abandon(session.handle(event), shutdown, DRAIN_TIMEOUT).await
         else {
             tracing::warn!(
@@ -121,6 +127,26 @@ pub async fn run_session<W: AsyncWrite + Unpin + Send>(
         tracing::warn!(%error, "replication stream did not stop cleanly");
     }
     Ok(())
+}
+
+fn next_event(
+    received: Result<Option<ReplicationEvent>, ReplicationError>,
+    position: &mut Lsn,
+) -> Result<ReplicationEvent, SessionError> {
+    let event = received
+        .map_err(|error| stream_fault(error, *position))?
+        .ok_or(SessionError::StreamEnded)?;
+    if let ReplicationEvent::XLogData { wal_start, .. } = &event {
+        *position = *wal_start;
+    }
+    Ok(event)
+}
+
+fn stream_fault(error: ReplicationError, at: Lsn) -> SessionError {
+    match error {
+        ReplicationError::Protocol(_) => SessionError::Malformed { at, source: error },
+        other => SessionError::Replication(other),
+    }
 }
 
 async fn finish_or_abandon<F: Future>(
@@ -291,6 +317,53 @@ fn known(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xlog(wal_start: u64) -> ReplicationEvent {
+        ReplicationEvent::XLogData {
+            wal_start: Lsn(wal_start),
+            wal_end: Lsn(wal_start + 0x100),
+            data: Vec::from(*b"B").into(),
+        }
+    }
+
+    #[test]
+    fn d3_malformed_framing_faults_at_the_last_wal_position_received() {
+        let mut position = Lsn(0x10);
+        let protocol = || Err(ReplicationError::Protocol("bad frame".to_owned()));
+        let error = next_event(protocol(), &mut position).unwrap_err();
+        assert!(
+            matches!(error, SessionError::Malformed { at: Lsn(0x10), .. }),
+            "{error:?}"
+        );
+        next_event(Ok(Some(xlog(0x40))), &mut position).unwrap();
+        next_event(
+            Ok(Some(ReplicationEvent::KeepAlive { wal_end: Lsn(0x90) })),
+            &mut position,
+        )
+        .unwrap();
+        let error = next_event(protocol(), &mut position).unwrap_err();
+        assert_eq!(error.fault_lsn(), Some(Lsn(0x40)));
+        assert!(!error.is_fatal());
+    }
+
+    #[test]
+    fn transport_failures_and_a_closed_stream_carry_no_fault_position() {
+        let mut position = Lsn(0x10);
+        for received in [
+            Err(ReplicationError::Closed),
+            Err(ReplicationError::Io(
+                std::io::ErrorKind::ConnectionReset.into(),
+            )),
+            Ok(None),
+        ] {
+            let error = next_event(received, &mut position).unwrap_err();
+            assert_eq!(error.fault_lsn(), None, "{error:?}");
+        }
+        assert!(matches!(
+            stream_fault(ReplicationError::Protocol("startup".to_owned()), Lsn(0x20)).fault_lsn(),
+            Some(Lsn(0x20))
+        ));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn work_started_before_shutdown_finishes_within_the_grace_period() {

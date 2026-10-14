@@ -193,6 +193,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn d3_three_malformed_streams_at_the_same_position_halt() {
+        let malformed = || {
+            Err(SessionError::Malformed {
+                at: Lsn(0x30),
+                source: pg_cdc_replication::ReplicationError::Protocol("bad frame".to_owned()),
+            })
+        };
+        let mut attempt = Scripted::new(vec![malformed(), malformed(), malformed(), Ok(())]);
+        let result = supervise(&mut attempt, &CancellationToken::new()).await;
+        assert!(
+            matches!(
+                result,
+                Err(SupervisorError::Halted {
+                    lsn: Lsn(0x30),
+                    count: 3,
+                    last: SessionError::Malformed { .. },
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(attempt.runs, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn faults_at_different_lsns_do_not_halt() {
         let mut attempt = Scripted::new(vec![
             fault(0x10),
