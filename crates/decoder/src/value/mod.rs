@@ -6,6 +6,8 @@ use serde_json::{Number, Value};
 
 pub use datetime::format_commit_ts;
 
+const MAX_JSON_NUMBER_EXPANSION: usize = 1 << 20;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
     Bool,
@@ -134,21 +136,22 @@ fn integer(text: &str) -> Option<Value> {
 }
 
 fn json(text: &str) -> Option<Value> {
-    normalize_numbers(serde_json::from_str(text).ok()?)
+    let mut budget = MAX_JSON_NUMBER_EXPANSION;
+    normalize_numbers(serde_json::from_str(text).ok()?, &mut budget)
 }
 
-fn normalize_numbers(value: Value) -> Option<Value> {
+fn normalize_numbers(value: Value, budget: &mut usize) -> Option<Value> {
     Some(match value {
-        Value::Number(number) => number::to_json_number(&number.to_string())?,
+        Value::Number(number) => number::to_json_number_within(&number.to_string(), budget)?,
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(normalize_numbers)
+                .map(|item| normalize_numbers(item, budget))
                 .collect::<Option<_>>()?,
         ),
         Value::Object(map) => Value::Object(
             map.into_iter()
-                .map(|(key, value)| normalize_numbers(value).map(|value| (key, value)))
+                .map(|(key, value)| normalize_numbers(value, budget).map(|value| (key, value)))
                 .collect::<Option<_>>()?,
         ),
         other => other,
@@ -271,6 +274,20 @@ mod tests {
         );
         assert_eq!(mapped(&TypeKind::Json, "null"), Value::Null);
         assert_eq!(mapped(&TypeKind::Json, r#"{"x": 100}"#), json!({"x": 100}));
+    }
+
+    #[test]
+    fn json_number_expansion_is_bounded_per_value() {
+        let literals = vec!["1e131071"; 1000].join(",");
+        let text = format!("[{literals}]");
+        let result = map_value(&TypeKind::Json, &text);
+        assert!(result.fallback);
+        assert_eq!(result.value, Value::String(text));
+
+        let modest = format!("[{}]", vec!["1e100"; 100].join(","));
+        let result = map_value(&TypeKind::Json, &modest);
+        assert!(!result.fallback);
+        assert_eq!(result.value.to_string().len(), 100 * 101 + 99 + 2);
     }
 
     #[test]

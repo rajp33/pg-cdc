@@ -4,8 +4,17 @@ const MAX_INTEGER_DIGITS: i64 = 131_072;
 const MAX_SCALE: i64 = 16_383;
 
 pub(super) fn to_json_number(text: &str) -> Option<Value> {
+    parse_plain(&plain_decimal(text)?)
+}
+
+pub(super) fn to_json_number_within(text: &str, budget: &mut usize) -> Option<Value> {
     let plain = plain_decimal(text)?;
-    serde_json::from_str::<Number>(&plain)
+    *budget = budget.checked_sub(plain.len().saturating_sub(text.len()))?;
+    parse_plain(&plain)
+}
+
+fn parse_plain(plain: &str) -> Option<Value> {
+    serde_json::from_str::<Number>(plain)
         .ok()
         .map(Value::Number)
 }
