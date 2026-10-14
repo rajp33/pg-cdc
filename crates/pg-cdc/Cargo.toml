@@ -11,10 +11,13 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-rds.workspace = true
 aws-smithy-http-client.workspace = true
+clap.workspace = true
+fastrand.workspace = true
 pg-cdc-decoder.workspace = true
 pg-cdc-replication.workspace = true
 rustls.workspace = true
@@ -24,11 +27,21 @@ serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = [
+  "io-std",
+  "io-util",
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
 tokio-postgres.workspace = true
 tokio-postgres-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 webpki-roots.workspace = true
 
 [dev-dependencies]
@@ -39,7 +52,9 @@ tokio = { workspace = true, features = [
   "io-util",
   "macros",
   "net",
+  "process",
   "rt",
   "rt-multi-thread",
+  "test-util",
   "time",
 ] }
