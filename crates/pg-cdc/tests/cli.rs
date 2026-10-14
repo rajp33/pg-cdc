@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::Stdio;
@@ -13,11 +12,15 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const WAIT: Duration = Duration::from_secs(30);
 
-fn write_config(pg: &Postgres, slot: &str) -> TestResult<tempfile::NamedTempFile> {
+fn write_config(
+    pg: &Postgres,
+    slot: &str,
+    status_interval: &str,
+) -> TestResult<tempfile::NamedTempFile> {
     let mut file = tempfile::NamedTempFile::new()?;
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: 200ms\nsink:\n  type: stdout\n",
+        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\nsink:\n  type: stdout\n",
         host = pg.host(),
         port = pg.port(),
         database = pg.database(),
@@ -73,7 +76,7 @@ async fn prepare(pg: &Postgres, create_slot: bool) -> TestResult {
 async fn run_streams_to_stdout_acknowledges_and_exits_cleanly_on_sigterm() -> TestResult {
     let pg = Postgres::start().await?;
     prepare(&pg, true).await?;
-    let config = write_config(&pg, "cli_slot")?;
+    let config = write_config(&pg, "cli_slot", "200ms")?;
     let mut child = spawn(config.path(), pg.password(), Stdio::null())?;
     let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
     pg.execute("INSERT INTO orders VALUES (1, 'paid')").await?;
@@ -100,32 +103,36 @@ async fn run_streams_to_stdout_acknowledges_and_exits_cleanly_on_sigterm() -> Te
 async fn d4_reconnect_rebuilds_relation_cache_and_replays_unacknowledged() -> TestResult {
     let pg = Postgres::start().await?;
     prepare(&pg, true).await?;
-    let config = write_config(&pg, "cli_slot")?;
+    let config = write_config(&pg, "cli_slot", "1h")?;
     let mut child = spawn(config.path(), pg.password(), Stdio::null())?;
     let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
     pg.execute("INSERT INTO orders VALUES (1, 'before reconnect')")
         .await?;
     let first = next_event(&mut stdout).await?;
-    let mut seen: HashMap<String, Value> = HashMap::new();
-    seen.insert(first["id"].as_str().ok_or("no id")?.to_owned(), first);
-    pg.wait_for_slot("cli_slot", WAIT, |state| state.active)
-        .await?;
+    assert_eq!(first["after"]["id"], 1);
     assert!(pg.terminate_walsender("cli_slot").await?);
+    pg.execute("ALTER TABLE orders ADD COLUMN note text DEFAULT 'n'")
+        .await?;
     pg.execute("INSERT INTO orders VALUES (2, 'after reconnect')")
         .await?;
+    let mut after = Vec::new();
     loop {
         let event = next_event(&mut stdout).await?;
-        let id = event["id"].as_str().ok_or("no id")?.to_owned();
-        if let Some(previous) = seen.get(&id) {
-            assert_eq!(previous, &event, "a replayed event changed");
-        }
-        if event["after"]["id"] == 2 {
-            assert_eq!(event["after"]["status"], "after reconnect");
-            assert_eq!(event["table"], "orders");
+        let done = event["after"]["id"] == 2;
+        after.push(event);
+        if done {
             break;
         }
-        seen.insert(id, event);
     }
+    let [replayed, second] = after.as_slice() else {
+        return Err(format!("expected a replay and insert 2, got {after:?}").into());
+    };
+    assert_eq!(replayed, &first, "transaction 1 did not replay unchanged");
+    assert!(replayed["after"].get("note").is_none(), "{replayed}");
+    assert_eq!(
+        second["after"],
+        serde_json::json!({"id": 2, "status": "after reconnect", "note": "n"})
+    );
     sigterm(&child).await?;
     assert!(tokio::time::timeout(WAIT, child.wait()).await??.success());
     Ok(())
@@ -135,7 +142,7 @@ async fn d4_reconnect_rebuilds_relation_cache_and_replays_unacknowledged() -> Te
 async fn s1_missing_slot_is_never_created() -> TestResult {
     let pg = Postgres::start().await?;
     prepare(&pg, false).await?;
-    let config = write_config(&pg, "missing_slot")?;
+    let config = write_config(&pg, "missing_slot", "200ms")?;
     let mut child = spawn(config.path(), pg.password(), Stdio::piped())?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(
