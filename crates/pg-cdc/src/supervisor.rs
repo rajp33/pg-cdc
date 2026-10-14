@@ -50,16 +50,31 @@ pub enum SupervisorError {
     Fatal(SessionError),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Backoff {
+    base: Duration,
+    cap: Duration,
     attempt: u32,
 }
 
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new(BACKOFF_BASE, BACKOFF_CAP)
+    }
+}
+
 impl Backoff {
+    pub fn new(base: Duration, cap: Duration) -> Self {
+        Self {
+            base,
+            cap,
+            attempt: 0,
+        }
+    }
+
     pub fn next_delay(&mut self) -> Duration {
-        let cap = BACKOFF_BASE
-            .saturating_mul(1 << self.attempt.min(5))
-            .min(BACKOFF_CAP);
+        let factor = 1_u32.checked_shl(self.attempt).unwrap_or(u32::MAX);
+        let cap = self.base.saturating_mul(factor).min(self.cap);
         self.attempt = self.attempt.saturating_add(1);
         let cap_ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX);
         Duration::from_millis(fastrand::u64(0..=cap_ms))
@@ -279,5 +294,23 @@ mod tests {
             assert!(fresh.next_delay() <= BACKOFF_BASE);
         }
         assert!(backoff.next_delay() <= BACKOFF_BASE);
+    }
+
+    #[test]
+    fn backoff_doubles_from_its_base_up_to_its_cap() {
+        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(30));
+        let caps_ms = [
+            100, 200, 400, 800, 1600, 3200, 6400, 12_800, 25_600, 30_000, 30_000,
+        ];
+        for cap in caps_ms {
+            let delay = backoff.next_delay();
+            assert!(
+                delay <= Duration::from_millis(cap),
+                "{delay:?} above {cap}ms"
+            );
+        }
+        for _ in 0..40 {
+            assert!(backoff.next_delay() <= Duration::from_secs(30));
+        }
     }
 }

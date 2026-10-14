@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod config;
 pub mod connection;
 pub mod event;
+pub mod lane;
 pub mod order;
 pub mod session;
 pub mod sink;
