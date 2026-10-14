@@ -21,7 +21,10 @@ impl FromStr for Lsn {
         let invalid = || ParseLsnError(text.to_owned());
         let (high, low) = text.split_once('/').ok_or_else(invalid)?;
         let half = |part: &str| {
-            if part.is_empty() || part.len() > 8 || !part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if part.is_empty()
+                || part.len() > 8
+                || !part.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
                 return Err(invalid());
             }
             u32::from_str_radix(part, 16).map_err(|_| invalid())
@@ -50,7 +53,17 @@ mod tests {
 
     #[test]
     fn rejects_malformed_text() {
-        for bad in ["", "1", "/1", "1/", "g/1", "+1/1", "123456789/1", "1/2/3", " 0/1"] {
+        for bad in [
+            "",
+            "1",
+            "/1",
+            "1/",
+            "g/1",
+            "+1/1",
+            "123456789/1",
+            "1/2/3",
+            " 0/1",
+        ] {
             assert!(bad.parse::<Lsn>().is_err(), "{bad:?} must be rejected");
         }
     }
