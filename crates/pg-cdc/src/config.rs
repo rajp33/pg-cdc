@@ -7,7 +7,12 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 use serde_json::{Map, Value};
 
+use crate::order::OrderBy;
+
 pub const ENV_PREFIX: &str = "PGCDC__";
+pub const DEFAULT_LANES: usize = 64;
+pub const MAX_LANES: usize = 4096;
+pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 << 20;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +20,8 @@ pub struct Config {
     #[serde(deserialize_with = "de_string")]
     pub pipeline: String,
     pub source: SourceConfig,
+    #[serde(default)]
+    pub delivery: DeliveryConfig,
     pub sink: SinkConfig,
 }
 
@@ -69,6 +76,27 @@ pub enum TlsMode {
     VerifyCa,
     #[default]
     VerifyFull,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryConfig {
+    #[serde(default, deserialize_with = "de_order_by")]
+    pub order_by: OrderBy,
+    #[serde(default = "default_lanes", deserialize_with = "de_count")]
+    pub lanes: usize,
+    #[serde(default = "default_max_inflight_bytes", deserialize_with = "de_size")]
+    pub max_inflight_bytes: u64,
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            order_by: OrderBy::default(),
+            lanes: DEFAULT_LANES,
+            max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -162,6 +190,20 @@ fn set_path(tree: &mut Value, keys: &[String], value: Value) -> Option<()> {
     Some(())
 }
 
+pub fn parse_size(text: &str) -> Option<u64> {
+    let split = text.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, unit) = text.split_at_checked(split)?;
+    let amount: u64 = digits.parse().ok()?;
+    let scale: u64 = match unit {
+        "B" => 1,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        _ => return None,
+    };
+    amount.checked_mul(scale)
+}
+
 pub fn parse_duration(text: &str) -> Option<Duration> {
     let split = text.find(|c: char| !c.is_ascii_digit())?;
     let (digits, unit) = text.split_at_checked(split)?;
@@ -220,6 +262,26 @@ impl Config {
         ) {
             return Err(ConfigError::MissingPassword);
         }
+        self.delivery.validate()
+    }
+}
+
+impl DeliveryConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=MAX_LANES).contains(&self.lanes) {
+            return Err(ConfigError::InvalidValue {
+                field: "delivery.lanes",
+                value: self.lanes.to_string(),
+                reason: "must be from 1 to 4096",
+            });
+        }
+        if self.max_inflight_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "delivery.max_inflight_bytes",
+                value: "0".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
         Ok(())
     }
 }
@@ -246,6 +308,33 @@ fn default_port() -> u16 {
 
 fn default_status_interval() -> Duration {
     Duration::from_secs(10)
+}
+
+fn default_lanes() -> usize {
+    DEFAULT_LANES
+}
+
+fn default_max_inflight_bytes() -> u64 {
+    DEFAULT_MAX_INFLIGHT_BYTES
+}
+
+fn de_order_by<'de, D: Deserializer<'de>>(deserializer: D) -> Result<OrderBy, D::Error> {
+    de_string(deserializer)?.parse().map_err(de::Error::custom)
+}
+
+fn de_size<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let text = de_string(deserializer)?;
+    parse_size(&text).ok_or_else(|| {
+        de::Error::custom(format!(
+            "invalid size {text:?}; use an integer with B, KiB, MiB or GiB"
+        ))
+    })
+}
+
+fn de_count<'de, D: Deserializer<'de>>(deserializer: D) -> Result<usize, D::Error> {
+    let text = de_string(deserializer)?;
+    text.parse()
+        .map_err(|_| de::Error::custom(format!("{text:?} is not a whole number")))
 }
 
 fn de_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
@@ -602,6 +691,97 @@ sink:
             "99999999999999999999s",
         ] {
             assert_eq!(parse_duration(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn delivery_defaults_match_the_spec() {
+        let config = parse(MINIMAL, with_password()).unwrap();
+        assert_eq!(config.delivery, DeliveryConfig::default());
+        assert_eq!(config.delivery.order_by, OrderBy::Key);
+        assert_eq!(config.delivery.lanes, 64);
+        assert_eq!(config.delivery.max_inflight_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_delivery_settings() {
+        let yaml = MINIMAL.replace(
+            "sink:",
+            "delivery:\n  order_by: column:tenant_id\n  lanes: 8\n  max_inflight_bytes: 64MiB\nsink:",
+        );
+        let config = parse(&yaml, with_password()).unwrap();
+        assert_eq!(
+            config.delivery,
+            DeliveryConfig {
+                order_by: OrderBy::Column("tenant_id".to_owned()),
+                lanes: 8,
+                max_inflight_bytes: 64 << 20,
+            }
+        );
+    }
+
+    #[test]
+    fn environment_overrides_delivery_settings() {
+        let mut vars = with_password();
+        vars.extend(env(&[
+            ("PGCDC__DELIVERY__ORDER_BY", "pipeline"),
+            ("PGCDC__DELIVERY__LANES", "2"),
+            ("PGCDC__DELIVERY__MAX_INFLIGHT_BYTES", "1GiB"),
+        ]));
+        let config = parse(MINIMAL, vars).unwrap();
+        assert_eq!(config.delivery.order_by, OrderBy::Pipeline);
+        assert_eq!(config.delivery.lanes, 2);
+        assert_eq!(config.delivery.max_inflight_bytes, 1 << 30);
+    }
+
+    #[test]
+    fn parses_sizes_with_binary_units() {
+        assert_eq!(parse_size("10B"), Some(10));
+        assert_eq!(parse_size("512KiB"), Some(512 * 1024));
+        assert_eq!(parse_size("256MiB"), Some(256 * 1024 * 1024));
+        assert_eq!(parse_size("2GiB"), Some(2 * 1024 * 1024 * 1024));
+        for bad in [
+            "",
+            "10",
+            "MiB",
+            "1.5MiB",
+            "10MB",
+            "10mib",
+            "10 MiB",
+            "-1B",
+            "99999999999999GiB",
+        ] {
+            assert_eq!(parse_size(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_delivery_settings() {
+        let delivery = |body: &str| MINIMAL.replace("sink:", &format!("delivery:\n{body}\nsink:"));
+        for body in [
+            "  order_by: random",
+            "  max_inflight_bytes: 10MB",
+            "  lanes: many",
+            "  park_after: 30s",
+        ] {
+            assert!(
+                matches!(
+                    parse(&delivery(body), with_password()),
+                    Err(ConfigError::Invalid(_))
+                ),
+                "{body}"
+            );
+        }
+        for (body, field) in [
+            ("  lanes: 0", "delivery.lanes"),
+            ("  lanes: 4097", "delivery.lanes"),
+            ("  max_inflight_bytes: 0MiB", "delivery.max_inflight_bytes"),
+        ] {
+            let error = parse(&delivery(body), with_password()).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { field: actual, .. } if *actual == field),
+                "{body}: {error}"
+            );
         }
     }
 
