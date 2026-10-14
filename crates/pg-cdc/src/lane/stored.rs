@@ -136,12 +136,16 @@ impl Lane {
         let parked_at = now_ms();
         let mut events = Vec::new();
         for state in keys.iter().filter_map(|key| self.keys.get(key)) {
+            let floor = state.stored.as_ref().and_then(|stored| stored.floor);
             let dead = state
                 .stored
                 .as_ref()
                 .is_some_and(|stored| stored.dead_on_append);
             for (index, pending) in state.queue.iter().enumerate() {
-                let failure = state.failure.as_ref().filter(|_| index == 0);
+                let failure = state
+                    .failure
+                    .as_ref()
+                    .filter(|_| index == 0 && floor == Some(pending.outbound.id));
                 events.push(ParkedEvent {
                     order_key: pending.outbound.order_key,
                     id: pending.outbound.id,

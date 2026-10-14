@@ -110,6 +110,30 @@ async fn a_terminal_outcome_parks_the_event_dead_and_blocks_its_key() {
     assert_eq!(harness.settle(1).await, Lsn(103));
     assert_eq!(harness.store.queue(b"poison").await.len(), 3);
     assert_eq!(harness.sink.batches(), vec![vec![0, 2]]);
+    let stored = harness
+        .store
+        .inner
+        .read_parked(&OrderKeyId::of(b"poison"), None, 10)
+        .await
+        .unwrap();
+    let metadata: Vec<(u32, u32, &str)> = stored
+        .iter()
+        .map(|event| {
+            (
+                event.id.ordinal(),
+                event.attempts,
+                event.last_error.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        metadata,
+        vec![
+            (0, 1, "rejected"),
+            (1, 0, "queued behind a parked event"),
+            (3, 0, "queued behind a parked event"),
+        ]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -215,4 +239,28 @@ async fn park_all_parks_every_queued_event_and_stops_sending() {
         harness.store.queue(b"other").await,
         vec![(2, ParkStatus::Retrying)]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn park_all_leaves_events_of_unloaded_partitions_to_the_replay_skip() {
+    let store = TestStore::default();
+    let held = OrderKeyId::of(b"k").partition();
+    store.hold(held);
+    store.seed(b"k", 6, ParkStatus::Retrying).await;
+    let mut harness = Harness::start(Setup::default(), ScriptedSink::delivering(), store).await;
+    harness.lanes.park_all();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    harness.send(5, b"k", 10).unwrap();
+    assert!(harness.quiet_for(Duration::from_secs(60)).await);
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(6, ParkStatus::Retrying)]
+    );
+    harness.store.release.notify_one();
+    assert_eq!(harness.settle(1).await, Lsn(100));
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(6, ParkStatus::Retrying)]
+    );
+    assert_eq!(harness.sink.batches(), Vec::<Vec<u32>>::new());
 }

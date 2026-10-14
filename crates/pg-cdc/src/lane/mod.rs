@@ -314,7 +314,7 @@ impl Lane {
                 let mut state = Key::new();
                 state.queue.push_back(pending);
                 entry.insert(state);
-                if self.closing {
+                if self.closing && self.is_loaded(key) {
                     self.start_parking(key, false);
                 } else {
                     self.make_ready(key);
