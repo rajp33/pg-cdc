@@ -5,8 +5,9 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
-use serde::Serialize;
-use serde_json::{Map, Value};
+use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::value::RawValue;
 
 use crate::event::EventId;
 use crate::state::{StoreError, store_root};
@@ -66,24 +67,60 @@ impl PayloadStore for S3PayloadStore {
 }
 
 pub fn pointer_body(body: &[u8], payload: &PayloadRef) -> Result<Bytes, serde_json::Error> {
-    let envelope: Map<String, Value> = serde_json::from_slice(body)?;
-    let mut reference = Some(serde_json::to_value(payload)?);
-    let mut pointer = Map::with_capacity(envelope.len());
-    for (name, value) in envelope {
-        if matches!(name.as_str(), "before" | "after" | "unchanged_toast") {
-            continue;
-        }
+    let envelope: Fields = serde_json::from_slice(body)?;
+    let reference = serde_json::value::to_raw_value(payload)?;
+    let mut fields = Vec::with_capacity(envelope.0.len() + 1);
+    let mut reference = Some(reference);
+    for (name, value) in envelope.0 {
         if name == "source"
             && let Some(reference) = reference.take()
         {
-            pointer.insert("payload_ref".to_owned(), reference);
+            fields.push(("payload_ref".to_owned(), reference));
         }
-        pointer.insert(name, value);
+        fields.push((name, value));
     }
     if let Some(reference) = reference {
-        pointer.insert("payload_ref".to_owned(), reference);
+        fields.push(("payload_ref".to_owned(), reference));
     }
-    serde_json::to_vec(&pointer).map(Bytes::from)
+    serde_json::to_vec(&Pointer(fields)).map(Bytes::from)
+}
+
+struct Fields(Vec<(String, Box<RawValue>)>);
+
+impl<'de> Deserialize<'de> for Fields {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+
+struct FieldsVisitor;
+
+impl<'de> Visitor<'de> for FieldsVisitor {
+    type Value = Fields;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Fields, A::Error> {
+        let mut fields = Vec::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if matches!(name.as_str(), "before" | "after" | "unchanged_toast") {
+                map.next_value::<IgnoredAny>()?;
+            } else {
+                fields.push((name, map.next_value::<Box<RawValue>>()?));
+            }
+        }
+        Ok(Fields(fields))
+    }
+}
+
+struct Pointer(Vec<(String, Box<RawValue>)>);
+
+impl Serialize for Pointer {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(name, value)| (name, value)))
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +168,24 @@ mod tests {
             ),
             "{pointer:?}"
         );
+    }
+
+    #[test]
+    fn a_pointer_survives_json_columns_nested_up_to_the_decoder_limit() {
+        for depth in [125, 126, 127] {
+            let nested = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            let body = format!(
+                r#"{{"id":"x","before":{{"doc":{nested}}},"after":{{"doc":{nested}}},"unchanged_toast":["doc"],"source":{{}}}}"#
+            );
+            assert!(serde_json::from_str::<serde_json::Value>(&nested).is_ok());
+            let pointer = pointer_body(body.as_bytes(), &reference()).unwrap();
+            assert!(
+                std::str::from_utf8(&pointer)
+                    .unwrap()
+                    .starts_with(r#"{"id":"x","payload_ref":{"#),
+                "depth {depth}"
+            );
+        }
     }
 
     #[test]
