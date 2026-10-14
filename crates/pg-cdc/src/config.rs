@@ -15,6 +15,9 @@ pub const MAX_LANES: usize = 4096;
 pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 << 20;
 pub const DEFAULT_SINK_CONCURRENCY: usize = 32;
 pub const MAX_ATTRIBUTE_COLUMNS: usize = 7;
+pub const DEFAULT_PARK_AFTER: Duration = Duration::from_secs(30);
+pub const DEFAULT_MAX_PARKED_EVENTS: u64 = 10_000_000;
+pub const DEFAULT_STORE_CONCURRENCY: usize = 32;
 const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,6 +29,9 @@ pub struct Config {
     #[serde(default)]
     pub delivery: DeliveryConfig,
     pub sink: SinkConfig,
+    pub state_store: StateStoreConfig,
+    #[serde(default)]
+    pub payload_store: Option<PayloadStoreConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +96,10 @@ pub struct DeliveryConfig {
     pub lanes: usize,
     #[serde(default = "default_max_inflight_bytes", deserialize_with = "de_size")]
     pub max_inflight_bytes: u64,
+    #[serde(default = "default_park_after", deserialize_with = "de_duration")]
+    pub park_after: Duration,
+    #[serde(default = "default_max_parked_events", deserialize_with = "de_u64")]
+    pub max_parked_events: u64,
 }
 
 impl Default for DeliveryConfig {
@@ -98,8 +108,97 @@ impl Default for DeliveryConfig {
             order_by: OrderBy::default(),
             lanes: DEFAULT_LANES,
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+            park_after: DEFAULT_PARK_AFTER,
+            max_parked_events: DEFAULT_MAX_PARKED_EVENTS,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StateStoreConfig {
+    S3(S3StoreConfig),
+    Filesystem(FilesystemStoreConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3StoreConfig {
+    #[serde(deserialize_with = "de_string")]
+    pub bucket: String,
+    #[serde(default, deserialize_with = "de_string")]
+    pub prefix: String,
+    #[serde(default, deserialize_with = "de_opt_string")]
+    pub region: Option<String>,
+    #[serde(default = "default_store_concurrency", deserialize_with = "de_count")]
+    pub max_concurrency: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemStoreConfig {
+    #[serde(deserialize_with = "de_path")]
+    pub path: PathBuf,
+    #[serde(default = "default_store_concurrency", deserialize_with = "de_count")]
+    pub max_concurrency: usize,
+}
+
+impl StateStoreConfig {
+    pub fn max_concurrency(&self) -> usize {
+        match self {
+            Self::S3(s3) => s3.max_concurrency,
+            Self::Filesystem(filesystem) => filesystem.max_concurrency,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_concurrency() == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "state_store.max_concurrency",
+                value: "0".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        match self {
+            Self::S3(s3) => validate_bucket("state_store.bucket", &s3.bucket),
+            Self::Filesystem(filesystem) if filesystem.path.as_os_str().is_empty() => {
+                Err(ConfigError::InvalidValue {
+                    field: "state_store.path",
+                    value: String::new(),
+                    reason: "must not be empty",
+                })
+            }
+            Self::Filesystem(_) => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PayloadStoreConfig {
+    S3(S3PayloadConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3PayloadConfig {
+    #[serde(deserialize_with = "de_string")]
+    pub bucket: String,
+    #[serde(default, deserialize_with = "de_string")]
+    pub prefix: String,
+    #[serde(default, deserialize_with = "de_opt_string")]
+    pub region: Option<String>,
+}
+
+fn validate_bucket(field: &'static str, bucket: &str) -> Result<(), ConfigError> {
+    if bucket.is_empty() || bucket.contains('/') {
+        return Err(ConfigError::InvalidValue {
+            field,
+            value: bucket.to_owned(),
+            reason: "must be an S3 bucket name",
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -374,6 +473,10 @@ impl Config {
             return Err(ConfigError::MissingPassword);
         }
         self.delivery.validate()?;
+        self.state_store.validate()?;
+        if let Some(PayloadStoreConfig::S3(payload)) = &self.payload_store {
+            validate_bucket("payload_store.bucket", &payload.bucket)?;
+        }
         if self.sink.max_concurrency() == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "sink.max_concurrency",
@@ -400,6 +503,13 @@ impl DeliveryConfig {
         if self.max_inflight_bytes == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "delivery.max_inflight_bytes",
+                value: "0".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.park_after.is_zero() {
+            return Err(ConfigError::InvalidValue {
+                field: "delivery.park_after",
                 value: "0".to_owned(),
                 reason: "must be greater than zero",
             });
@@ -442,6 +552,18 @@ fn default_max_inflight_bytes() -> u64 {
 
 fn default_sink_concurrency() -> usize {
     DEFAULT_SINK_CONCURRENCY
+}
+
+fn default_park_after() -> Duration {
+    DEFAULT_PARK_AFTER
+}
+
+fn default_max_parked_events() -> u64 {
+    DEFAULT_MAX_PARKED_EVENTS
+}
+
+fn default_store_concurrency() -> usize {
+    DEFAULT_STORE_CONCURRENCY
 }
 
 fn de_string_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
@@ -497,6 +619,12 @@ fn de_count<'de, D: Deserializer<'de>>(deserializer: D) -> Result<usize, D::Erro
         .map_err(|_| de::Error::custom(format!("{text:?} is not a whole number")))
 }
 
+fn de_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let text = de_string(deserializer)?;
+    text.parse()
+        .map_err(|_| de::Error::custom(format!("{text:?} is not a whole number")))
+}
+
 fn de_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
     let text = de_string(deserializer)?;
     parse_duration(&text).ok_or_else(|| {
@@ -546,6 +674,10 @@ fn de_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Er
 
 fn de_opt_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
     Option::<StringField>::deserialize(deserializer).map(|field| field.map(|field| field.0))
+}
+
+fn de_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+    de_string(deserializer).map(PathBuf::from)
 }
 
 fn de_opt_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<PathBuf>, D::Error> {
@@ -605,6 +737,9 @@ source:
   publication: pgcdc_orders
 sink:
   type: stdout
+state_store:
+  type: filesystem
+  path: /var/lib/pg-cdc
 ";
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -741,9 +876,22 @@ source:
   status_interval: 5s
 sink:
   type: stdout
+state_store:
+  type: s3
+  bucket: 2026
+  prefix: 10
 ";
         let config = parse(yaml, env(&[])).unwrap();
         assert_eq!(config.pipeline, "2024");
+        assert_eq!(
+            config.state_store,
+            StateStoreConfig::S3(S3StoreConfig {
+                bucket: "2026".to_owned(),
+                prefix: "10".to_owned(),
+                region: None,
+                max_concurrency: DEFAULT_STORE_CONCURRENCY,
+            })
+        );
         assert_eq!(config.source.host, "127.1");
         assert_eq!(config.source.database, "1234");
         assert_eq!(config.source.user, "12345");
@@ -1035,13 +1183,15 @@ sink:
         assert_eq!(config.delivery.order_by, OrderBy::Key);
         assert_eq!(config.delivery.lanes, 64);
         assert_eq!(config.delivery.max_inflight_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.delivery.park_after, Duration::from_secs(30));
+        assert_eq!(config.delivery.max_parked_events, 10_000_000);
     }
 
     #[test]
     fn parses_delivery_settings() {
         let yaml = MINIMAL.replace(
             "sink:",
-            "delivery:\n  order_by: column:tenant_id\n  lanes: 8\n  max_inflight_bytes: 64MiB\nsink:",
+            "delivery:\n  order_by: column:tenant_id\n  lanes: 8\n  max_inflight_bytes: 64MiB\n  park_after: 2m\n  max_parked_events: 0\nsink:",
         );
         let config = parse(&yaml, with_password()).unwrap();
         assert_eq!(
@@ -1050,6 +1200,8 @@ sink:
                 order_by: OrderBy::Column("tenant_id".to_owned()),
                 lanes: 8,
                 max_inflight_bytes: 64 << 20,
+                park_after: Duration::from_secs(120),
+                max_parked_events: 0,
             }
         );
     }
@@ -1061,11 +1213,15 @@ sink:
             ("PGCDC__DELIVERY__ORDER_BY", "pipeline"),
             ("PGCDC__DELIVERY__LANES", "2"),
             ("PGCDC__DELIVERY__MAX_INFLIGHT_BYTES", "1GiB"),
+            ("PGCDC__DELIVERY__PARK_AFTER", "500ms"),
+            ("PGCDC__DELIVERY__MAX_PARKED_EVENTS", "25"),
         ]));
         let config = parse(MINIMAL, vars).unwrap();
         assert_eq!(config.delivery.order_by, OrderBy::Pipeline);
         assert_eq!(config.delivery.lanes, 2);
         assert_eq!(config.delivery.max_inflight_bytes, 1 << 30);
+        assert_eq!(config.delivery.park_after, Duration::from_millis(500));
+        assert_eq!(config.delivery.max_parked_events, 25);
     }
 
     #[test]
@@ -1096,7 +1252,9 @@ sink:
             "  order_by: random",
             "  max_inflight_bytes: 10MB",
             "  lanes: many",
-            "  park_after: 30s",
+            "  park_after: 30",
+            "  max_parked_events: -1",
+            "  max_parked_events: lots",
         ] {
             assert!(
                 matches!(
@@ -1110,11 +1268,141 @@ sink:
             ("  lanes: 0", "delivery.lanes"),
             ("  lanes: 4097", "delivery.lanes"),
             ("  max_inflight_bytes: 0MiB", "delivery.max_inflight_bytes"),
+            ("  park_after: 0s", "delivery.park_after"),
         ] {
             let error = parse(&delivery(body), with_password()).unwrap_err();
             assert!(
                 matches!(&error, ConfigError::InvalidValue { field: actual, .. } if *actual == field),
                 "{body}: {error}"
+            );
+        }
+    }
+
+    const FILESYSTEM_STORE: &str = "state_store:\n  type: filesystem\n  path: /var/lib/pg-cdc\n";
+
+    fn stores(sections: &str) -> String {
+        MINIMAL.replace(FILESYSTEM_STORE, sections)
+    }
+
+    #[test]
+    fn parses_the_filesystem_state_store_with_defaults() {
+        let config = parse(MINIMAL, with_password()).unwrap();
+        assert_eq!(
+            config.state_store,
+            StateStoreConfig::Filesystem(FilesystemStoreConfig {
+                path: PathBuf::from("/var/lib/pg-cdc"),
+                max_concurrency: 32,
+            })
+        );
+        assert_eq!(config.state_store.max_concurrency(), 32);
+        assert_eq!(config.payload_store, None);
+    }
+
+    #[test]
+    fn parses_the_s3_state_and_payload_stores() {
+        let yaml = stores(
+            "state_store:\n  type: s3\n  bucket: pgcdc-state\n  prefix: orders/\n  region: eu-west-1\n  max_concurrency: 8\npayload_store:\n  type: s3\n  bucket: pgcdc-payloads\n  prefix: orders/\n  region: eu-west-1\n",
+        );
+        let config = parse(&yaml, with_password()).unwrap();
+        assert_eq!(
+            config.state_store,
+            StateStoreConfig::S3(S3StoreConfig {
+                bucket: "pgcdc-state".to_owned(),
+                prefix: "orders/".to_owned(),
+                region: Some("eu-west-1".to_owned()),
+                max_concurrency: 8,
+            })
+        );
+        assert_eq!(
+            config.payload_store,
+            Some(PayloadStoreConfig::S3(S3PayloadConfig {
+                bucket: "pgcdc-payloads".to_owned(),
+                prefix: "orders/".to_owned(),
+                region: Some("eu-west-1".to_owned()),
+            }))
+        );
+        let minimal = stores(
+            "state_store:\n  type: s3\n  bucket: b\npayload_store:\n  type: s3\n  bucket: p\n",
+        );
+        let config = parse(&minimal, with_password()).unwrap();
+        assert_eq!(
+            config.state_store,
+            StateStoreConfig::S3(S3StoreConfig {
+                bucket: "b".to_owned(),
+                prefix: String::new(),
+                region: None,
+                max_concurrency: DEFAULT_STORE_CONCURRENCY,
+            })
+        );
+    }
+
+    #[test]
+    fn the_state_store_is_required_and_can_come_from_the_environment() {
+        assert!(matches!(
+            parse(&stores(""), with_password()),
+            Err(ConfigError::Invalid(_))
+        ));
+        let mut vars = with_password();
+        vars.extend(env(&[
+            ("PGCDC__STATE_STORE__TYPE", "s3"),
+            ("PGCDC__STATE_STORE__BUCKET", "from-env"),
+            ("PGCDC__STATE_STORE__MAX_CONCURRENCY", "4"),
+        ]));
+        let config = parse(&stores(""), vars).unwrap();
+        assert_eq!(
+            config.state_store,
+            StateStoreConfig::S3(S3StoreConfig {
+                bucket: "from-env".to_owned(),
+                prefix: String::new(),
+                region: None,
+                max_concurrency: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_store_settings() {
+        for (sections, field) in [
+            (
+                "state_store:\n  type: filesystem\n  path: /x\n  max_concurrency: 0\n",
+                "state_store.max_concurrency",
+            ),
+            (
+                "state_store:\n  type: filesystem\n  path: \"\"\n",
+                "state_store.path",
+            ),
+            (
+                "state_store:\n  type: s3\n  bucket: \"\"\n",
+                "state_store.bucket",
+            ),
+            (
+                "state_store:\n  type: s3\n  bucket: a/b\n",
+                "state_store.bucket",
+            ),
+            (
+                "state_store:\n  type: s3\n  bucket: b\npayload_store:\n  type: s3\n  bucket: \"\"\n",
+                "payload_store.bucket",
+            ),
+        ] {
+            let error = parse(&stores(sections), with_password()).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { field: actual, .. } if *actual == field),
+                "{sections}: {error}"
+            );
+        }
+        for sections in [
+            "state_store:\n  type: postgres\n",
+            "state_store:\n  type: s3\n",
+            "state_store:\n  type: s3\n  bucket: b\n  path: /x\n",
+            "state_store:\n  type: filesystem\n  path: /x\npayload_store:\n  type: filesystem\n  path: /y\n",
+            "state_store:\n  type: filesystem\n  path: /x\npayload_store:\n  type: s3\n",
+        ] {
+            assert!(
+                matches!(
+                    parse(&stores(sections), with_password()),
+                    Err(ConfigError::Invalid(_))
+                ),
+                "{sections}"
             );
         }
     }

@@ -12,11 +12,18 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const WAIT: Duration = Duration::from_secs(30);
 
-fn write_config(
-    pg: &Postgres,
-    slot: &str,
-    status_interval: &str,
-) -> TestResult<tempfile::NamedTempFile> {
+struct ConfigFile {
+    file: tempfile::NamedTempFile,
+    _state: tempfile::TempDir,
+}
+
+impl ConfigFile {
+    fn path(&self) -> &Path {
+        self.file.path()
+    }
+}
+
+fn write_config(pg: &Postgres, slot: &str, status_interval: &str) -> TestResult<ConfigFile> {
     write_config_with_sink(
         pg,
         slot,
@@ -30,17 +37,22 @@ fn write_config_with_sink(
     slot: &str,
     status_interval: &str,
     sections: &str,
-) -> TestResult<tempfile::NamedTempFile> {
+) -> TestResult<ConfigFile> {
     let mut file = tempfile::NamedTempFile::new()?;
+    let state = tempfile::tempdir()?;
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\n{sections}",
+        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\n{sections}state_store:\n  type: filesystem\n  path: {state}\n",
         host = pg.host(),
         port = pg.port(),
         database = pg.database(),
         user = pg.user(),
+        state = state.path().display(),
     )?;
-    Ok(file)
+    Ok(ConfigFile {
+        file,
+        _state: state,
+    })
 }
 
 fn spawn(config: &Path, password: &str, stderr: Stdio) -> TestResult<Child> {
@@ -202,7 +214,7 @@ async fn sigterm_while_the_connection_provider_is_built_exits_cleanly() -> TestR
     let mut file = tempfile::NamedTempFile::new()?;
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: aws_rds_iam\n  slot: s\n  publication: p\nsink:\n  type: stdout\n"
+        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: aws_rds_iam\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: /nonexistent/pg-cdc\n"
     )?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_pg-cdc"))
         .arg("run")
