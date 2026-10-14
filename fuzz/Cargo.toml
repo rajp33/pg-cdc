@@ -21,3 +21,10 @@ path = "fuzz_targets/decode_message.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "map_value"
+path = "fuzz_targets/map_value.rs"
+test = false
+doc = false
+bench = false

@@ -2219,6 +2219,7 @@ version = "0.1.0"
 dependencies = [
  "pg-cdc-testkit",
  "proptest",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
