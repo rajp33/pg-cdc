@@ -77,7 +77,6 @@ impl SessionError {
 pub async fn run_session<W: AsyncWrite + Unpin + Send>(
     config: &SessionConfig,
     provider: &dyn ConnectionProvider,
-    types: &mut TypeResolver,
     sink: &mut StdoutSink<W>,
     shutdown: &CancellationToken,
 ) -> Result<(), SessionError> {
@@ -98,7 +97,7 @@ pub async fn run_session<W: AsyncWrite + Unpin + Send>(
     let mut position = start;
     let mut session = Session {
         control: &control,
-        types,
+        types: TypeResolver::new(),
         sink,
         ack: AckProgress::new(start),
         builder: Builder::new(config.pipeline.clone()),
@@ -188,7 +187,7 @@ fn replication_config(
 
 struct Session<'a, W> {
     control: &'a ControlConnection,
-    types: &'a mut TypeResolver,
+    types: TypeResolver,
     sink: &'a mut StdoutSink<W>,
     ack: AckProgress,
     builder: Builder,

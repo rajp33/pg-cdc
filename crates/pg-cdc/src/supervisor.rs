@@ -5,7 +5,6 @@ use pg_cdc_decoder::Lsn;
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 
-use crate::catalog::TypeResolver;
 use crate::connection::ConnectionProvider;
 use crate::session::{SessionConfig, SessionError, run_session};
 use crate::sink::StdoutSink;
@@ -21,7 +20,6 @@ pub trait Attempt {
 pub struct LiveSession<'a, W> {
     pub config: &'a SessionConfig,
     pub provider: &'a dyn ConnectionProvider,
-    pub types: &'a mut TypeResolver,
     pub sink: &'a mut StdoutSink<W>,
     pub shutdown: &'a CancellationToken,
 }
@@ -36,13 +34,7 @@ impl<W> fmt::Debug for LiveSession<'_, W> {
 
 impl<W: AsyncWrite + Unpin + Send> Attempt for LiveSession<'_, W> {
     fn run(&mut self) -> impl Future<Output = Result<(), SessionError>> + Send {
-        run_session(
-            self.config,
-            self.provider,
-            self.types,
-            self.sink,
-            self.shutdown,
-        )
+        run_session(self.config, self.provider, self.sink, self.shutdown)
     }
 }
 

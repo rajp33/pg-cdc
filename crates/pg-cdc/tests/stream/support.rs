@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use pg_cdc::catalog::TypeResolver;
 use pg_cdc::config::TlsMode;
 use pg_cdc::connection::{ConnectParams, PasswordProvider, TlsConfig};
 use pg_cdc::session::{SessionConfig, SessionError, run_session};
@@ -74,7 +73,6 @@ pub(crate) fn spawn_after_abandoned_writes(
     };
     let task = tokio::spawn(async move {
         let provider = PasswordProvider::new(params);
-        let mut types = TypeResolver::new();
         let mut sink = StdoutSink::new(writer);
         for n in 0..abandoned {
             let line = format!("{{\"abandoned\":{n}}}");
@@ -82,7 +80,7 @@ pub(crate) fn spawn_after_abandoned_writes(
                 .await
                 .map_err(SessionError::Sink)?;
         }
-        run_session(&config, &provider, &mut types, &mut sink, &token).await
+        run_session(&config, &provider, &mut sink, &token).await
     });
     Running {
         shutdown,

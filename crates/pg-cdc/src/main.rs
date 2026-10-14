@@ -4,7 +4,6 @@ use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use pg_cdc::catalog::TypeResolver;
 use pg_cdc::config::{Config, Credentials, SinkConfig, SourceConfig};
 use pg_cdc::connection::{
     ConnectParams, ConnectionProvider, PasswordProvider, RdsIamProvider, TlsConfig,
@@ -85,12 +84,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
         status_interval: config.source.status_interval,
         buffer: REPLICATION_BUFFER,
     };
-    let mut types = TypeResolver::new();
     let mut sink = StdoutSink::stdout();
     let mut live = LiveSession {
         config: &session,
         provider: provider.as_ref(),
-        types: &mut types,
         sink: &mut sink,
         shutdown: &shutdown,
     };
