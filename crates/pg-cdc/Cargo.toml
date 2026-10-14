@@ -16,6 +16,7 @@ async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-rds.workspace = true
 aws-smithy-http-client.workspace = true
+bytes.workspace = true
 clap.workspace = true
 fastrand.workspace = true
 pg-cdc-decoder.workspace = true

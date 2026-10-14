@@ -2249,6 +2249,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-rds",
  "aws-smithy-http-client",
+ "bytes",
  "clap",
  "fastrand",
  "pg-cdc-decoder",

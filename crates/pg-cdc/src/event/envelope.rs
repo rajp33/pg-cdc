@@ -16,6 +16,17 @@ pub enum Op {
     Truncate,
 }
 
+impl Op {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Truncate => "truncate",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Source {
     pub pipeline: String,
