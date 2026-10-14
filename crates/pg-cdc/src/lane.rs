@@ -122,28 +122,19 @@ impl Lane {
                 }
             }
             self.promote_due_retries(Instant::now());
-            let Some(deadline) = self.linger_deadline() else {
-                if !self.wait_for_work().await {
-                    return;
-                }
-                continue;
-            };
             let (count, full) = self.plan_batch();
-            if !full && Instant::now() < deadline {
-                tokio::select! {
-                    received = self.inbox.recv() => match received {
-                        Some(pending) => {
-                            if !self.accept(pending) {
-                                return;
-                            }
-                        }
-                        None => return,
-                    },
-                    () = tokio::time::sleep_until(deadline) => {}
-                }
+            let linger = self.linger_deadline();
+            if let Some(deadline) = linger
+                && (full || Instant::now() >= deadline)
+            {
+                self.send_batch(count).await;
                 continue;
             }
-            self.send_batch(count).await;
+            let next_retry = self.retries.peek().map(|Reverse((due, _))| *due);
+            let until = [linger, next_retry].into_iter().flatten().min();
+            if !self.wait(until).await {
+                return;
+            }
         }
     }
 
@@ -230,11 +221,10 @@ impl Lane {
         (count, count >= limits.max_batch_messages)
     }
 
-    async fn wait_for_work(&mut self) -> bool {
-        let next_retry = self.retries.peek().map(|Reverse((due, _))| *due);
-        let retry = async {
-            match next_retry {
-                Some(due) => tokio::time::sleep_until(due).await,
+    async fn wait(&mut self, until: Option<Instant>) -> bool {
+        let timer = async {
+            match until {
+                Some(at) => tokio::time::sleep_until(at).await,
                 None => std::future::pending().await,
             }
         };
@@ -243,7 +233,7 @@ impl Lane {
                 Some(pending) => self.accept(pending),
                 None => false,
             },
-            () = retry => true,
+            () = timer => true,
         }
     }
 
