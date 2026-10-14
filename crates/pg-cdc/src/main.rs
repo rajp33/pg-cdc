@@ -64,8 +64,8 @@ fn init_logging(sink: &SinkConfig) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt().json().with_env_filter(filter);
     match sink {
-        SinkConfig::Stdout => builder.with_writer(std::io::stderr).init(),
-        SinkConfig::Discard | SinkConfig::Sns(_) => builder.with_writer(std::io::stdout).init(),
+        SinkConfig::Stdout(_) => builder.with_writer(std::io::stderr).init(),
+        SinkConfig::Discard(_) | SinkConfig::Sns(_) => builder.with_writer(std::io::stdout).init(),
     }
 }
 
@@ -120,8 +120,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
 async fn sink(config: &SinkConfig) -> Arc<dyn Sink> {
     match config {
-        SinkConfig::Stdout => Arc::new(StdoutSink::stdout()),
-        SinkConfig::Discard => Arc::new(DiscardSink::new()),
+        SinkConfig::Stdout(_) => Arc::new(StdoutSink::stdout()),
+        SinkConfig::Discard(_) => Arc::new(DiscardSink::new()),
         SinkConfig::Sns(sns) => Arc::new(
             SnsSink::from_environment(
                 sns.topic_arn.clone(),

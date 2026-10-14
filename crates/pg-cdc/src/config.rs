@@ -105,9 +105,24 @@ impl Default for DeliveryConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SinkConfig {
-    Stdout,
-    Discard,
+    Stdout(BasicSinkConfig),
+    Discard(BasicSinkConfig),
     Sns(SnsConfig),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BasicSinkConfig {
+    #[serde(default = "default_sink_concurrency", deserialize_with = "de_count")]
+    pub max_concurrency: usize,
+}
+
+impl Default for BasicSinkConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrency: DEFAULT_SINK_CONCURRENCY,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -128,14 +143,14 @@ pub struct SnsConfig {
 impl SinkConfig {
     pub fn max_concurrency(&self) -> usize {
         match self {
-            Self::Stdout | Self::Discard => DEFAULT_SINK_CONCURRENCY,
+            Self::Stdout(basic) | Self::Discard(basic) => basic.max_concurrency,
             Self::Sns(sns) => sns.max_concurrency,
         }
     }
 
     pub fn attribute_columns(&self) -> &[String] {
         match self {
-            Self::Stdout | Self::Discard => &[],
+            Self::Stdout(_) | Self::Discard(_) => &[],
             Self::Sns(sns) => &sns.attribute_columns,
         }
     }
@@ -149,13 +164,6 @@ impl SnsConfig {
                 field: "sink.topic_arn",
                 value: self.topic_arn.clone(),
                 reason: "must be an SNS topic ARN",
-            });
-        }
-        if self.max_concurrency == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "sink.max_concurrency",
-                value: "0".to_owned(),
-                reason: "must be greater than zero",
             });
         }
         if self.attribute_columns.len() > MAX_ATTRIBUTE_COLUMNS {
@@ -366,9 +374,16 @@ impl Config {
             return Err(ConfigError::MissingPassword);
         }
         self.delivery.validate()?;
+        if self.sink.max_concurrency() == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "sink.max_concurrency",
+                value: "0".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
         match &self.sink {
             SinkConfig::Sns(sns) => sns.validate(),
-            SinkConfig::Stdout | SinkConfig::Discard => Ok(()),
+            SinkConfig::Stdout(_) | SinkConfig::Discard(_) => Ok(()),
         }
     }
 }
@@ -612,7 +627,7 @@ sink:
         assert_eq!(config.source.tls.mode, TlsMode::VerifyFull);
         assert_eq!(config.source.tls.ca_file, None);
         assert_eq!(config.source.status_interval, Duration::from_secs(10));
-        assert_eq!(config.sink, SinkConfig::Stdout);
+        assert_eq!(config.sink, SinkConfig::Stdout(BasicSinkConfig::default()));
         let Credentials::Password {
             password: Some(password),
         } = &config.source.credentials
@@ -963,9 +978,54 @@ sink:
     fn parses_the_discard_sink() {
         let yaml = MINIMAL.replace("type: stdout", "type: discard");
         let config = parse(&yaml, with_password()).unwrap();
-        assert_eq!(config.sink, SinkConfig::Discard);
+        assert_eq!(config.sink, SinkConfig::Discard(BasicSinkConfig::default()));
         assert_eq!(config.sink.max_concurrency(), DEFAULT_SINK_CONCURRENCY);
-        assert_eq!(SinkConfig::Stdout.max_concurrency(), 32);
+        assert_eq!(
+            SinkConfig::Stdout(BasicSinkConfig::default()).max_concurrency(),
+            32
+        );
+    }
+
+    #[test]
+    fn every_sink_takes_max_concurrency_from_the_file_or_the_environment() {
+        for sink in ["stdout", "discard"] {
+            let yaml = MINIMAL.replace(
+                "type: stdout\n",
+                &format!("type: {sink}\n  max_concurrency: 8\n"),
+            );
+            let config = parse(&yaml, with_password()).unwrap();
+            assert_eq!(config.sink.max_concurrency(), 8, "{sink}");
+
+            let mut vars = with_password();
+            vars.extend(env(&[("PGCDC__SINK__MAX_CONCURRENCY", "3")]));
+            let config = parse(&MINIMAL.replace("stdout", sink), vars).unwrap();
+            assert_eq!(config.sink.max_concurrency(), 3, "{sink}");
+
+            let zero = MINIMAL.replace(
+                "type: stdout\n",
+                &format!("type: {sink}\n  max_concurrency: 0\n"),
+            );
+            assert!(
+                matches!(
+                    parse(&zero, with_password()),
+                    Err(ConfigError::InvalidValue {
+                        field: "sink.max_concurrency",
+                        ..
+                    })
+                ),
+                "{sink}"
+            );
+
+            let unknown =
+                MINIMAL.replace("type: stdout\n", &format!("type: {sink}\n  topic_arn: x\n"));
+            assert!(
+                matches!(
+                    parse(&unknown, with_password()),
+                    Err(ConfigError::Invalid(_))
+                ),
+                "{sink}"
+            );
+        }
     }
 
     #[test]
