@@ -91,6 +91,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         lanes: config.delivery.lanes,
         sink_concurrency: config.sink.max_concurrency(),
         attribute_columns: Vec::new(),
+        max_inflight_bytes: config.delivery.max_inflight_bytes,
     };
     let sink = sink(&config.sink);
     let mut live = LiveSession {

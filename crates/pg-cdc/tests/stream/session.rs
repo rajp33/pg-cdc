@@ -393,3 +393,53 @@ async fn o2_each_key_reaches_the_sink_in_id_order_across_lanes() -> TestResult {
     assert!(session.no_event_within(Duration::from_millis(500)).await?);
     session.stop().await
 }
+
+#[tokio::test]
+async fn a4_backpressure_pauses_reading_while_status_updates_keep_the_connection() -> TestResult {
+    const ROWS: usize = 30_000;
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &["CREATE TABLE items (id int PRIMARY KEY, body text)"],
+        &["items"],
+    )
+    .await?;
+    pg.execute("ALTER SYSTEM SET wal_sender_timeout = '2s'")
+        .await?;
+    pg.execute("SELECT pg_reload_conf()").await?;
+    let mut config = support::config(FAST, 64);
+    config.order_by = OrderBy::Key;
+    config.lanes = 4;
+    config.max_inflight_bytes = 16 * 1024;
+    let mut session = support::spawn_with(support::params(&pg), config);
+    session.set_mode(Mode::Hold);
+    pg.execute(&format!(
+        "INSERT INTO items SELECT g, repeat('x', 1000) FROM generate_series(1, {ROWS}) g"
+    ))
+    .await?;
+    let written = pg.current_wal_lsn().await?;
+    let walsender = pg
+        .wait_for_slot(SLOT, WAIT, |state| state.active_pid.is_some())
+        .await?
+        .active_pid;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let state = pg.slot_state(SLOT).await?.ok_or("slot missing")?;
+    assert_eq!(
+        state.active_pid, walsender,
+        "the replication connection was dropped"
+    );
+    let sent = pg.sent_lsn(SLOT).await?.ok_or("no sent position")?;
+    assert!(
+        sent < written,
+        "the reader kept reading past the in-flight bound: sent {sent:X} of {written:X}"
+    );
+    session.set_mode(Mode::Deliver);
+    session.skip_events(ROWS - 1).await?;
+    let last = session.next_event().await?;
+    let commit = support::commit_lsn(&last)?;
+    pg.wait_for_slot(SLOT, WAIT, |state| {
+        state.confirmed_flush_lsn.is_some_and(|lsn| lsn > commit)
+    })
+    .await?;
+    session.stop().await
+}

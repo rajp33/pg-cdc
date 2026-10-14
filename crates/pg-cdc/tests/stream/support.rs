@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pg_cdc::config::TlsMode;
+use pg_cdc::config::{DEFAULT_MAX_INFLIGHT_BYTES, TlsMode};
 use pg_cdc::connection::{ConnectParams, PasswordProvider, TlsConfig};
 use pg_cdc::order::OrderBy;
 use pg_cdc::session::{SessionConfig, SessionError, run_session};
@@ -58,6 +58,7 @@ pub(crate) fn config(status_interval: Duration, buffer: usize) -> SessionConfig 
         lanes: 1,
         sink_concurrency: 4,
         attribute_columns: Vec::new(),
+        max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
     }
 }
 
@@ -184,6 +185,13 @@ impl Running {
             events.push(self.next_event().await?);
         }
         Ok(events)
+    }
+
+    pub(crate) async fn skip_events(&mut self, count: usize) -> TestResult {
+        for _ in 0..count {
+            self.next_event().await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn no_event_within(&mut self, window: Duration) -> TestResult<bool> {

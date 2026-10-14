@@ -36,6 +36,7 @@ pub struct SessionConfig {
     pub lanes: usize,
     pub sink_concurrency: usize,
     pub attribute_columns: Vec<String>,
+    pub max_inflight_bytes: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +124,7 @@ pub async fn run_session(
         lanes: Lanes::spawn(config.lanes, sink, &permits, &reports),
         order_by: &config.order_by,
         attribute_columns: &config.attribute_columns,
+        max_inflight_bytes: config.max_inflight_bytes,
     };
     drop(reports);
     session
@@ -188,6 +190,7 @@ struct Session<'a> {
     lanes: Lanes,
     order_by: &'a OrderBy,
     attribute_columns: &'a [String],
+    max_inflight_bytes: u64,
 }
 
 impl Session<'_> {
@@ -204,7 +207,7 @@ impl Session<'_> {
                 biased;
                 () = shutdown.cancelled() => return Ok(()),
                 report = settled.recv() => self.report(report, stream)?,
-                received = stream.recv() => {
+                received = stream.recv(), if self.ack.inflight_bytes() < self.max_inflight_bytes => {
                     let event = next_event(received, &mut position)?;
                     let Some(handled) = shutdown.run_until_cancelled(self.handle(event)).await else {
                         return Ok(());

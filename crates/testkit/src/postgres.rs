@@ -243,6 +243,23 @@ impl Postgres {
         }
     }
 
+    pub async fn sent_lsn(&self, slot: &str) -> Result<Option<u64>, TestkitError> {
+        let row = self
+            .client()
+            .await?
+            .query_opt(
+                "SELECT r.sent_lsn::text FROM pg_stat_replication r \
+                 JOIN pg_replication_slots s ON s.active_pid = r.pid WHERE s.slot_name = $1",
+                &[&slot],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let lsn: Option<String> = row.try_get(0)?;
+        lsn.as_deref().map(parse_lsn).transpose()
+    }
+
     pub async fn current_wal_lsn(&self) -> Result<u64, TestkitError> {
         let row = self
             .client()
