@@ -15,6 +15,7 @@ const KEY_SQL: &str = "SELECT a.attname::text FROM pg_index i \
      WHERE i.indexrelid = (SELECT x.indexrelid FROM pg_index x \
      WHERE x.indrelid = $1 AND (x.indisprimary OR x.indisreplident) \
      ORDER BY x.indisprimary DESC LIMIT 1) \
+     AND k.ord <= i.indnkeyatts \
      ORDER BY k.ord";
 
 const SLOT_SQL: &str =

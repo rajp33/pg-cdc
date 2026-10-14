@@ -78,7 +78,11 @@ async fn key_columns_follow_the_primary_key_then_the_replica_identity_index() ->
          CREATE TABLE ri (a int, c text NOT NULL);
          CREATE UNIQUE INDEX ri_c ON ri (c);
          ALTER TABLE ri REPLICA IDENTITY USING INDEX ri_c;
-         CREATE TABLE nokey (a int);",
+         CREATE TABLE nokey (a int);
+         CREATE TABLE inc (a int, b int, PRIMARY KEY (a) INCLUDE (b));
+         CREATE TABLE ri_inc (a int, c text NOT NULL, d int);
+         CREATE UNIQUE INDEX ri_inc_c ON ri_inc (c) INCLUDE (d);
+         ALTER TABLE ri_inc REPLICA IDENTITY USING INDEX ri_inc_c;",
     )
     .await?;
     let client = pg.client().await?;
@@ -88,6 +92,14 @@ async fn key_columns_follow_the_primary_key_then_the_replica_identity_index() ->
     );
     assert_eq!(
         key_columns(&client, oid_of(&client, "'ri'::regclass").await?).await?,
+        ["c"]
+    );
+    assert_eq!(
+        key_columns(&client, oid_of(&client, "'inc'::regclass").await?).await?,
+        ["a"]
+    );
+    assert_eq!(
+        key_columns(&client, oid_of(&client, "'ri_inc'::regclass").await?).await?,
         ["c"]
     );
     assert_eq!(
