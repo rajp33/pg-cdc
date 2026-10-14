@@ -108,7 +108,7 @@ impl Builder {
         let (after, unchanged_toast) = map_row(relation, &insert.new.0, |_| true, &mut fallbacks);
         let change = Change {
             op: Op::Insert,
-            key: key(relation, &after),
+            key: key(relation, &after, None),
             before: None,
             after: Some(after),
             unchanged_toast,
@@ -145,7 +145,7 @@ impl Builder {
         let (after, unchanged_toast) = map_row(relation, &new_values, |_| true, &mut fallbacks);
         let change = Change {
             op: Op::Update,
-            key: key(relation, &after),
+            key: key(relation, &after, before.as_ref()),
             before,
             after: Some(after),
             unchanged_toast,
@@ -162,7 +162,7 @@ impl Builder {
         let before = old_image(relation, &delete.old, &mut fallbacks)?;
         let change = Change {
             op: Op::Delete,
-            key: key(relation, &before),
+            key: key(relation, &before, None),
             before: Some(before),
             after: None,
             unchanged_toast: Vec::new(),
@@ -276,14 +276,19 @@ fn map_row(
     (row, unchanged)
 }
 
-fn key(relation: &RelationInfo, image: &Row) -> Option<Row> {
+fn key(relation: &RelationInfo, image: &Row, fallback: Option<&Row>) -> Option<Row> {
     if relation.key_columns.is_empty() {
         return None;
     }
     relation
         .key_columns
         .iter()
-        .map(|name| image.get(name).map(|value| (name.clone(), value.clone())))
+        .map(|name| {
+            image
+                .get(name)
+                .or_else(|| fallback.and_then(|row| row.get(name)))
+                .map(|value| (name.clone(), value.clone()))
+        })
         .collect()
 }
 
@@ -527,6 +532,59 @@ mod tests {
             open().update(&relation, &update).unwrap().envelope.key,
             None
         );
+    }
+
+    #[test]
+    fn a_toasted_key_column_unchanged_by_an_update_keeps_the_rows_order_key() {
+        use crate::order::{OrderBy, order_key};
+
+        let relation = RelationInfo {
+            oid: 16_385,
+            schema: "public".to_owned(),
+            table: "docs".to_owned(),
+            columns: vec![
+                column("slug", TypeKind::Text, 25, true),
+                column("body", TypeKind::Text, 25, false),
+            ],
+            key_columns: vec!["slug".to_owned()],
+        };
+        let mut builder = open();
+        let insert = builder
+            .insert(
+                &relation,
+                &Insert {
+                    relation_oid: 16_385,
+                    new: Tuple(vec![t("long-slug"), t("one")]),
+                },
+            )
+            .unwrap()
+            .envelope;
+        let update = builder
+            .update(
+                &relation,
+                &Update {
+                    relation_oid: 16_385,
+                    old: Some(OldTuple::Key(Tuple(vec![t("long-slug"), TupleValue::Null]))),
+                    new: Tuple(vec![TupleValue::UnchangedToast, t("two")]),
+                },
+            )
+            .unwrap()
+            .envelope;
+        let delete = builder
+            .delete(
+                &relation,
+                &Delete {
+                    relation_oid: 16_385,
+                    old: OldTuple::Key(Tuple(vec![t("long-slug"), TupleValue::Null])),
+                },
+            )
+            .unwrap()
+            .envelope;
+        assert_eq!(update.key, Some(row(json!({"slug": "long-slug"}))));
+        assert_eq!(update.unchanged_toast, vec!["slug".to_owned()]);
+        let ids = [&insert, &update, &delete].map(|event| order_key(&OrderBy::Key, event));
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(ids[1], ids[2]);
     }
 
     #[test]
