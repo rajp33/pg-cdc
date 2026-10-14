@@ -139,6 +139,51 @@ async fn d4_reconnect_rebuilds_relation_cache_and_replays_unacknowledged() -> Te
 }
 
 #[tokio::test]
+async fn sigterm_while_the_connection_provider_is_built_exits_cleanly() -> TestResult {
+    let imds = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", imds.local_addr()?);
+    let (contacted, mut first_contact) = tokio::sync::mpsc::channel(1);
+    let stalled = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = imds.accept().await {
+            held.push(socket);
+            let _ = contacted.try_send(());
+        }
+    });
+    let mut file = tempfile::NamedTempFile::new()?;
+    write!(
+        file,
+        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: aws_rds_iam\n  slot: s\n  publication: p\nsink:\n  type: stdout\n"
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pg-cdc"))
+        .arg("run")
+        .arg("--config")
+        .arg(file.path())
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_EC2_METADATA_DISABLED")
+        .env("AWS_CONFIG_FILE", "/nonexistent/aws/config")
+        .env(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "/nonexistent/aws/credentials",
+        )
+        .env("AWS_EC2_METADATA_SERVICE_ENDPOINT", &endpoint)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    tokio::time::timeout(WAIT, first_contact.recv())
+        .await?
+        .ok_or("the metadata stub stopped")?;
+    sigterm(&child).await?;
+    let status = tokio::time::timeout(WAIT, child.wait()).await??;
+    stalled.abort();
+    assert!(status.success(), "{status}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn s1_missing_slot_is_never_created() -> TestResult {
     let pg = Postgres::start().await?;
     prepare(&pg, false).await?;

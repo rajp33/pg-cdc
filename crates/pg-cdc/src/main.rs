@@ -12,7 +12,7 @@ use pg_cdc::connection::{
 use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig};
 use pg_cdc::sink::StdoutSink;
 use pg_cdc::supervisor::{LiveSession, supervise};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -66,9 +66,18 @@ fn init_logging(sink: &SinkConfig) {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
-    let provider = provider(&config.source).await;
     let shutdown = CancellationToken::new();
-    tokio::spawn(watch_signals(shutdown.clone()));
+    let terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
+    let interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
+    tokio::spawn(watch_signals(terminate, interrupt, shutdown.clone()));
+    tracing::info!(pipeline = %config.pipeline, slot = %config.source.slot, "pg-cdc starting");
+    let Some(provider) = shutdown
+        .run_until_cancelled(Box::pin(provider(&config.source)))
+        .await
+    else {
+        tracing::info!("pg-cdc stopped cleanly");
+        return Ok(());
+    };
     let session = SessionConfig {
         pipeline: config.pipeline.clone(),
         slot: config.source.slot.clone(),
@@ -85,7 +94,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
         sink: &mut sink,
         shutdown: &shutdown,
     };
-    tracing::info!(pipeline = %config.pipeline, slot = %config.source.slot, "pg-cdc starting");
     supervise(&mut live, &shutdown)
         .await
         .context("replication stopped")?;
@@ -116,22 +124,10 @@ async fn provider(source: &SourceConfig) -> Box<dyn ConnectionProvider> {
     }
 }
 
-async fn watch_signals(shutdown: CancellationToken) {
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(terminate) => terminate,
-        Err(error) => {
-            tracing::error!(%error, "cannot listen for SIGTERM");
-            return;
-        }
-    };
+async fn watch_signals(mut terminate: Signal, mut interrupt: Signal, shutdown: CancellationToken) {
     tokio::select! {
         _ = terminate.recv() => {}
-        result = tokio::signal::ctrl_c() => {
-            if let Err(error) = result {
-                tracing::error!(%error, "cannot listen for Ctrl-C");
-                return;
-            }
-        }
+        _ = interrupt.recv() => {}
     }
     tracing::info!("shutdown requested");
     shutdown.cancel();
