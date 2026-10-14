@@ -40,14 +40,21 @@ fn write_config_with_sink(
 ) -> TestResult<ConfigFile> {
     let mut file = tempfile::NamedTempFile::new()?;
     let state = tempfile::tempdir()?;
+    let state_store = if sections.contains("state_store:") {
+        String::new()
+    } else {
+        format!(
+            "state_store:\n  type: filesystem\n  path: {}\n",
+            state.path().display()
+        )
+    };
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\n{sections}state_store:\n  type: filesystem\n  path: {state}\n",
+        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\n{sections}{state_store}",
         host = pg.host(),
         port = pg.port(),
         database = pg.database(),
         user = pg.user(),
-        state = state.path().display(),
     )?;
     Ok(ConfigFile {
         file,
@@ -432,6 +439,32 @@ async fn a_missing_sns_topic_keeps_preflight_retrying_without_taking_the_slot() 
     assert!(
         !state.active,
         "pg-cdc took the slot before its sink passed preflight"
+    );
+    assert!(
+        child.try_wait()?.is_none(),
+        "pg-cdc must keep retrying, not exit"
+    );
+    sigterm(&child).await?;
+    assert!(tokio::time::timeout(WAIT, child.wait()).await??.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_missing_state_bucket_keeps_the_store_check_retrying_without_taking_the_slot()
+-> TestResult {
+    let pg = Postgres::start().await?;
+    prepare(&pg, true).await?;
+    let aws = AwsEmulator::start().await?;
+    let sections = "sink:\n  type: discard\nstate_store:\n  type: s3\n  bucket: missing-state\n";
+    let config = write_config_with_sink(&pg, "cli_slot", "200ms", sections)?;
+    let mut child = spawn_with_env(config.path(), pg.password(), Stdio::null(), &moto_env(&aws))?;
+    let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
+    let failed = wait_for_line(&mut stdout, "state store check failed").await?;
+    assert!(failed.contains("NoSuchBucket"), "{failed}");
+    let state = pg.slot_state("cli_slot").await?.ok_or("slot missing")?;
+    assert!(
+        !state.active,
+        "pg-cdc took the slot before its state store answered"
     );
     assert!(
         child.try_wait()?.is_none(),

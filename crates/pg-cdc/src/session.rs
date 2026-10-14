@@ -18,7 +18,7 @@ use crate::connection::{
     SESSION_OPTIONS, connect_control, replication_tls,
 };
 use crate::event::{BuildError, Builder, Built, ColumnInfo, RelationInfo};
-use crate::lane::{LaneError, LaneStopped, Lanes, Pending, Report};
+use crate::lane::{LaneError, LaneSettings, LaneStopped, Lanes, Pending, Report, Stores};
 use crate::order::{OrderBy, order_key};
 use crate::sink::{Outbound, Sink};
 
@@ -37,6 +37,20 @@ pub struct SessionConfig {
     pub sink_concurrency: usize,
     pub attribute_columns: Vec<String>,
     pub max_inflight_bytes: u64,
+    pub park_after: Duration,
+    pub max_parked_events: u64,
+    pub store_concurrency: usize,
+}
+
+impl SessionConfig {
+    pub fn lane_settings(&self) -> LaneSettings {
+        LaneSettings {
+            lanes: self.lanes,
+            park_after: self.park_after,
+            max_parked_events: self.max_parked_events,
+            store_concurrency: self.store_concurrency,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +112,7 @@ pub async fn run_session(
     config: &SessionConfig,
     provider: &dyn ConnectionProvider,
     sink: &Arc<dyn Sink>,
+    stores: &Stores,
     shutdown: &CancellationToken,
 ) -> Result<(), SessionError> {
     let params = provider.params().await?;
@@ -121,7 +136,7 @@ pub async fn run_session(
         relations: HashMap::new(),
         builder: Builder::new(config.pipeline.clone()),
         ack: AckTracker::new(start),
-        lanes: Lanes::spawn(config.lanes, sink, &permits, &reports),
+        lanes: Lanes::spawn(config.lane_settings(), sink, stores, &permits, &reports),
         order_by: &config.order_by,
         attribute_columns: &config.attribute_columns,
         max_inflight_bytes: config.max_inflight_bytes,

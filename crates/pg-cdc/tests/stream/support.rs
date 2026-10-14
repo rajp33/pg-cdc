@@ -3,12 +3,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pg_cdc::config::{DEFAULT_MAX_INFLIGHT_BYTES, TlsMode};
+use pg_cdc::config::{
+    DEFAULT_MAX_INFLIGHT_BYTES, DEFAULT_MAX_PARKED_EVENTS, DEFAULT_PARK_AFTER, TlsMode,
+};
 use pg_cdc::connection::{ConnectParams, PasswordProvider, TlsConfig};
+use pg_cdc::lane::Stores;
 use pg_cdc::order::OrderBy;
 use pg_cdc::session::{SessionConfig, SessionError, run_session};
 use pg_cdc::sink::stdout::StdoutSink;
 use pg_cdc::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
+use pg_cdc::state::memory::MemoryStateStore;
 use pg_cdc_testkit::Postgres;
 use secrecy::SecretString;
 use serde_json::Value;
@@ -59,6 +63,16 @@ pub(crate) fn config(status_interval: Duration, buffer: usize) -> SessionConfig 
         sink_concurrency: 4,
         attribute_columns: Vec::new(),
         max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+        park_after: DEFAULT_PARK_AFTER,
+        max_parked_events: DEFAULT_MAX_PARKED_EVENTS,
+        store_concurrency: 4,
+    }
+}
+
+pub(crate) fn memory_stores() -> Stores {
+    Stores {
+        state: Arc::new(MemoryStateStore::new()),
+        payload: None,
     }
 }
 
@@ -149,7 +163,7 @@ pub(crate) fn spawn_with(params: ConnectParams, config: SessionConfig) -> Runnin
         delivered,
     });
     let shutdown = CancellationToken::new();
-    let task = spawn_run(params, config, sink, shutdown.clone());
+    let task = spawn_run(params, config, sink, memory_stores(), shutdown.clone());
     Running {
         shutdown,
         task,
@@ -163,11 +177,12 @@ fn spawn_run(
     params: ConnectParams,
     config: SessionConfig,
     sink: Arc<dyn Sink>,
+    stores: Stores,
     shutdown: CancellationToken,
 ) -> JoinHandle<Result<(), SessionError>> {
     tokio::spawn(async move {
         let provider = PasswordProvider::new(params);
-        run_session(&config, &provider, &sink, &shutdown).await
+        run_session(&config, &provider, &sink, &stores, &shutdown).await
     })
 }
 
@@ -239,7 +254,13 @@ pub(crate) fn spawn_stdout_session(
     let (writer, reader) = tokio::io::duplex(pipe);
     let shutdown = CancellationToken::new();
     let sink: Arc<dyn Sink> = Arc::new(StdoutSink::new(writer));
-    let task = spawn_run(params, config(status_interval, 64), sink, shutdown.clone());
+    let task = spawn_run(
+        params,
+        config(status_interval, 64),
+        sink,
+        memory_stores(),
+        shutdown.clone(),
+    );
     StdoutRunning {
         shutdown,
         task,

@@ -5,16 +5,23 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use pg_cdc::config::{Config, Credentials, SinkConfig, SourceConfig};
+use pg_cdc::config::{
+    Config, Credentials, PayloadStoreConfig, SinkConfig, SourceConfig, StateStoreConfig,
+};
 use pg_cdc::connection::{
     ConnectParams, ConnectionProvider, PasswordProvider, RdsIamProvider, TlsConfig,
 };
+use pg_cdc::lane::Stores;
+use pg_cdc::payload::{PayloadStore, S3PayloadStore};
 use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig};
 use pg_cdc::sink::Sink;
 use pg_cdc::sink::discard::DiscardSink;
 use pg_cdc::sink::sns::SnsSink;
 use pg_cdc::sink::stdout::StdoutSink;
-use pg_cdc::supervisor::{LiveSession, preflight, supervise};
+use pg_cdc::state::StateStore;
+use pg_cdc::state::filesystem::FilesystemStateStore;
+use pg_cdc::state::s3::{S3StateStore, s3_client};
+use pg_cdc::supervisor::{LiveSession, preflight, store_ready, supervise};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -89,7 +96,16 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!("pg-cdc stopped cleanly");
         return Ok(());
     };
-    if !preflight(sink.as_ref(), &shutdown).await {
+    let Some(stores) = shutdown
+        .run_until_cancelled(Box::pin(stores(&config)))
+        .await
+    else {
+        tracing::info!("pg-cdc stopped cleanly");
+        return Ok(());
+    };
+    if !preflight(sink.as_ref(), &shutdown).await
+        || !store_ready(stores.state.as_ref(), &shutdown).await
+    {
         tracing::info!("pg-cdc stopped cleanly");
         return Ok(());
     }
@@ -104,11 +120,15 @@ async fn run(config: Config) -> anyhow::Result<()> {
         sink_concurrency: config.sink.max_concurrency(),
         attribute_columns: config.sink.attribute_columns().to_vec(),
         max_inflight_bytes: config.delivery.max_inflight_bytes,
+        park_after: config.delivery.park_after,
+        max_parked_events: config.delivery.max_parked_events,
+        store_concurrency: config.state_store.max_concurrency(),
     };
     let mut live = LiveSession {
         config: &session,
         provider: provider.as_ref(),
         sink: &sink,
+        stores: &stores,
         shutdown: &shutdown,
     };
     supervise(&mut live, &shutdown)
@@ -131,6 +151,33 @@ async fn sink(config: &SinkConfig) -> Arc<dyn Sink> {
             .await,
         ),
     }
+}
+
+async fn stores(config: &Config) -> Stores {
+    let state: Arc<dyn StateStore> = match &config.state_store {
+        StateStoreConfig::S3(s3) => Arc::new(S3StateStore::new(
+            s3_client(s3.region.clone()).await,
+            s3.bucket.clone(),
+            &s3.prefix,
+            &config.pipeline,
+            s3.max_concurrency,
+        )),
+        StateStoreConfig::Filesystem(filesystem) => Arc::new(FilesystemStateStore::new(
+            &filesystem.path,
+            &config.pipeline,
+            filesystem.max_concurrency,
+        )),
+    };
+    let payload: Option<Arc<dyn PayloadStore>> = match &config.payload_store {
+        Some(PayloadStoreConfig::S3(s3)) => Some(Arc::new(S3PayloadStore::new(
+            s3_client(s3.region.clone()).await,
+            s3.bucket.clone(),
+            &s3.prefix,
+            &config.pipeline,
+        ))),
+        None => None,
+    };
+    Stores { state, payload }
 }
 
 async fn provider(source: &SourceConfig) -> Box<dyn ConnectionProvider> {

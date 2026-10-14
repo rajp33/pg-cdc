@@ -11,7 +11,9 @@ use tokio::time::Instant;
 use crate::ack::{Settled, Ticket};
 use crate::event::EventId;
 use crate::order::OrderKeyId;
+use crate::payload::PayloadStore;
 use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
+use crate::state::StateStore;
 use crate::supervisor::Backoff;
 
 pub const LINGER: Duration = Duration::from_millis(5);
@@ -45,6 +47,20 @@ pub enum LaneError {
 #[error("lane {0} has stopped")]
 pub struct LaneStopped(pub usize);
 
+#[derive(Debug, Clone)]
+pub struct Stores {
+    pub state: Arc<dyn StateStore>,
+    pub payload: Option<Arc<dyn PayloadStore>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneSettings {
+    pub lanes: usize,
+    pub park_after: Duration,
+    pub max_parked_events: u64,
+    pub store_concurrency: usize,
+}
+
 #[derive(Debug)]
 pub struct Lanes {
     inboxes: Vec<mpsc::UnboundedSender<Pending>>,
@@ -53,14 +69,15 @@ pub struct Lanes {
 
 impl Lanes {
     pub fn spawn(
-        count: usize,
+        settings: LaneSettings,
         sink: &Arc<dyn Sink>,
+        _stores: &Stores,
         permits: &Arc<Semaphore>,
         reports: &mpsc::UnboundedSender<Report>,
     ) -> Self {
         let capabilities = sink.capabilities();
         let mut tasks = JoinSet::new();
-        let inboxes = (0..count.max(1))
+        let inboxes = (0..settings.lanes.max(1))
             .map(|index| {
                 let (inbox, receiver) = mpsc::unbounded_channel();
                 let lane = Lane {
@@ -314,6 +331,7 @@ impl Lane {
 mod tests {
     use super::*;
     use crate::ack::AckTracker;
+    use crate::state::memory::MemoryStateStore;
     use async_trait::async_trait;
     use bytes::Bytes;
     use pg_cdc_decoder::Lsn;
@@ -441,9 +459,20 @@ mod tests {
             let sink = Arc::new(sink);
             let (reports, receiver) = mpsc::unbounded_channel();
             let dyn_sink: Arc<dyn Sink> = sink.clone();
+            let settings = LaneSettings {
+                lanes: count,
+                park_after: Duration::from_secs(30),
+                max_parked_events: 0,
+                store_concurrency: 4,
+            };
+            let stores = Stores {
+                state: Arc::new(MemoryStateStore::new()),
+                payload: None,
+            };
             let lanes = Lanes::spawn(
-                count,
+                settings,
                 &dyn_sink,
+                &stores,
                 &Arc::new(Semaphore::new(concurrency)),
                 &reports,
             );
