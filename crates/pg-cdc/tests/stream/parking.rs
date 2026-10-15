@@ -81,7 +81,12 @@ async fn o3_a_parked_queue_drains_before_new_events_for_its_key() -> TestResult 
     assert_eq!(first, serde_json::json!({"seeded": true}));
     let second = session.next_event().await?;
     assert_eq!(second["after"]["status"], "new");
-    assert_eq!(store.parked_events(), 0);
+    tokio::time::timeout(WAIT, async {
+        while store.parked_events() > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
     session.stop().await
 }
 

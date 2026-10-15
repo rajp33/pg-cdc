@@ -3,8 +3,12 @@ mod state_store;
 
 use std::sync::Arc;
 
-use pg_cdc::state::filesystem::FilesystemStateStore;
-use pg_cdc::state::{ParkStatus, StateStore, StoreError, decode_parked};
+use pg_cdc::state::filesystem::{FilesystemStateStore, LEADER_LOCK};
+use pg_cdc::state::{
+    LeaderRecord, LeaderState, ParkStatus, StateStore, StoreError, SwapOutcome, Version,
+    decode_parked,
+};
+use pg_cdc_decoder::Lsn;
 
 use state_store::{TestResult, event, id, key};
 
@@ -20,7 +24,8 @@ async fn the_filesystem_store_conforms() -> TestResult {
 }
 
 #[tokio::test]
-async fn parked_events_use_the_spec_layout_and_stray_files_are_ignored() -> TestResult {
+async fn parked_events_and_the_leader_record_use_the_spec_layout_and_stray_files_are_ignored()
+-> TestResult {
     let dir = tempfile::tempdir()?;
     let store = FilesystemStateStore::new(dir.path(), "orders", 4);
     let queue = key(0xab, 1)?;
@@ -56,8 +61,34 @@ async fn parked_events_use_the_spec_layout_and_stray_files_are_ignored() -> Test
     std::fs::remove_file(queue_dir.join("notes.txt"))?;
     store.remove_parked(&[(queue, parked.id)]).await?;
     assert!(!queue_dir.exists(), "an emptied queue leaves no directory");
-    let leader_dir = dir.path().join("orders");
-    assert!(!leader_dir.join("leader.json").exists());
+    let root = dir.path().join("orders");
+    let record = LeaderRecord {
+        epoch: 3,
+        holder: "task-a".to_owned(),
+        state: LeaderState::Active,
+        confirmed_lsn: Lsn(0x1_0000_00FF),
+        updated_ms: 1_760_443_200_000,
+    };
+    assert_eq!(
+        store.swap_leader(&record, None).await?,
+        SwapOutcome::Swapped(Version("1".to_owned()))
+    );
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("leader.json"))?)?;
+    assert_eq!(
+        written,
+        serde_json::json!({
+            "version": 1,
+            "record": {
+                "epoch": 3,
+                "holder": "task-a",
+                "state": "active",
+                "confirmed_lsn": "1/FF",
+                "updated_ms": 1_760_443_200_000_u64,
+            },
+        })
+    );
+    assert!(root.join(LEADER_LOCK).is_file());
     Ok(())
 }
 
