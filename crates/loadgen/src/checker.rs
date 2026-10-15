@@ -53,17 +53,23 @@ impl Verdict {
 }
 
 pub fn check(evidence: &Evidence) -> Verdict {
+    let written = Written::new(evidence);
     let committed: HashSet<i64> = evidence.committed.iter().map(|change| change.seq).collect();
-    let uncertain: HashSet<i64> = evidence.uncertain.iter().map(|change| change.seq).collect();
 
     let mut deliveries: HashMap<i64, usize> = HashMap::new();
+    let mut misrouted = BTreeSet::new();
     let mut discarded_seqs = HashSet::new();
     let mut discarded = 0;
     for observed in &evidence.observed {
         match *observed {
-            Observed::Delivered(delivery) => *deliveries.entry(delivery.seq).or_default() += 1,
-            Observed::DiscardMarker { token, seq, .. } => {
-                if evidence.discards.contains(&token) {
+            Observed::Delivered(delivery) if written.matches(delivery.seq, delivery.key) => {
+                *deliveries.entry(delivery.seq).or_default() += 1;
+            }
+            Observed::Delivered(delivery) => {
+                misrouted.insert(delivery.seq);
+            }
+            Observed::DiscardMarker { token, key, seq } => {
+                if written.counts_marker(token, key, seq) {
                     discarded += 1;
                     discarded_seqs.insert(seq);
                 }
@@ -79,11 +85,6 @@ pub fn check(evidence: &Evidence) -> Verdict {
             !deliveries.contains_key(seq) && !stored.contains(seq) && !discarded_seqs.contains(seq)
         })
         .collect();
-    let phantoms: BTreeSet<i64> = deliveries
-        .keys()
-        .copied()
-        .filter(|seq| !committed.contains(seq) && !uncertain.contains(seq))
-        .collect();
 
     Verdict {
         committed: committed.len(),
@@ -92,8 +93,35 @@ pub fn check(evidence: &Evidence) -> Verdict {
         stored: stored.len(),
         discarded,
         missing: missing.into_iter().collect(),
-        phantoms: phantoms.into_iter().collect(),
-        out_of_order: order_violations(evidence),
+        phantoms: misrouted.into_iter().collect(),
+        out_of_order: order_violations(evidence, &written),
+    }
+}
+
+struct Written<'a> {
+    keys: HashMap<i64, i32>,
+    discards: &'a BTreeSet<u64>,
+}
+
+impl<'a> Written<'a> {
+    fn new(evidence: &'a Evidence) -> Self {
+        Self {
+            keys: evidence
+                .committed
+                .iter()
+                .chain(&evidence.uncertain)
+                .map(|change| (change.seq, change.key))
+                .collect(),
+            discards: &evidence.discards,
+        }
+    }
+
+    fn matches(&self, seq: i64, key: i32) -> bool {
+        self.keys.get(&seq) == Some(&key)
+    }
+
+    fn counts_marker(&self, token: u64, key: i32, seq: i64) -> bool {
+        self.discards.contains(&token) && self.matches(seq, key)
     }
 }
 
@@ -116,7 +144,7 @@ impl KeyProgress {
     }
 }
 
-fn order_violations(evidence: &Evidence) -> Vec<OrderViolation> {
+fn order_violations(evidence: &Evidence, written: &Written<'_>) -> Vec<OrderViolation> {
     let mut keys: HashMap<i32, KeyProgress> = HashMap::new();
     for change in &evidence.committed {
         keys.entry(change.key)
@@ -133,7 +161,7 @@ fn order_violations(evidence: &Evidence) -> Vec<OrderViolation> {
     let mut violations = Vec::new();
     for observed in &evidence.observed {
         match *observed {
-            Observed::Delivered(delivery) => {
+            Observed::Delivered(delivery) if written.matches(delivery.seq, delivery.key) => {
                 let progress = keys.entry(delivery.key).or_default();
                 if delivered.insert(delivery.seq)
                     && let Some(earlier) = progress
@@ -148,8 +176,9 @@ fn order_violations(evidence: &Evidence) -> Vec<OrderViolation> {
                 }
                 progress.cleared.insert(delivery.seq);
             }
+            Observed::Delivered(_) => {}
             Observed::DiscardMarker { token, key, seq } => {
-                if evidence.discards.contains(&token) {
+                if written.counts_marker(token, key, seq) {
                     keys.entry(key).or_default().cleared.insert(seq);
                 }
             }
@@ -347,6 +376,44 @@ mod tests {
         });
         assert_eq!(phantom.phantoms, vec![7]);
         assert!(!phantom.passed());
+    }
+
+    #[test]
+    fn a_delivery_under_the_wrong_key_counts_for_nothing() {
+        let committed = [(1, 1), (2, 1)];
+        let swapped = check(&evidence(
+            &committed,
+            vec![delivered(2, 2), delivered(1, 2)],
+        ));
+        assert_eq!(swapped.phantoms, vec![1, 2]);
+        assert_eq!(swapped.missing, vec![1, 2]);
+        assert_eq!(swapped.delivered, 0);
+        assert!(!swapped.passed());
+
+        let one_misrouted = check(&evidence(
+            &committed,
+            vec![delivered(2, 2), delivered(1, 1)],
+        ));
+        assert_eq!(one_misrouted.phantoms, vec![2]);
+        assert_eq!(one_misrouted.missing, vec![2]);
+        assert!(!one_misrouted.passed());
+
+        let uncertain_elsewhere = check(&Evidence {
+            uncertain: vec![change(3, 1)],
+            ..evidence(
+                &committed,
+                vec![delivered(1, 1), delivered(2, 1), delivered(3, 4)],
+            )
+        });
+        assert_eq!(uncertain_elsewhere.phantoms, vec![3]);
+
+        let misplaced_marker = check(&Evidence {
+            discards: BTreeSet::from([8]),
+            ..evidence(&committed, vec![marker(8, 1, 3), delivered(2, 1)])
+        });
+        assert_eq!(misplaced_marker.missing, vec![1]);
+        assert_eq!(misplaced_marker.out_of_order, vec![violation(1, 2, 1)]);
+        assert_eq!(misplaced_marker.discarded, 0);
     }
 
     #[test]
