@@ -127,6 +127,8 @@ async fn heads_load_across_listing_pages() -> TestResult {
 struct Requests {
     listings: AtomicUsize,
     gets: AtomicUsize,
+    deletes: AtomicUsize,
+    batch_deletes: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -144,14 +146,14 @@ impl Intercept for CountRequests {
         _cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         let request = context.request();
-        if request.method() == "GET" {
-            let counter = if request.uri().contains("list-type=2") {
-                &self.0.listings
-            } else {
-                &self.0.gets
-            };
-            counter.fetch_add(1, Ordering::SeqCst);
-        }
+        let counter = match request.method() {
+            "GET" if request.uri().contains("list-type=2") => &self.0.listings,
+            "GET" => &self.0.gets,
+            "DELETE" => &self.0.deletes,
+            "POST" if request.uri().contains("delete") => &self.0.batch_deletes,
+            _ => return Ok(()),
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -216,6 +218,56 @@ async fn listing_queues_costs_one_page_per_queue_whatever_the_backlog() -> TestR
         }
     );
     assert_eq!(requests.gets.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+fn counting(s3: &aws_sdk_s3::Client, requests: &Arc<Requests>) -> aws_sdk_s3::Client {
+    aws_sdk_s3::Client::from_conf(
+        s3.config()
+            .to_builder()
+            .interceptor(CountRequests(Arc::clone(requests)))
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn removal_deletes_up_to_a_thousand_objects_per_request() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let seeding = S3StateStore::new(s3.clone(), BUCKET.to_owned(), "", "orders", 64);
+    let keys: Vec<OrderKeyId> = (1..=5).map(|n| key(0x42, n)).collect::<TestResult<_>>()?;
+    let events: Vec<ParkedEvent> = keys
+        .iter()
+        .cycle()
+        .zip(0..2500)
+        .map(|(queue, n)| event(*queue, id(7, n), ParkStatus::Retrying))
+        .collect();
+    seeding.append_parked(&events).await?;
+    let removals: Vec<(OrderKeyId, EventId)> = events
+        .iter()
+        .map(|event| (event.order_key, event.id))
+        .collect();
+
+    let requests = Arc::new(Requests::default());
+    let store = S3StateStore::new(
+        counting(&s3, &requests),
+        BUCKET.to_owned(),
+        "",
+        "orders",
+        64,
+    );
+    store.remove_parked(&removals).await?;
+    assert_eq!(requests.batch_deletes.load(Ordering::SeqCst), 3);
+    assert_eq!(requests.deletes.load(Ordering::SeqCst), 0);
+    let left = s3
+        .list_objects_v2()
+        .bucket(BUCKET)
+        .prefix("orders/parked/")
+        .send()
+        .await?;
+    assert_eq!(left.key_count(), Some(0));
+
+    store.remove_parked(&removals[..10]).await?;
+    assert_eq!(requests.batch_deletes.load(Ordering::SeqCst), 4);
     Ok(())
 }
 
@@ -365,10 +417,15 @@ async fn a_missing_bucket_reports_the_store_unavailable() -> TestResult {
     Ok(())
 }
 
+const DELETED: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: 77\r\n\r\n<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></DeleteResult>";
+const DELETE_FAILED: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: 177\r\n\r\n<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Error><Key>orders/parked/x.json</Key><Code>InternalError</Code><Message>try again</Message></Error></DeleteResult>";
+
 #[derive(Debug, Default)]
 struct FakeS3 {
     failing: Option<String>,
     stall: Option<String>,
+    failing_deletes: AtomicUsize,
+    batch_deletes: AtomicUsize,
     active: AtomicUsize,
     peak: AtomicUsize,
     per_key: Mutex<HashMap<String, (usize, usize)>>,
@@ -430,6 +487,16 @@ impl FakeS3 {
         let queue = self.enter(path);
         tokio::time::sleep(Duration::from_millis(20)).await;
         self.leave(queue);
+        if method == "POST" {
+            self.batch_deletes.fetch_add(1, Ordering::SeqCst);
+            let failing = self
+                .failing_deletes
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            return if failing { DELETE_FAILED } else { DELETED };
+        }
         if method == "DELETE" {
             return "HTTP/1.1 204 No Content\r\n\r\n";
         }
@@ -551,6 +618,24 @@ async fn s3_requests_never_exceed_max_concurrency() -> TestResult {
     let peak = fake.peak.load(Ordering::SeqCst);
     assert!(peak <= 4, "{peak} requests were in flight at once");
     assert!(peak >= 2, "the fan-out never ran in parallel");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_per_object_delete_error_fails_the_removal_until_a_retry_succeeds() -> TestResult {
+    let fake = Arc::new(FakeS3 {
+        failing_deletes: AtomicUsize::new(1),
+        ..FakeS3::default()
+    });
+    let store = fake_store(&fake, 4).await?;
+    let removals = [(key(0x05, 1)?, id(1, 0)), (key(0x05, 2)?, id(1, 1))];
+    let failed = store.remove_parked(&removals).await;
+    assert!(
+        matches!(&failed, Err(StoreError::Unavailable(message)) if message.contains("InternalError")),
+        "{failed:?}"
+    );
+    store.remove_parked(&removals).await?;
+    assert_eq!(fake.batch_deletes.load(Ordering::SeqCst), 2);
     Ok(())
 }
 

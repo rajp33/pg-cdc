@@ -8,6 +8,7 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 
@@ -24,6 +25,8 @@ pub const S3_MAX_ATTEMPTS: u32 = 3;
 pub const S3_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const S3_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const S3_LIST_PAGE: i32 = 1000;
+// S3 DeleteObjects accepts at most 1,000 keys per request.
+pub const S3_DELETE_BATCH: usize = 1000;
 const JSON: &str = "application/json";
 
 pub async fn s3_client(region: Option<String>) -> Client {
@@ -172,18 +175,34 @@ impl S3StateStore {
         Ok(Some((bytes, etag)))
     }
 
-    async fn delete(&self, object: String) -> Result<(), StoreError> {
+    async fn delete_batch(&self, objects: Vec<String>) -> Result<(), StoreError> {
+        let identifiers = objects
+            .into_iter()
+            .map(|object| ObjectIdentifier::builder().key(object).build())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+        let delete = Delete::builder()
+            .set_objects(Some(identifiers))
+            .quiet(true)
+            .build()
+            .map_err(|error| StoreError::Unavailable(error.to_string()))?;
         let _permit = self.permit().await?;
-        match self
+        let output = self
             .client
-            .delete_object()
+            .delete_objects()
             .bucket(&self.bucket)
-            .key(&object)
+            .delete(delete)
             .send()
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) => Err(unavailable(&error)),
+            .map_err(|error| unavailable(&error))?;
+        match output.errors().first() {
+            None => Ok(()),
+            Some(error) => Err(StoreError::Unavailable(format!(
+                "cannot delete {}: {} {}",
+                error.key().unwrap_or_default(),
+                error.code().unwrap_or_default(),
+                error.message().unwrap_or_default(),
+            ))),
         }
     }
 
@@ -466,9 +485,10 @@ impl StateStore for S3StateStore {
 
     async fn remove_parked(&self, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError> {
         let mut tasks = JoinSet::new();
-        for (key, id) in events {
-            let (store, object) = (self.clone(), self.object(key, id));
-            tasks.spawn(async move { store.delete(object).await });
+        for batch in events.chunks(S3_DELETE_BATCH) {
+            let store = self.clone();
+            let objects = batch.iter().map(|(key, id)| self.object(key, id)).collect();
+            tasks.spawn(async move { store.delete_batch(objects).await });
         }
         Self::join(tasks).await.map(drop)
     }

@@ -500,6 +500,7 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 - **`load_parked_heads(p)`** lists the `parked/<pp>` prefix, where `pp` is the partition as two hex digits. The first object under each key is its head.
 - **`list_parked_queues`** lists the `parked/` prefix with delimiter `/` and `StartAfter` past `after`'s objects, so each key is one common prefix, then lists each returned key's prefix up to `length_cap` objects (one page when `length_cap` is at most 1,000), under the store's concurrency bound.
 - **`read_parked`** lists with `StartAfter`, then fetches each object.
+- **`remove_parked`** sends `DeleteObjects` in quiet mode, at most 1,000 objects per request, the requests in parallel under the concurrency bound. A missing object counts as deleted, as item 5 requires; any per-object error in the reply fails the whole call, and the lane retries it with backoff without sending the events again.
 - **A status change** rewrites the object; only the owning lane writes it.
 - **The leader record** lives at `<prefix>/<pipeline>/leader.json`. It is changed with `If-Match: <etag>` and created with `If-None-Match: *`.
 - **Throttling.** `503 SlowDown` and other 5xx responses are retried with backoff.
