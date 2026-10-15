@@ -19,6 +19,7 @@ use crate::support::{self, TestResult, WAIT};
 const FAST: Duration = Duration::from_millis(200);
 const BUFFER: usize = 1 << 16;
 const BETWEEN_TRANSACTIONS: Duration = Duration::from_secs(3);
+const BACKLOG: Duration = Duration::from_secs(3);
 const JSON_OID: u32 = 114;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,8 +162,12 @@ async fn a_session_records_what_it_receives_its_commit_latency_fallbacks_and_its
         &["orders"],
     )
     .await?;
+    pg.execute(r#"INSERT INTO orders VALUES (0, '{"a": 0}')"#)
+        .await?;
+    tokio::time::sleep(BACKLOG).await;
     let mut session = support::spawn_session(support::params(&pg), FAST, BUFFER);
     delivering(&session).await?;
+    session.skip_events(1).await?;
     pg.execute(r#"INSERT INTO orders VALUES (1, '{"a": 1}'), (2, '{"a": 2}')"#)
         .await?;
     session.skip_events(2).await?;
@@ -180,7 +185,7 @@ async fn a_session_records_what_it_receives_its_commit_latency_fallbacks_and_its
     for outcome in [EventOutcome::Received, EventOutcome::Delivered] {
         assert_eq!(
             count(&seen, &event("orders", "insert", outcome)),
-            3,
+            4,
             "{seen:?}"
         );
         assert_eq!(
@@ -196,11 +201,13 @@ async fn a_session_records_what_it_receives_its_commit_latency_fallbacks_and_its
             _ => None,
         })
         .collect();
-    assert_eq!(latencies.len(), 4, "{seen:?}");
+    let Some((backlogged, fresh)) = latencies.split_first() else {
+        panic!("no commit latency recorded: {seen:?}");
+    };
+    assert!(*backlogged >= BACKLOG, "{latencies:?}");
+    assert_eq!(fresh.len(), 4, "{seen:?}");
     assert!(
-        latencies
-            .iter()
-            .all(|elapsed| *elapsed < BETWEEN_TRANSACTIONS),
+        fresh.iter().all(|elapsed| *elapsed < BACKLOG),
         "{latencies:?}"
     );
     let fallbacks: Vec<&Seen> = seen
@@ -219,12 +226,12 @@ async fn a_session_records_what_it_receives_its_commit_latency_fallbacks_and_its
         .filter(|span| span.name == "transaction")
         .cloned()
         .collect();
-    assert_eq!(transactions.len(), 3, "{transactions:?}");
+    assert_eq!(transactions.len(), 4, "{transactions:?}");
     let counted: Vec<&str> = transactions
         .iter()
         .map(|span| span.fields.get("events").map_or("", String::as_str))
         .collect();
-    assert_eq!(counted, vec!["2", "1", "1"]);
+    assert_eq!(counted, vec!["1", "2", "1", "1"]);
     for span in &transactions {
         assert_eq!(span.level, Level::DEBUG);
         assert!(span.fields.contains_key("commit_lsn"), "{span:?}");
