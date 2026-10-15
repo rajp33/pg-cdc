@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pg_cdc_testkit::{AwsEmulator, CREATED_LABEL, Postgres, REAP_AGE, reap};
+use pg_cdc_testkit::{AwsEmulator, CREATED_LABEL, Postgres, REAP_AGE, lock_reaper, reap};
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -29,6 +29,7 @@ async fn listed(id: &str) -> Result<String, std::io::Error> {
 
 #[tokio::test]
 async fn reaping_removes_only_stale_labeled_containers() -> TestResult {
+    let _reaper = lock_reaper().await?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let old = sleeper(now - 7_200).await?;
     let young = sleeper(now).await?;

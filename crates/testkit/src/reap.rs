@@ -59,8 +59,15 @@ pub(crate) fn created_label() -> (String, String) {
 }
 
 #[derive(Debug)]
-pub(crate) struct StampClaim {
+pub struct ReaperLock {
     _stamp: File,
+}
+
+pub async fn lock_reaper() -> Result<ReaperLock, TestkitError> {
+    let stamp = stamp_path();
+    tokio::task::spawn_blocking(move || lock_stamp(&stamp))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 pub(crate) async fn reap_once() {
@@ -77,7 +84,7 @@ fn stamp_path() -> PathBuf {
     std::env::temp_dir().join(STAMP_FILE)
 }
 
-async fn claim_stamp(stamp: &Path, now: SystemTime) -> Option<StampClaim> {
+async fn claim_stamp(stamp: &Path, now: SystemTime) -> Option<ReaperLock> {
     let stamp = stamp.to_path_buf();
     tokio::task::spawn_blocking(move || claim_stamp_blocking(&stamp, now))
         .await
@@ -85,7 +92,7 @@ async fn claim_stamp(stamp: &Path, now: SystemTime) -> Option<StampClaim> {
         .flatten()
 }
 
-fn claim_stamp_blocking(stamp: &Path, now: SystemTime) -> Option<StampClaim> {
+fn claim_stamp_blocking(stamp: &Path, now: SystemTime) -> Option<ReaperLock> {
     let mut file = open_stamp(stamp).ok()?;
     file.try_lock().ok()?;
     let metadata = file.metadata().ok()?;
@@ -101,7 +108,13 @@ fn claim_stamp_blocking(stamp: &Path, now: SystemTime) -> Option<StampClaim> {
     file.write_all(unix_seconds(now).to_string().as_bytes())
         .ok()?;
     file.set_modified(now).ok()?;
-    Some(StampClaim { _stamp: file })
+    Some(ReaperLock { _stamp: file })
+}
+
+fn lock_stamp(stamp: &Path) -> Result<ReaperLock, TestkitError> {
+    let file = open_stamp(stamp)?;
+    file.lock()?;
+    Ok(ReaperLock { _stamp: file })
 }
 
 fn open_stamp(stamp: &Path) -> std::io::Result<File> {
@@ -237,6 +250,16 @@ mod tests {
         assert!(claim_stamp(&stamp, now).await.is_some());
         let later = now + STAMP_INTERVAL + Duration::from_secs(1);
         assert_eq!(concurrent_claims(&stamp, later).await, 1);
+    }
+
+    #[test]
+    fn a_held_reaper_lock_refuses_every_claim_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("reap");
+        let lock = lock_stamp(&stamp).unwrap();
+        assert!(claim_stamp_blocking(&stamp, SystemTime::now()).is_none());
+        drop(lock);
+        assert!(claim_stamp_blocking(&stamp, SystemTime::now()).is_some());
     }
 
     #[tokio::test]

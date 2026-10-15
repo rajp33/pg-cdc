@@ -12,4 +12,4 @@ pub use postgres::{
     DEFAULT_PG_VERSION, PG_VERSION_ENV, Postgres, PostgresOptions, SESSION_OPTIONS, SlotState,
     WalLevel, parse_lsn, parse_pg_version,
 };
-pub use reap::{CREATED_LABEL, REAP_AGE, reap, stale_containers};
+pub use reap::{CREATED_LABEL, REAP_AGE, ReaperLock, lock_reaper, reap, stale_containers};
