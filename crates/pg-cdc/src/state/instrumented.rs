@@ -6,8 +6,8 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use super::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError, SwapOutcome,
-    Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore, StoreError,
+    SwapOutcome, Version, Versioned,
 };
 use crate::event::EventId;
 use crate::lane::Stores;
@@ -92,7 +92,7 @@ impl StateStore for InstrumentedStateStore {
         after: Option<&OrderKeyId>,
         limit: usize,
         length_cap: usize,
-    ) -> Result<Vec<ParkedHead>, StoreError> {
+    ) -> Result<ParkedQueues, StoreError> {
         timed(
             StoreOperation::ListParkedQueues,
             1,
@@ -230,7 +230,7 @@ mod tests {
             after: Option<&OrderKeyId>,
             limit: usize,
             length_cap: usize,
-        ) -> Result<Vec<ParkedHead>, StoreError> {
+        ) -> Result<ParkedQueues, StoreError> {
             self.call(self.inner.list_parked_queues(after, limit, length_cap))
                 .await
         }
