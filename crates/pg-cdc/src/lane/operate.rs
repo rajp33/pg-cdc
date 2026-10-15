@@ -95,11 +95,13 @@ impl Lane {
         if !self.is_loaded(key) {
             return Err(OperateError::Loading(key));
         }
-        self.keys
+        let stored = self
+            .keys
             .get(&key)
             .and_then(|state| state.stored.as_ref())
-            .and_then(|stored| stored.floor.map(|head| (head, stored)))
-            .ok_or(OperateError::NotParked(key))
+            .ok_or(OperateError::NotParked(key))?;
+        let head = stored.current.ok_or(OperateError::Loading(key))?;
+        Ok((head, stored))
     }
 
     async fn redrive(&mut self, key: OrderKeyId) -> Result<EventId, OperateError> {
@@ -160,6 +162,7 @@ impl Lane {
                     self.heads_in_memory = self.heads_in_memory.saturating_sub(1);
                 }
                 stored.floor = Some(id);
+                stored.current = None;
                 stored.since_ms = None;
             }
         }

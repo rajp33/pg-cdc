@@ -67,6 +67,7 @@ impl Lane {
             .map_or_else(now_ms, |failure| failure.since_ms);
         state.stored = Some(Stored {
             floor,
+            current: floor,
             dead_on_append: dead,
             since_ms: Some(since_ms),
             ..Stored::default()

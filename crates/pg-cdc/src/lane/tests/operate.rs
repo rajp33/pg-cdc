@@ -182,6 +182,71 @@ async fn discard_removes_the_head_only_if_it_still_has_that_id() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn concurrent_discards_of_one_head_remove_it_once() {
+    let harness = dead_head_behind(2, TestStore::default()).await;
+    assert_eq!(harness.gauges().events, 2);
+    let operator = harness.operator();
+    let (first, second) = tokio::join!(operator.discard(k(), id(0)), operator.discard(k(), id(0)));
+    assert_eq!(first, Ok(id(0)));
+    assert_eq!(second, Err(OperateError::Loading(k())));
+    assert_eq!(harness.gauges().events, 1);
+    assert_eq!(harness.delivered(1).await, vec![1]);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(harness.store.queue(b"k").await, vec![]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn operations_are_refused_until_the_head_after_a_discard_is_read() {
+    let harness = dead_head_behind(2, TestStore::default()).await;
+    harness.store.fail_reads.store(u32::MAX, Ordering::SeqCst);
+    let operator = harness.operator();
+    assert_eq!(operator.discard(k(), id(0)).await, Ok(id(0)));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        operator.discard(k(), id(0)).await,
+        Err(OperateError::Loading(k()))
+    );
+    assert_eq!(operator.redrive(k()).await, Err(OperateError::Loading(k())));
+    assert_eq!(harness.gauges().events, 1);
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(1, ParkStatus::Retrying)]
+    );
+
+    harness.store.fail_reads.store(0, Ordering::SeqCst);
+    assert_eq!(harness.delivered(1).await, vec![1]);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(harness.store.queue(b"k").await, vec![]);
+    assert_eq!(harness.gauges().events, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_discard_of_a_head_already_delivered_and_removed_is_refused() {
+    let mut sink = ScriptedSink::delivering();
+    sink.latency = Duration::from_millis(100);
+    let store = TestStore::default();
+    store.seed(b"k", 0, ParkStatus::Retrying).await;
+    store.seed(b"k", 1, ParkStatus::Retrying).await;
+    let harness = Harness::start(Setup::default(), sink, store).await;
+    harness.store.fail_reads.store(u32::MAX, Ordering::SeqCst);
+    assert_eq!(harness.delivered(1).await, vec![0]);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(1, ParkStatus::Retrying)]
+    );
+    assert_eq!(harness.gauges().events, 1);
+
+    assert_eq!(
+        harness.operator().discard(k(), id(0)).await,
+        Err(OperateError::Loading(k()))
+    );
+    assert_eq!(harness.gauges().events, 1);
+    harness.store.fail_reads.store(0, Ordering::SeqCst);
+    assert_eq!(harness.delivered(2).await, vec![0, 1]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn discarding_a_retrying_head_in_memory_drops_it_and_sends_the_next() {
     let until = Instant::now() + Duration::from_secs(60);
     let script: Script = Box::new(move |ordinal, _| {

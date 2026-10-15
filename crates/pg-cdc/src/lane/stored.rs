@@ -22,6 +22,7 @@ impl Lane {
         let state = self.keys.entry(key).or_insert_with(Key::new);
         state.stored = Some(Stored {
             floor: Some(head.head),
+            current: Some(head.head),
             ..Stored::default()
         });
         self.stats_dirty = true;
@@ -280,6 +281,7 @@ impl Lane {
             return;
         };
         stored.floor = Some(head.id);
+        stored.current = Some(head.id);
         stored.since_ms = Some(head.first_failure_ms);
         if head.status == ParkStatus::Dead {
             stored.dead = true;
@@ -356,6 +358,7 @@ impl Lane {
                 .and_then(|state| state.stored.as_mut())
             {
                 stored.floor = Some(id);
+                stored.current = None;
                 stored.since_ms = None;
                 self.stats_dirty = true;
                 self.to_load.push_back(key);

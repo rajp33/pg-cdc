@@ -239,6 +239,7 @@ struct Failure {
 #[derive(Debug, Default)]
 struct Stored {
     floor: Option<EventId>,
+    current: Option<EventId>,
     head: Option<Outbound>,
     dead: bool,
     dead_on_append: bool,
