@@ -14,5 +14,6 @@ pub mod payload;
 pub mod session;
 pub mod sink;
 pub mod state;
+pub mod status;
 pub mod supervisor;
 pub mod validate;
