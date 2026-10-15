@@ -61,11 +61,17 @@ impl Lane {
         }
         let floor = state.queue.front().map(|pending| pending.outbound.id);
         state.offloaded = None;
+        let since_ms = state
+            .failure
+            .as_ref()
+            .map_or_else(now_ms, |failure| failure.since_ms);
         state.stored = Some(Stored {
             floor,
             dead_on_append: dead,
+            since_ms: Some(since_ms),
             ..Stored::default()
         });
+        self.stats_dirty = true;
         tracing::warn!(order_key = %key, id = ?floor, dead, "parking an order key's events");
         self.to_append.insert(key);
         if !dead && !self.closing {

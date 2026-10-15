@@ -1,3 +1,4 @@
+mod gauges;
 mod model;
 mod offload;
 mod park;
@@ -10,6 +11,7 @@ use crate::state::memory::MemoryStateStore;
 use crate::state::{
     LeaderRecord, ParkStatus, ParkedEvent, StoreError, SwapOutcome, Version, Versioned,
 };
+use crate::status::ParkedSnapshot;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pg_cdc_decoder::Lsn;
@@ -419,6 +421,10 @@ impl Harness {
             sink,
             store,
         }
+    }
+
+    fn gauges(&self) -> ParkedSnapshot {
+        self.lanes.gauges().snapshot()
     }
 
     async fn delivered(&self, count: usize) -> Vec<u32> {

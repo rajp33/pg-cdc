@@ -24,6 +24,7 @@ impl Lane {
             floor: Some(head.head),
             ..Stored::default()
         });
+        self.stats_dirty = true;
         let queued = std::mem::take(&mut state.queue);
         for pending in queued {
             let id = pending.outbound.id;
@@ -207,6 +208,7 @@ impl Lane {
             {
                 stored.dead_on_append = false;
                 stored.dead = true;
+                self.stats_dirty = true;
                 tracing::error!(order_key = %key, id = ?stored.floor, "a dead event is parked and blocks its order key");
             }
         }
@@ -264,6 +266,7 @@ impl Lane {
         let Some(stored) = state.stored.as_mut() else {
             return;
         };
+        self.stats_dirty = true;
         let Some(head) = head else {
             state.stored = None;
             state.backoff.reset();
@@ -277,6 +280,7 @@ impl Lane {
             return;
         };
         stored.floor = Some(head.id);
+        stored.since_ms = Some(head.first_failure_ms);
         if head.status == ParkStatus::Dead {
             stored.dead = true;
             tracing::error!(
@@ -352,6 +356,8 @@ impl Lane {
                 .and_then(|state| state.stored.as_mut())
             {
                 stored.floor = Some(id);
+                stored.since_ms = None;
+                self.stats_dirty = true;
                 self.to_load.push_back(key);
             }
         }
@@ -374,6 +380,7 @@ impl Lane {
                 .and_then(|state| state.stored.as_mut())
             {
                 stored.dead = true;
+                self.stats_dirty = true;
             }
         }
         self.store_succeeded();

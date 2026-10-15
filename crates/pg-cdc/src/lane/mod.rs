@@ -23,6 +23,7 @@ use crate::order::OrderKeyId;
 use crate::payload::PayloadStore;
 use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 use crate::state::{PARTITIONS, ParkedHead, StateStore};
+use crate::status::{LaneCounts, ParkedGauges, STATS_INTERVAL};
 use crate::supervisor::Backoff;
 
 pub const LINGER: Duration = Duration::from_millis(5);
@@ -83,6 +84,7 @@ pub struct Lanes {
     inboxes: Vec<mpsc::UnboundedSender<Inbound>>,
     running: JoinSet<()>,
     loader: JoinSet<()>,
+    gauges: Arc<ParkedGauges>,
 }
 
 impl Lanes {
@@ -95,6 +97,7 @@ impl Lanes {
     ) -> Self {
         let capabilities = sink.capabilities();
         let parked = Arc::new(AtomicU64::new(0));
+        let gauges = ParkedGauges::new(settings.lanes.max(1), Arc::clone(&parked));
         let mut running = JoinSet::new();
         let inboxes: Vec<_> = (0..settings.lanes.max(1))
             .map(|index| {
@@ -126,6 +129,9 @@ impl Lanes {
                     park_after: settings.park_after,
                     max_parked: settings.max_parked_events,
                     parked: Arc::clone(&parked),
+                    gauges: Arc::clone(&gauges),
+                    stats_dirty: false,
+                    stats_due: None,
                     closing: false,
                 };
                 running.spawn(lane.run());
@@ -143,7 +149,12 @@ impl Lanes {
             inboxes,
             running,
             loader,
+            gauges,
         }
+    }
+
+    pub fn gauges(&self) -> Arc<ParkedGauges> {
+        Arc::clone(&self.gauges)
     }
 
     pub fn dispatch(&self, pending: Pending) -> Result<(), LaneStopped> {
@@ -165,6 +176,7 @@ impl Lanes {
             inboxes,
             mut running,
             mut loader,
+            gauges: _,
         } = self;
         loader.shutdown().await;
         drop(inboxes);
@@ -215,6 +227,7 @@ struct Stored {
     head: Option<Outbound>,
     dead: bool,
     dead_on_append: bool,
+    since_ms: Option<u64>,
 }
 
 struct Lane {
@@ -244,6 +257,9 @@ struct Lane {
     park_after: Duration,
     max_parked: u64,
     parked: Arc<AtomicU64>,
+    gauges: Arc<ParkedGauges>,
+    stats_dirty: bool,
+    stats_due: Option<Instant>,
     closing: bool,
 }
 
@@ -256,13 +272,18 @@ impl Lane {
                 }
             }
             let now = Instant::now();
+            self.publish_stats(now);
             self.promote_due_retries(now);
             let stored = self.store_work(now).await;
             if self.closing {
                 if stored {
                     continue;
                 }
-                if !self.wait(self.store_wake()).await {
+                let until = [self.store_wake(), self.stats_wake()]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                if !self.wait(until).await {
                     return;
                 }
                 continue;
@@ -283,7 +304,7 @@ impl Lane {
                 continue;
             }
             let next_retry = self.retries.peek().map(|Reverse((due, _))| *due);
-            let until = [linger, next_retry, self.store_wake()]
+            let until = [linger, next_retry, self.store_wake(), self.stats_wake()]
                 .into_iter()
                 .flatten()
                 .min();
@@ -291,6 +312,30 @@ impl Lane {
                 return;
             }
         }
+    }
+
+    fn publish_stats(&mut self, now: Instant) {
+        if !self.stats_dirty || self.stats_due.is_some_and(|due| due > now) {
+            return;
+        }
+        let mut counts = LaneCounts::default();
+        for stored in self.keys.values().filter_map(|state| state.stored.as_ref()) {
+            counts.keys += 1;
+            if stored.dead {
+                counts.dead += 1;
+            }
+            counts.oldest_ms = match (counts.oldest_ms, stored.since_ms) {
+                (Some(known), Some(since)) => Some(known.min(since)),
+                (known, since) => known.or(since),
+            };
+        }
+        self.gauges.publish(self.index, counts);
+        self.stats_dirty = false;
+        self.stats_due = Some(now + STATS_INTERVAL);
+    }
+
+    fn stats_wake(&self) -> Option<Instant> {
+        self.stats_dirty.then_some(self.stats_due).flatten()
     }
 
     fn accept(&mut self, inbound: Inbound) -> bool {
