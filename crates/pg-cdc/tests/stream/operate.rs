@@ -90,7 +90,10 @@ async fn session_publishes_while_active(
     })
     .await?;
     assert_eq!(waiting.epoch, None);
+    assert_eq!(waiting.confirmed_lsn, None);
+    assert_eq!((waiting.inflight_events, waiting.inflight_bytes), (0, 0));
     assert_eq!(waiting.parked, None);
+    assert_eq!(waiting.status_update_age, None);
     assert!(standby.parked_access().is_none());
     Ok(())
 }
@@ -137,9 +140,31 @@ async fn operator_redrives_the_poisoned_head(
     Ok(())
 }
 
-async fn draining_withdraws_access(pg: &Postgres, a: &mut Running) -> TestResult {
+async fn inflight_counts_follow_a_held_event(pg: &Postgres, a: &mut Running) -> TestResult {
     a.set_mode(Mode::Hold);
     pg.execute("INSERT INTO orders VALUES (3, 'held')").await?;
+    a.wait_for_next_sink_call().await?;
+    let held = wait_for_status(&a.status(), PUBLISH_WITHIN, |snapshot| {
+        snapshot.inflight_events > 0
+    })
+    .await?;
+    assert_eq!(held.inflight_events, 1, "{held:?}");
+    assert!(held.inflight_bytes > 0, "{held:?}");
+
+    a.set_mode(Mode::Deliver);
+    assert_eq!(field(&a.next_event().await?, "/after/id"), 3);
+    let settled = wait_for_status(&a.status(), PUBLISH_WITHIN, |snapshot| {
+        snapshot.inflight_events == 0
+    })
+    .await?;
+    assert_eq!((settled.epoch, settled.inflight_bytes), (Some(1), 0));
+    Ok(())
+}
+
+async fn draining_withdraws_access(pg: &Postgres, a: &mut Running) -> TestResult {
+    a.set_mode(Mode::Hold);
+    pg.execute("INSERT INTO orders VALUES (4, 'draining')")
+        .await?;
     a.wait_for_next_sink_call().await?;
     a.request_stop();
     draining(&a.health()).await?;
@@ -202,14 +227,22 @@ async fn an_active_session_publishes_its_status_and_operator_and_a_standby_publi
 
     session_publishes_while_active(&a.status(), &b.status(), row_two_commit).await?;
     operator_redrives_the_poisoned_head(&mut a, &stores, row_two_id).await?;
+    inflight_counts_follow_a_held_event(&pg, &mut a).await?;
     draining_withdraws_access(&pg, &mut a).await?;
     let ended = a.status();
     a.finished(WAIT).await??;
     let snapshot = ended.snapshot();
-    assert_eq!((snapshot.epoch, snapshot.parked), (None, None));
+    assert_eq!(
+        snapshot,
+        StatusSnapshot {
+            tables_without_full_identity: snapshot.tables_without_full_identity,
+            ..StatusSnapshot::default()
+        }
+    );
+    assert!(ended.parked_access().is_none());
 
-    pg.execute("INSERT INTO orders VALUES (4, 'after')").await?;
-    while field(&b.next_event().await?, "/after/id") != 4 {}
+    pg.execute("INSERT INTO orders VALUES (5, 'after')").await?;
+    while field(&b.next_event().await?, "/after/id") != 5 {}
     let takeover = wait_for_status(&b.status(), PUBLISH_WITHIN, |snapshot| {
         snapshot.epoch == Some(2)
     })
