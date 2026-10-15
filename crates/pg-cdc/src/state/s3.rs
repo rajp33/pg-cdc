@@ -12,9 +12,9 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 
 use super::{
-    LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEvent, ParkedHead, StateStore,
-    StoreError, SwapOutcome, Version, Versioned, decode_leader, decode_parked, encode_parked,
-    parse_parked_name, store_root,
+    LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues,
+    StateStore, StoreError, SwapOutcome, Version, Versioned, decode_leader, decode_parked,
+    encode_parked, parse_parked_name, store_root,
 };
 use crate::aws::aws_loader;
 use crate::event::EventId;
@@ -247,7 +247,7 @@ impl S3StateStore {
         &self,
         after: Option<&OrderKeyId>,
         limit: usize,
-    ) -> Result<Vec<OrderKeyId>, StoreError> {
+    ) -> Result<(Vec<OrderKeyId>, bool), StoreError> {
         let prefix = self.parked_prefix();
         let mut start_after = after.map(|after| format!("{prefix}{after}0"));
         let mut token = None;
@@ -269,8 +269,9 @@ impl S3StateStore {
                 None => break,
             }
         }
+        let more = token.is_some() || keys.len() > limit;
         keys.truncate(limit);
-        Ok(keys)
+        Ok((keys, more))
     }
 
     async fn queue_head(
@@ -384,35 +385,21 @@ impl StateStore for S3StateStore {
         after: Option<&OrderKeyId>,
         limit: usize,
         length_cap: usize,
-    ) -> Result<Vec<ParkedHead>, StoreError> {
+    ) -> Result<ParkedQueues, StoreError> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(ParkedQueues::default());
         }
         let length_cap = length_cap.max(1);
-        let mut after = after.copied();
-        let mut queues = Vec::new();
-        while queues.len() < limit {
-            let wanted = limit - queues.len();
-            let keys = self.queue_keys(after.as_ref(), wanted).await?;
-            let Some(last) = keys.last().copied() else {
-                break;
-            };
-            let listed = keys.len();
-            let mut tasks = JoinSet::new();
-            for key in keys {
-                let store = self.clone();
-                tasks.spawn(async move { store.queue_head(key, length_cap).await });
-            }
-            let mut found: Vec<ParkedHead> =
-                Self::join(tasks).await?.into_iter().flatten().collect();
-            found.sort_unstable_by_key(|queue| queue.order_key);
-            queues.extend(found);
-            after = Some(last);
-            if listed < wanted {
-                break;
-            }
+        let (keys, more) = self.queue_keys(after, limit).await?;
+        let next = keys.last().copied().filter(|_| more);
+        let mut tasks = JoinSet::new();
+        for key in keys {
+            let store = self.clone();
+            tasks.spawn(async move { store.queue_head(key, length_cap).await });
         }
-        Ok(queues)
+        let mut queues: Vec<ParkedHead> = Self::join(tasks).await?.into_iter().flatten().collect();
+        queues.sort_unstable_by_key(|queue| queue.order_key);
+        Ok(ParkedQueues { queues, next })
     }
 
     async fn read_parked(

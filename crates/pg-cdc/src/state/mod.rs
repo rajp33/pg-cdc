@@ -58,6 +58,12 @@ pub struct ParkedHead {
     pub length: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParkedQueues {
+    pub queues: Vec<ParkedHead>,
+    pub next: Option<OrderKeyId>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeaderState {
@@ -109,7 +115,7 @@ pub trait StateStore: Send + Sync + fmt::Debug {
         after: Option<&OrderKeyId>,
         limit: usize,
         length_cap: usize,
-    ) -> Result<Vec<ParkedHead>, StoreError>;
+    ) -> Result<ParkedQueues, StoreError>;
     async fn read_parked(
         &self,
         key: &OrderKeyId,

@@ -19,8 +19,8 @@ use pg_cdc::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 use pg_cdc::state::filesystem::FilesystemStateStore;
 use pg_cdc::state::memory::MemoryStateStore;
 use pg_cdc::state::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError, SwapOutcome,
-    Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore, StoreError,
+    SwapOutcome, Version, Versioned,
 };
 use pg_cdc::status::Status;
 use pg_cdc_testkit::Postgres;
@@ -162,7 +162,7 @@ impl StateStore for UnparkableStore {
         after: Option<&OrderKeyId>,
         limit: usize,
         length_cap: usize,
-    ) -> Result<Vec<ParkedHead>, StoreError> {
+    ) -> Result<ParkedQueues, StoreError> {
         self.0.list_parked_queues(after, limit, length_cap).await
     }
 
@@ -315,7 +315,7 @@ impl StateStore for RecordingStore {
         after: Option<&OrderKeyId>,
         limit: usize,
         length_cap: usize,
-    ) -> Result<Vec<ParkedHead>, StoreError> {
+    ) -> Result<ParkedQueues, StoreError> {
         self.record("list_parked_queues");
         self.inner
             .list_parked_queues(after, limit, length_cap)

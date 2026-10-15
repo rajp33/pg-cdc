@@ -11,7 +11,8 @@ use crate::ack::AckTracker;
 use crate::payload::PayloadRef;
 use crate::state::memory::MemoryStateStore;
 use crate::state::{
-    LeaderRecord, ParkStatus, ParkedEvent, StoreError, SwapOutcome, Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedQueues, StoreError, SwapOutcome, Version,
+    Versioned,
 };
 use crate::status::ParkedSnapshot;
 use async_trait::async_trait;
@@ -262,7 +263,7 @@ impl StateStore for TestStore {
         after: Option<&OrderKeyId>,
         limit: usize,
         length_cap: usize,
-    ) -> Result<Vec<ParkedHead>, StoreError> {
+    ) -> Result<ParkedQueues, StoreError> {
         self.inner
             .list_parked_queues(after, limit, length_cap)
             .await

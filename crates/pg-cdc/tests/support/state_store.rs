@@ -6,8 +6,8 @@ use pg_cdc::event::EventId;
 use pg_cdc::order::OrderKeyId;
 use pg_cdc::sink::AttributeValue;
 use pg_cdc::state::{
-    LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError,
-    SwapOutcome, Version, Versioned,
+    LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore,
+    StoreError, SwapOutcome, Version, Versioned,
 };
 use pg_cdc_decoder::Lsn;
 
@@ -91,7 +91,8 @@ async fn empty_calls_succeed(store: &dyn StateStore) -> TestResult {
 async fn queues_list_in_key_order_from_a_cursor_with_capped_lengths(
     store: &dyn StateStore,
 ) -> TestResult {
-    assert_eq!(store.list_parked_queues(None, 10, 10).await?, vec![]);
+    let ended = ParkedQueues::default();
+    assert_eq!(store.list_parked_queues(None, 10, 10).await?, ended);
     let (k1, k2, k3, k4) = (key(0x10, 1)?, key(0x10, 2)?, key(0x11, 1)?, key(0x12, 1)?);
     let mut events = vec![
         event(k1, id(4, 0), ParkStatus::Retrying),
@@ -108,34 +109,38 @@ async fn queues_list_in_key_order_from_a_cursor_with_capped_lengths(
         head,
         length,
     };
+    let page = |queues, next| ParkedQueues { queues, next };
     assert_eq!(
         store.list_parked_queues(None, 2, 10).await?,
-        vec![head(k1, id(2, 1), 3), head(k2, id(1, 0), 10)]
+        page(
+            vec![head(k1, id(2, 1), 3), head(k2, id(1, 0), 10)],
+            Some(k2)
+        )
     );
     assert_eq!(
         store.list_parked_queues(Some(&k2), 10, 10).await?,
-        vec![head(k3, id(7, 0), 1), head(k4, id(5, 0), 2)]
+        page(vec![head(k3, id(7, 0), 1), head(k4, id(5, 0), 2)], None)
+    );
+    assert_eq!(
+        store.list_parked_queues(Some(&k2), 2, 10).await?,
+        page(vec![head(k3, id(7, 0), 1), head(k4, id(5, 0), 2)], None)
     );
     assert_eq!(
         store.list_parked_queues(Some(&k1), 1, 100).await?,
-        vec![head(k2, id(1, 0), 25)]
+        page(vec![head(k2, id(1, 0), 25)], Some(k2))
     );
-    assert_eq!(store.list_parked_queues(Some(&k4), 10, 10).await?, vec![]);
-    assert_eq!(store.list_parked_queues(None, 0, 10).await?, vec![]);
+    assert_eq!(store.list_parked_queues(Some(&k4), 10, 10).await?, ended);
+    assert_eq!(store.list_parked_queues(None, 0, 10).await?, ended);
     store.remove_parked(&[(k3, id(7, 0))]).await?;
-    let listed: Vec<OrderKeyId> = store
-        .list_parked_queues(None, 10, 10)
-        .await?
-        .iter()
-        .map(|queue| queue.order_key)
-        .collect();
-    assert_eq!(listed, vec![k1, k2, k4]);
+    let listed = store.list_parked_queues(None, 10, 10).await?;
+    let keys: Vec<OrderKeyId> = listed.queues.iter().map(|queue| queue.order_key).collect();
+    assert_eq!((keys, listed.next), (vec![k1, k2, k4], None));
     let all: Vec<_> = events
         .iter()
         .map(|event| (event.order_key, event.id))
         .collect();
     store.remove_parked(&all).await?;
-    assert_eq!(store.list_parked_queues(None, 10, 10).await?, vec![]);
+    assert_eq!(store.list_parked_queues(None, 10, 10).await?, ended);
     Ok(())
 }
 

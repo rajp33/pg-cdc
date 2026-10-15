@@ -186,7 +186,8 @@ mod tests {
     use crate::order::OrderKeyId;
     use crate::state::memory::MemoryStateStore;
     use crate::state::{
-        LeaderState, ParkStatus, ParkedEvent, ParkedHead, StoreError, SwapOutcome, Versioned,
+        LeaderState, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StoreError, SwapOutcome,
+        Versioned,
     };
 
     const FENCE: Duration = Duration::from_secs(10);
@@ -268,7 +269,7 @@ mod tests {
             after: Option<&OrderKeyId>,
             limit: usize,
             length_cap: usize,
-        ) -> Result<Vec<ParkedHead>, StoreError> {
+        ) -> Result<ParkedQueues, StoreError> {
             self.inner
                 .list_parked_queues(after, limit, length_cap)
                 .await

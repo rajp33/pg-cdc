@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, oneshot};
 
 use super::{
-    LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEvent, ParkedHead, StateStore,
-    StoreError, SwapOutcome, Version, Versioned, decode_parked, encode_parked,
+    LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues,
+    StateStore, StoreError, SwapOutcome, Version, Versioned, decode_parked, encode_parked,
 };
 use crate::event::EventId;
 use crate::order::OrderKeyId;
@@ -290,11 +290,11 @@ fn list_queues(
     limit: usize,
     length_cap: usize,
     cancelled: Cancelled<'_>,
-) -> Result<Vec<ParkedHead>, StoreError> {
+) -> Result<ParkedQueues, StoreError> {
     let parked = root.join(PARKED_DIR);
     let entries = match fs::read_dir(&parked) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(ParkedQueues::default()),
         Err(error) => return Err(unavailable(&parked, &error)),
     };
     let mut keys = Vec::new();
@@ -312,22 +312,24 @@ fn list_queues(
         }
     }
     keys.sort_unstable();
+    let more = keys.len() > limit;
+    keys.truncate(limit);
     let mut queues = Vec::new();
-    for order_key in keys {
-        if queues.len() >= limit {
-            break;
-        }
+    for order_key in &keys {
         check(cancelled)?;
-        let ids = event_ids(&key_dir(root, &order_key))?;
+        let ids = event_ids(&key_dir(root, order_key))?;
         if let Some(head) = ids.first() {
             queues.push(ParkedHead {
-                order_key,
+                order_key: *order_key,
                 head: *head,
                 length: u64::try_from(ids.len().min(length_cap.max(1))).unwrap_or(u64::MAX),
             });
         }
     }
-    Ok(queues)
+    Ok(ParkedQueues {
+        queues,
+        next: keys.last().copied().filter(|_| more),
+    })
 }
 
 fn read(
@@ -486,9 +488,9 @@ impl StateStore for FilesystemStateStore {
         after: Option<&OrderKeyId>,
         limit: usize,
         length_cap: usize,
-    ) -> Result<Vec<ParkedHead>, StoreError> {
+    ) -> Result<ParkedQueues, StoreError> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(ParkedQueues::default());
         }
         let after = after.copied();
         self.blocking(move |root, cancelled| list_queues(root, after, limit, length_cap, cancelled))

@@ -217,8 +217,8 @@ mod tests {
     use crate::sink::{Outbound, Outcome, SinkCapabilities, SinkError};
     use crate::state::memory::MemoryStateStore;
     use crate::state::{
-        LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, StoreError, SwapOutcome, Version,
-        Versioned,
+        LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StoreError, SwapOutcome,
+        Version, Versioned,
     };
     use crate::validate::Invalid;
     use async_trait::async_trait;
@@ -331,7 +331,7 @@ mod tests {
             after: Option<&OrderKeyId>,
             limit: usize,
             length_cap: usize,
-        ) -> Result<Vec<ParkedHead>, StoreError> {
+        ) -> Result<ParkedQueues, StoreError> {
             self.inner
                 .list_parked_queues(after, limit, length_cap)
                 .await

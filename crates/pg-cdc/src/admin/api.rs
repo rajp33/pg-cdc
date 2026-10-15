@@ -350,11 +350,8 @@ async fn scan(
         let listed = store
             .list_parked_queues(cursor.as_ref(), chunk, PARKED_LENGTH_CAP)
             .await?;
-        if listed.is_empty() {
-            return Ok(Page { queues, next: None });
-        }
-        let heads = read_heads(store, &listed).await?;
-        for (queue, head) in listed.iter().zip(heads) {
+        let heads = read_heads(store, &listed.queues).await?;
+        for (queue, head) in listed.queues.iter().zip(heads) {
             let Some(head) = head else { continue };
             if listing.wanted.is_some_and(|wanted| wanted != head.status) {
                 continue;
@@ -375,8 +372,11 @@ async fn scan(
                 return Ok(Page { queues, next });
             }
         }
+        let Some(next) = listed.next else {
+            return Ok(Page { queues, next: None });
+        };
         examined += chunk;
-        cursor = listed.last().map(|queue| queue.order_key);
+        cursor = Some(next);
     }
     Ok(Page {
         queues,
@@ -582,7 +582,7 @@ async fn operate_failure(admin: &Admin, error: OperateError) -> Reply {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::{Duration, SystemTime};
@@ -610,8 +610,8 @@ mod tests {
     use crate::sink::{AttributeValue, Outbound, Outcome, Sink, SinkCapabilities, SinkError};
     use crate::state::memory::MemoryStateStore;
     use crate::state::{
-        LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError,
-        SwapOutcome, Version, Versioned, now_ms,
+        LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore,
+        StoreError, SwapOutcome, Version, Versioned, now_ms,
     };
     use crate::status::{LaneCounts, ParkedAccess, ParkedGauges, Status};
 
@@ -625,7 +625,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct Races {
-        drain_while_listing: Option<OrderKeyId>,
+        drain_while_listing: HashSet<OrderKeyId>,
         deliver_before_reading: Option<OrderKeyId>,
     }
 
@@ -742,19 +742,27 @@ mod tests {
             after: Option<&OrderKeyId>,
             limit: usize,
             length_cap: usize,
-        ) -> Result<Vec<ParkedHead>, StoreError> {
+        ) -> Result<ParkedQueues, StoreError> {
             self.count()?;
             let mut listed = self
                 .inner
                 .list_parked_queues(after, limit, length_cap)
                 .await?;
-            let draining = self.races().drain_while_listing;
-            if let Some(key) = draining.filter(|key| listed.iter().any(|q| q.order_key == *key)) {
-                self.races().drain_while_listing = None;
-                self.drain(&key).await;
-                listed.retain(|queue| queue.order_key != key);
+            let draining: Vec<OrderKeyId> = listed
+                .queues
+                .iter()
+                .map(|queue| queue.order_key)
+                .filter(|key| self.races().drain_while_listing.remove(key))
+                .collect();
+            for key in &draining {
+                self.drain(key).await;
             }
-            self.counts().lists.push((limit, listed.len(), length_cap));
+            listed
+                .queues
+                .retain(|queue| !draining.contains(&queue.order_key));
+            self.counts()
+                .lists
+                .push((limit, listed.queues.len(), length_cap));
             Ok(listed)
         }
 
@@ -1335,7 +1343,7 @@ mod tests {
             seed(&store, &[parked(*key, 0x10, 0, ParkStatus::Dead)]).await;
         }
         let counting = CountingStore::over(&store);
-        counting.races().drain_while_listing = Some(keys[0]);
+        counting.races().drain_while_listing.insert(keys[0]);
         let fixture = Fixture::reading(counting.clone()).await;
 
         let answer = get(&fixture.admin, "/parked?status=dead&limit=2").await;
@@ -1345,6 +1353,49 @@ mod tests {
             vec![keys[1].to_string(), keys[2].to_string()]
         );
         assert_eq!(answer.body["next"], keys[2].to_string());
+        fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queues_draining_during_the_listing_count_against_the_scan_limit() {
+        let keys = sorted_keys(PARKED_SCAN_LIMIT + 3);
+        let store = MemoryStateStore::new();
+        let events: Vec<_> = keys
+            .iter()
+            .map(|key| parked(*key, 0x10, 0, ParkStatus::Dead))
+            .collect();
+        seed(&store, &events).await;
+        let counting = CountingStore::over(&store);
+        counting
+            .races()
+            .drain_while_listing
+            .extend(keys[..PARKED_SCAN_LIMIT + 2].iter().copied());
+        let fixture = Fixture::reading(counting.clone()).await;
+
+        let first = get(&fixture.admin, "/parked?status=dead&limit=1").await;
+        assert_eq!(first.status, 200);
+        assert_eq!(queue_keys(&first), Vec::<String>::new());
+        assert_eq!(first.body["next"], keys[PARKED_SCAN_LIMIT - 1].to_string());
+        {
+            let counts = counting.counts();
+            assert_eq!(counts.lists.len(), PARKED_SCAN_LIMIT);
+            assert!(counts.lists.iter().all(|(asked, _, _)| *asked == 1));
+            assert_eq!(counts.reads, Vec::<(usize, usize)>::new());
+        }
+
+        let after = format!(
+            "/parked?status=dead&limit=1&after={}",
+            keys[PARKED_SCAN_LIMIT - 1]
+        );
+        let second = get(&fixture.admin, &after).await;
+        let live = keys[PARKED_SCAN_LIMIT + 2].to_string();
+        assert_eq!(queue_keys(&second), vec![live.clone()]);
+        assert_eq!(second.body["next"], live);
+        assert_eq!(counting.counts().lists.len(), PARKED_SCAN_LIMIT + 3);
+
+        let last = get(&fixture.admin, &format!("/parked?status=dead&after={live}")).await;
+        assert_eq!(queue_keys(&last), Vec::<String>::new());
+        assert_eq!(last.body["next"], Value::Null);
         fixture.stop().await;
     }
 

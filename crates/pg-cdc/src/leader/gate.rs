@@ -12,8 +12,8 @@ use crate::order::OrderKeyId;
 use crate::payload::{PayloadRef, PayloadStore};
 use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 use crate::state::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError, SwapOutcome,
-    Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore, StoreError,
+    SwapOutcome, Version, Versioned,
 };
 
 pub const FENCED: &str = "sink and store writes are fenced";
@@ -205,7 +205,7 @@ impl StateStore for GatedStateStore {
         after: Option<&OrderKeyId>,
         limit: usize,
         length_cap: usize,
-    ) -> Result<Vec<ParkedHead>, StoreError> {
+    ) -> Result<ParkedQueues, StoreError> {
         or_unavailable(
             self.gate
                 .read(self.inner.list_parked_queues(after, limit, length_cap))
@@ -429,13 +429,16 @@ mod tests {
             _after: Option<&OrderKeyId>,
             _limit: usize,
             _length_cap: usize,
-        ) -> Result<Vec<ParkedHead>, StoreError> {
+        ) -> Result<ParkedQueues, StoreError> {
             self.run("list_parked_queues").await;
-            Ok(vec![ParkedHead {
-                order_key: key(),
-                head: id(),
-                length: 3,
-            }])
+            Ok(ParkedQueues {
+                queues: vec![ParkedHead {
+                    order_key: key(),
+                    head: id(),
+                    length: 3,
+                }],
+                next: Some(key()),
+            })
         }
 
         async fn read_parked(
@@ -835,11 +838,14 @@ mod tests {
 
         assert_eq!(
             state.list_parked_queues(Some(&key()), 10, 5).await,
-            Ok(vec![ParkedHead {
-                order_key: key(),
-                head: id(),
-                length: 3,
-            }])
+            Ok(ParkedQueues {
+                queues: vec![ParkedHead {
+                    order_key: key(),
+                    head: id(),
+                    length: 3,
+                }],
+                next: Some(key()),
+            })
         );
         assert_eq!(
             state.read_parked(&key(), None, 1).await,

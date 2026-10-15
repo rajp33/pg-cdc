@@ -19,8 +19,8 @@ use pg_cdc::event::EventId;
 use pg_cdc::order::OrderKeyId;
 use pg_cdc::state::s3::S3StateStore;
 use pg_cdc::state::{
-    LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError,
-    SwapOutcome,
+    LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore,
+    StoreError, SwapOutcome,
 };
 use pg_cdc_decoder::Lsn;
 use pg_cdc_testkit::AwsEmulator;
@@ -191,11 +191,14 @@ async fn listing_queues_costs_one_page_per_queue_whatever_the_backlog() -> TestR
     };
     assert_eq!(
         first,
-        vec![
-            head(busy, id(7, 0), 1000),
-            head(quiet[0], id(9, 0), 1),
-            head(quiet[1], id(9, 0), 1),
-        ]
+        ParkedQueues {
+            queues: vec![
+                head(busy, id(7, 0), 1000),
+                head(quiet[0], id(9, 0), 1),
+                head(quiet[1], id(9, 0), 1),
+            ],
+            next: Some(quiet[1]),
+        }
     );
     assert!(requests.listings.load(Ordering::SeqCst) <= 4);
     assert_eq!(requests.gets.load(Ordering::SeqCst), 0);
@@ -203,18 +206,21 @@ async fn listing_queues_costs_one_page_per_queue_whatever_the_backlog() -> TestR
     let rest = store.list_parked_queues(Some(&quiet[1]), 3, 1000).await?;
     assert_eq!(
         rest,
-        vec![
-            head(quiet[2], id(9, 0), 1),
-            head(quiet[3], id(9, 0), 1),
-            head(elsewhere, id(9, 0), 1),
-        ]
+        ParkedQueues {
+            queues: vec![
+                head(quiet[2], id(9, 0), 1),
+                head(quiet[3], id(9, 0), 1),
+                head(elsewhere, id(9, 0), 1),
+            ],
+            next: None,
+        }
     );
     assert_eq!(requests.gets.load(Ordering::SeqCst), 0);
     Ok(())
 }
 
 #[derive(Debug)]
-struct DrainWhileListed(String);
+struct DrainWhileListed(Vec<String>);
 
 impl Intercept for DrainWhileListed {
     fn name(&self) -> &'static str {
@@ -229,8 +235,11 @@ impl Intercept for DrainWhileListed {
     ) -> Result<(), BoxError> {
         let request = context.request_mut();
         let uri = request.uri();
-        if uri.contains("list-type=2") && !uri.contains("delimiter=") && uri.contains(&self.0) {
-            let hidden = uri.replace(&self.0, "drained");
+        if uri.contains("list-type=2")
+            && !uri.contains("delimiter=")
+            && let Some(key) = self.0.iter().find(|key| uri.contains(key.as_str()))
+        {
+            let hidden = uri.replace(key.as_str(), "drained");
             request.set_uri(hidden)?;
         }
         Ok(())
@@ -251,7 +260,7 @@ async fn a_queue_draining_while_listed_does_not_end_the_listing() -> TestResult 
     let draining = aws_sdk_s3::Client::from_conf(
         s3.config()
             .to_builder()
-            .interceptor(DrainWhileListed(keys[0].to_string()))
+            .interceptor(DrainWhileListed(vec![keys[0].to_string()]))
             .build(),
     );
     let store = S3StateStore::new(draining, BUCKET.to_owned(), "", "orders", 32);
@@ -260,19 +269,71 @@ async fn a_queue_draining_while_listed_does_not_end_the_listing() -> TestResult 
         head: id(9, 0),
         length: 1,
     };
+    let page = |queues, next| ParkedQueues { queues, next };
 
     assert_eq!(
         store.list_parked_queues(None, 1, 1000).await?,
-        vec![head(keys[1])]
+        page(vec![], Some(keys[0]))
+    );
+    assert_eq!(
+        store.list_parked_queues(Some(&keys[0]), 1, 1000).await?,
+        page(vec![head(keys[1])], Some(keys[1]))
     );
     assert_eq!(
         store.list_parked_queues(None, 2, 1000).await?,
-        vec![head(keys[1]), head(keys[2])]
+        page(vec![head(keys[1])], Some(keys[1]))
     );
     assert_eq!(
         store.list_parked_queues(Some(&keys[1]), 2, 1000).await?,
-        vec![head(keys[2])]
+        page(vec![head(keys[2])], None)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn queues_draining_while_listed_cost_no_more_than_the_limit() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let seeding = S3StateStore::new(s3.clone(), BUCKET.to_owned(), "", "orders", 32);
+    let keys: Vec<OrderKeyId> = (1..=6).map(|n| key(0x42, n)).collect::<TestResult<_>>()?;
+    let events: Vec<ParkedEvent> = keys
+        .iter()
+        .map(|queue| event(*queue, id(9, 0), ParkStatus::Dead))
+        .collect();
+    seeding.append_parked(&events).await?;
+
+    let requests = Arc::new(Requests::default());
+    let draining = aws_sdk_s3::Client::from_conf(
+        s3.config()
+            .to_builder()
+            .interceptor(DrainWhileListed(
+                keys[..5].iter().map(ToString::to_string).collect(),
+            ))
+            .interceptor(CountRequests(Arc::clone(&requests)))
+            .build(),
+    );
+    let store = S3StateStore::new(draining, BUCKET.to_owned(), "", "orders", 32);
+
+    let mut after = None;
+    let mut pages = Vec::new();
+    loop {
+        let before = requests.listings.load(Ordering::SeqCst);
+        let listed = store.list_parked_queues(after.as_ref(), 1, 1000).await?;
+        let listings = requests.listings.load(Ordering::SeqCst) - before;
+        assert!(listings <= 2, "limit 1 made {listings} listings");
+        after = listed.next;
+        pages.push(listed.queues);
+        if after.is_none() {
+            break;
+        }
+    }
+    let mut expected = vec![vec![]; 5];
+    expected.push(vec![ParkedHead {
+        order_key: keys[5],
+        head: id(9, 0),
+        length: 1,
+    }]);
+    assert_eq!(pages, expected);
+    assert_eq!(requests.gets.load(Ordering::SeqCst), 0);
     Ok(())
 }
 

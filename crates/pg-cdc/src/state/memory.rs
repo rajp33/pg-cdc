@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 
 use super::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError, SwapOutcome,
-    Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore, StoreError,
+    SwapOutcome, Version, Versioned,
 };
 use crate::event::EventId;
 use crate::order::OrderKeyId;
@@ -76,25 +76,30 @@ impl StateStore for MemoryStateStore {
         after: Option<&OrderKeyId>,
         limit: usize,
         length_cap: usize,
-    ) -> Result<Vec<ParkedHead>, StoreError> {
+    ) -> Result<ParkedQueues, StoreError> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(ParkedQueues::default());
         }
         let inner = self.lock()?;
         let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
-        Ok(inner
-            .parked
-            .range((lower, Bound::Unbounded))
-            .filter_map(|(key, queue)| {
-                let head = *queue.keys().next()?;
-                Some(ParkedHead {
-                    order_key: *key,
-                    head,
-                    length: u64::try_from(queue.len().min(length_cap.max(1))).unwrap_or(u64::MAX),
+        let mut keys = inner.parked.range((lower, Bound::Unbounded));
+        let examined: Vec<_> = keys.by_ref().take(limit).collect();
+        let more = keys.next().is_some();
+        Ok(ParkedQueues {
+            next: examined.last().filter(|_| more).map(|(key, _)| **key),
+            queues: examined
+                .into_iter()
+                .filter_map(|(key, queue)| {
+                    let head = *queue.keys().next()?;
+                    Some(ParkedHead {
+                        order_key: *key,
+                        head,
+                        length: u64::try_from(queue.len().min(length_cap.max(1)))
+                            .unwrap_or(u64::MAX),
+                    })
                 })
-            })
-            .take(limit)
-            .collect())
+                .collect(),
+        })
     }
 
     async fn read_parked(
