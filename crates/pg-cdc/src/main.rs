@@ -227,7 +227,7 @@ async fn run(config: Config, signalled: Arc<OnceLock<Instant>>) -> anyhow::Resul
         return Ok(());
     }
     health.set_sink_ready(true);
-    if !store_ready(stores.state.as_ref(), &shutdown).await {
+    if !store_ready(&stores.state, &shutdown).await {
         tracing::info!("pg-cdc stopped cleanly");
         return Ok(());
     }

@@ -10,6 +10,7 @@ use crate::lane::Stores;
 use crate::session::{SessionConfig, SessionContext, SessionError, run_session};
 use crate::sink::Sink;
 use crate::state::StateStore;
+use crate::state::instrumented::InstrumentedStateStore;
 
 pub const HALT_AFTER_FAULTS: u32 = 3;
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -158,7 +159,8 @@ pub async fn preflight(sink: &dyn Sink, shutdown: &CancellationToken) -> bool {
     .await
 }
 
-pub async fn store_ready(store: &dyn StateStore, shutdown: &CancellationToken) -> bool {
+pub async fn store_ready(store: &Arc<dyn StateStore>, shutdown: &CancellationToken) -> bool {
+    let store = InstrumentedStateStore::new(Arc::clone(store));
     retry_until_ok("state store check failed; retrying", shutdown, || async {
         store.read_leader().await.map(drop)
     })
@@ -210,6 +212,7 @@ mod tests {
     use crate::leader::lease::FenceReason;
     use crate::leader::record::TakeoverError;
     use crate::leader::standby::ProbeError;
+    use crate::metrics::{Measurement, Recorder, StoreOperation};
     use crate::order::OrderKeyId;
     use crate::sink::{Outbound, Outcome, SinkCapabilities, SinkError};
     use crate::state::memory::MemoryStateStore;
@@ -377,27 +380,52 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_store_check_retries_with_backoff_until_the_store_answers() {
-        let store = FlakyStore {
+        let store = Arc::new(FlakyStore {
             failures_left: AtomicU32::new(2),
             ..FlakyStore::default()
-        };
-        assert!(store_ready(&store, &CancellationToken::new()).await);
+        });
+        let probe: Arc<dyn StateStore> = store.clone();
+        assert!(store_ready(&probe, &CancellationToken::new()).await);
         assert_eq!(store.checks.load(Ordering::SeqCst), 3);
+    }
+
+    #[derive(Debug)]
+    struct StoreCalls(Arc<std::sync::Mutex<Vec<StoreOperation>>>);
+
+    impl Recorder for StoreCalls {
+        fn record(&self, measurement: Measurement<'_>) {
+            if let Measurement::Store { operation, .. } = measurement {
+                self.0.lock().unwrap().push(operation);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_store_check_records_a_leader_read() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::metrics::install(Box::new(StoreCalls(Arc::clone(&calls)))).unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(FlakyStore {
+            failures_left: AtomicU32::new(2),
+            ..FlakyStore::default()
+        });
+        assert!(store_ready(&store, &CancellationToken::new()).await);
+        assert_eq!(*calls.lock().unwrap(), vec![StoreOperation::ReadLeader; 3]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_stops_a_failing_store_check() {
-        let store = FlakyStore {
+        let store = Arc::new(FlakyStore {
             failures_left: AtomicU32::new(u32::MAX),
             ..FlakyStore::default()
-        };
+        });
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
             token.cancel();
         });
-        assert!(!store_ready(&store, &shutdown).await);
+        let probe: Arc<dyn StateStore> = store.clone();
+        assert!(!store_ready(&probe, &shutdown).await);
         assert!(store.checks.load(Ordering::SeqCst) >= 3);
     }
 
