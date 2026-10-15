@@ -44,6 +44,9 @@ clap = { version = "4.6.7", default-features = false, features = [
 ] }
 fallible-iterator = "0.2.0"
 fastrand = "2.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 pg-cdc-decoder = { path = "crates/decoder", version = "0.1.0" }
 pg-cdc-replication = { path = "crates/replication", version = "0.1.0" }
 pg-cdc-testkit = { path = "crates/testkit", version = "0.1.0" }

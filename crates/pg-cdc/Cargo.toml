@@ -21,6 +21,9 @@ aws-smithy-http-client.workspace = true
 bytes.workspace = true
 clap.workspace = true
 fastrand.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 pg-cdc-decoder.workspace = true
 pg-cdc-replication.workspace = true
 rustls.workspace = true
@@ -35,6 +38,7 @@ tokio = { workspace = true, features = [
   "io-std",
   "io-util",
   "macros",
+  "net",
   "rt",
   "rt-multi-thread",
   "signal",

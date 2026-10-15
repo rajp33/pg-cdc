@@ -1,16 +1,20 @@
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
+use pg_cdc::admin::{self, HEALTH_TIMEOUT};
 use pg_cdc::config::{
-    Config, Credentials, PayloadStoreConfig, SinkConfig, SourceConfig, StateStoreConfig,
+    Config, Credentials, DEFAULT_ADMIN_LISTEN, PayloadStoreConfig, SinkConfig, SourceConfig,
+    StateStoreConfig,
 };
 use pg_cdc::connection::{
     ConnectParams, ConnectionProvider, PasswordProvider, RdsIamProvider, TlsConfig,
 };
+use pg_cdc::health::Health;
 use pg_cdc::lane::Stores;
 use pg_cdc::payload::{PayloadStore, S3PayloadStore};
 use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig};
@@ -22,6 +26,7 @@ use pg_cdc::state::StateStore;
 use pg_cdc::state::filesystem::FilesystemStateStore;
 use pg_cdc::state::s3::{S3StateStore, s3_client};
 use pg_cdc::supervisor::{LiveSession, preflight, store_ready, supervise};
+use tokio::net::TcpListener;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -43,14 +48,52 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    Health {
+        #[arg(long)]
+        addr: Option<SocketAddr>,
+    },
 }
+
+const ADMIN_LISTEN_VARIABLE: &str = "PGCDC__ADMIN__LISTEN";
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let Command::Run { config } = Cli::parse().command;
+    match Cli::parse().command {
+        Command::Run { config } => run_command(&config).await,
+        Command::Health { addr } => health_command(addr).await,
+    }
+}
+
+async fn health_command(flag: Option<SocketAddr>) -> ExitCode {
+    let env = std::env::var(ADMIN_LISTEN_VARIABLE).ok();
+    let failure = match health_addr(flag, env.as_deref()) {
+        Err(error) => format!("health check failed: {error}"),
+        Ok(addr) => match admin::check_health(addr, HEALTH_TIMEOUT).await {
+            Ok(200) => return ExitCode::SUCCESS,
+            Ok(status) => format!("unhealthy: /healthz returned {status}"),
+            Err(error) => format!("health check failed: {error}"),
+        },
+    };
+    let _ = writeln!(std::io::stderr(), "pg-cdc: {failure}");
+    ExitCode::FAILURE
+}
+
+fn health_addr(flag: Option<SocketAddr>, env: Option<&str>) -> Result<SocketAddr, String> {
+    if let Some(addr) = flag {
+        return Ok(addr);
+    }
+    match env.filter(|value| !value.is_empty()) {
+        Some(value) => value.parse().map_err(|error| {
+            format!("{ADMIN_LISTEN_VARIABLE} {value:?} is not an address: {error}")
+        }),
+        None => Ok(DEFAULT_ADMIN_LISTEN),
+    }
+}
+
+async fn run_command(config: &Path) -> ExitCode {
     let env = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)));
-    let config = match pg_cdc::config::load(&config, env) {
+    let config = match pg_cdc::config::load(config, env) {
         Ok(config) => config,
         Err(error) => {
             let _ = writeln!(std::io::stderr(), "pg-cdc: invalid configuration: {error}");
@@ -82,6 +125,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
     tokio::spawn(watch_signals(terminate, interrupt, shutdown.clone()));
     tracing::info!(pipeline = %config.pipeline, slot = %config.source.slot, "pg-cdc starting");
+    let health = start_admin(config.admin.listen).await?;
     let Some(provider) = shutdown
         .run_until_cancelled(Box::pin(provider(&config.source)))
         .await
@@ -103,12 +147,16 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!("pg-cdc stopped cleanly");
         return Ok(());
     };
-    if !preflight(sink.as_ref(), &shutdown).await
-        || !store_ready(stores.state.as_ref(), &shutdown).await
-    {
+    if !preflight(sink.as_ref(), &shutdown).await {
         tracing::info!("pg-cdc stopped cleanly");
         return Ok(());
     }
+    health.set_sink_ready(true);
+    if !store_ready(stores.state.as_ref(), &shutdown).await {
+        tracing::info!("pg-cdc stopped cleanly");
+        return Ok(());
+    }
+    health.set_store_ready(true);
     let session = SessionConfig {
         pipeline: config.pipeline.clone(),
         slot: config.source.slot.clone(),
@@ -136,6 +184,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .context("replication stopped")?;
     tracing::info!("pg-cdc stopped cleanly");
     Ok(())
+}
+
+async fn start_admin(listen: SocketAddr) -> anyhow::Result<Health> {
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("cannot bind admin.listen {listen}"))?;
+    let addr = listener
+        .local_addr()
+        .context("cannot read the admin address")?;
+    tracing::info!(%addr, "admin listening");
+    let health = Health::new();
+    tokio::spawn(admin::serve(listener, health.clone()));
+    Ok(health)
 }
 
 async fn sink(config: &SinkConfig) -> Arc<dyn Sink> {
@@ -210,4 +271,22 @@ async fn watch_signals(mut terminate: Signal, mut interrupt: Signal, shutdown: C
     }
     tracing::info!("shutdown requested");
     shutdown.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_address_comes_from_the_flag_then_the_environment_then_the_default() {
+        let flag: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let env: SocketAddr = "10.0.0.2:2".parse().unwrap();
+        assert_eq!(health_addr(Some(flag), Some("10.0.0.2:2")), Ok(flag));
+        assert_eq!(health_addr(None, Some("10.0.0.2:2")), Ok(env));
+        assert_eq!(health_addr(None, None), Ok(DEFAULT_ADMIN_LISTEN));
+        assert_eq!(health_addr(None, Some("")), Ok(DEFAULT_ADMIN_LISTEN));
+        let error = health_addr(None, Some("not-an-address")).unwrap_err();
+        assert!(error.contains("PGCDC__ADMIN__LISTEN"), "{error}");
+        assert_eq!(health_addr(Some(flag), Some("not-an-address")), Ok(flag));
+    }
 }

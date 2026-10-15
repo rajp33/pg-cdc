@@ -1,6 +1,7 @@
 use std::io::Write as _;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use pg_cdc_testkit::{AwsEmulator, Postgres, parse_lsn};
@@ -11,6 +12,7 @@ use tokio::process::{Child, ChildStdout, Command};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const WAIT: Duration = Duration::from_secs(30);
+const ADMIN_ANY_PORT: &str = "admin:\n  listen: 127.0.0.1:0\n";
 
 struct ConfigFile {
     file: tempfile::NamedTempFile,
@@ -83,7 +85,7 @@ fn write_config_with_sink(
     };
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\n{sections}{state_store}",
+        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\n{sections}{state_store}{ADMIN_ANY_PORT}",
         host = pg.host(),
         port = pg.port(),
         database = pg.database(),
@@ -137,6 +139,30 @@ async fn wait_for_line<R: AsyncBufRead + Unpin>(
         Err(format!("output ended before {needle:?}").into())
     })
     .await?
+}
+
+async fn admin_addr<R: AsyncBufRead + Unpin>(lines: &mut Lines<R>) -> TestResult<SocketAddr> {
+    let line = wait_for_line(lines, "admin listening").await?;
+    let log: Value = serde_json::from_str(&line)?;
+    Ok(log
+        .get("fields")
+        .and_then(|fields| fields.get("addr"))
+        .and_then(Value::as_str)
+        .ok_or("no addr in the admin listening line")?
+        .parse()?)
+}
+
+async fn health_command(args: &[&str], env: Option<&str>) -> TestResult<Output> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pg-cdc"));
+    command
+        .arg("health")
+        .args(args)
+        .env_remove("PGCDC__ADMIN__LISTEN")
+        .kill_on_drop(true);
+    if let Some(listen) = env {
+        command.env("PGCDC__ADMIN__LISTEN", listen);
+    }
+    Ok(tokio::time::timeout(WAIT, command.output()).await??)
 }
 
 async fn next_event(lines: &mut Lines<BufReader<ChildStdout>>) -> TestResult<Value> {
@@ -251,7 +277,7 @@ async fn sigterm_while_the_connection_provider_is_built_exits_cleanly() -> TestR
     let mut file = tempfile::NamedTempFile::new()?;
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: aws_rds_iam\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: /nonexistent/pg-cdc\n"
+        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: aws_rds_iam\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: /nonexistent/pg-cdc\n{ADMIN_ANY_PORT}"
     )?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_pg-cdc"))
         .arg("run")
@@ -540,5 +566,99 @@ async fn a_deleted_topic_parks_events_on_disk_and_the_slot_advances() -> TestRes
     .await?;
     sigterm(&child).await?;
     assert!(tokio::time::timeout(WAIT, child.wait()).await??.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_exits_zero_only_when_healthz_returns_200() -> TestResult {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let health = pg_cdc::health::Health::new();
+    let server = tokio::spawn(pg_cdc::admin::serve(listener, health.clone()));
+    let flag = addr.to_string();
+
+    let unhealthy = health_command(&["--addr", &flag], None).await?;
+    assert_eq!(unhealthy.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&unhealthy.stderr);
+    assert_eq!(stderr, "pg-cdc: unhealthy: /healthz returned 503\n");
+    assert_eq!(unhealthy.stdout, Vec::<u8>::new());
+
+    health.set_sink_ready(true);
+    health.set_store_ready(true);
+    health.set_validated(true);
+    let healthy = health_command(&["--addr", &flag], None).await?;
+    assert_eq!(healthy.status.code(), Some(0), "{healthy:?}");
+    assert_eq!(healthy.stderr, Vec::<u8>::new());
+
+    let from_environment = health_command(&[], Some(&flag)).await?;
+    assert_eq!(
+        from_environment.status.code(),
+        Some(0),
+        "{from_environment:?}"
+    );
+
+    server.abort();
+    let _ = server.await;
+    let started = std::time::Instant::now();
+    let closed = health_command(&["--addr", &flag], None).await?;
+    assert_eq!(closed.status.code(), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let stderr = String::from_utf8_lossy(&closed.stderr);
+    assert!(
+        stderr.starts_with("pg-cdc: health check failed: "),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_rejects_an_unparsable_environment_address() -> TestResult {
+    let output = health_command(&[], Some("not-an-address")).await?;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("PGCDC__ADMIN__LISTEN"), "{stderr}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_reports_unhealthy_until_its_checks_pass() -> TestResult {
+    let pg = Postgres::start().await?;
+    prepare(&pg, true).await?;
+    let aws = AwsEmulator::start().await?;
+    let sink = "sink:\n  type: sns\n  topic_arn: arn:aws:sns:us-east-1:123456789012:missing\n";
+    let config = write_config_with_sink(&pg, "cli_slot", "200ms", sink)?;
+    let mut child = spawn_with_env(config.path(), pg.password(), Stdio::null(), &moto_env(&aws))?;
+    let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
+    let addr = admin_addr(&mut stdout).await?;
+    wait_for_line(&mut stdout, "sink preflight failed").await?;
+    let output = health_command(&["--addr", &addr.to_string()], None).await?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr, "pg-cdc: unhealthy: /healthz returned 503\n");
+    sigterm(&child).await?;
+    assert!(tokio::time::timeout(WAIT, child.wait()).await??.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_exits_when_the_admin_address_is_taken() -> TestResult {
+    let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let mut file = tempfile::NamedTempFile::new()?;
+    let state = tempfile::tempdir()?;
+    write!(
+        file,
+        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: password\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: {}\nadmin:\n  listen: {}\n",
+        state.path().display(),
+        taken.local_addr()?
+    )?;
+    let child = spawn(file.path(), "unused", Stdio::piped())?;
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await??;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot bind admin.listen"), "{stderr}");
     Ok(())
 }
