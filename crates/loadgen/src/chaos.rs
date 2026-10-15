@@ -101,6 +101,10 @@ pub fn outstanding(committed: &[Change], observed: &[Observed], discards: &BTree
         .count()
 }
 
+pub fn settle_over(pending: usize, elapsed: Duration, limit: Duration) -> bool {
+    pending == 0 || elapsed >= limit
+}
+
 pub fn resolve_unresolved(
     unresolved: &[Unresolved],
     stored: &HashSet<i64, impl std::hash::BuildHasher>,
@@ -240,6 +244,15 @@ mod tests {
         );
         assert_eq!(outstanding(&committed, &[], &BTreeSet::new()), 4);
         assert_eq!(outstanding(&[], &observed, &discards), 0);
+    }
+
+    #[test]
+    fn settling_ends_at_its_limit_even_while_changes_are_still_draining() {
+        let limit = Duration::from_secs(60);
+        assert!(!settle_over(5, Duration::from_secs(59), limit));
+        assert!(settle_over(5, limit, limit));
+        assert!(settle_over(5, Duration::from_secs(600), limit));
+        assert!(settle_over(0, Duration::ZERO, limit));
     }
 
     fn delivered(seq: i64) -> Observed {

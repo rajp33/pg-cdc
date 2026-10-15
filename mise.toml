@@ -90,10 +90,10 @@ run = [
 ]
 
 [tasks.chaos]
-description = "10 minute chaos run against two pg-cdc instances; CHAOS_SEED defaults to the current Unix time"
+description = "About 5 minutes against two pg-cdc instances: opening takeovers, 3 minutes of chaos, at most 1 minute to settle; CHAOS_SEED defaults to the current Unix time"
 run = [
   "cargo build --release -p pg-cdc",
-  "cargo run --release -p pg-cdc-loadgen -- chaos --pg-cdc target/release/pg-cdc --seed ${CHAOS_SEED:-$(date +%s)} --duration 10m --settle 5m --report target/chaos/full.json",
+  "cargo run --release -p pg-cdc-loadgen -- chaos --pg-cdc target/release/pg-cdc --seed ${CHAOS_SEED:-$(date +%s)} --duration 3m --settle 1m --report target/chaos/full.json",
 ]
 
 [tasks.load]

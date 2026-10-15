@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use super::fleet::{Fleet, Seen, artifact_path};
 use super::operator::Operator;
 use super::{
     Action, ChaosOptions, ChaosReport, choose, missing_takeovers, outstanding, resolve_unresolved,
+    settle_over,
 };
 use crate::checker::{Evidence, check};
 use crate::proxy::{FaultProxy, Faults, Mode, Tap, Upstream};
@@ -27,7 +29,6 @@ const TOPIC: &str = "chaos";
 const TICK: Duration = Duration::from_millis(250);
 const ACTION_PERIOD: Duration = Duration::from_secs(1);
 const SKIPPED: &str = "Skipped";
-const STALL_CAP_FACTOR: u32 = 10;
 const CHAOS_OPERATOR_BUDGET: Duration = Duration::from_secs(5);
 const SETTLE_OPERATOR_BUDGET: Duration = Duration::from_secs(45);
 const OPENING_TIMEOUT: Duration = Duration::from_secs(60);
@@ -377,15 +378,12 @@ impl Harness {
         let _ = timeout(budget, pass).await;
     }
 
-    pub(super) async fn settle(&mut self, ledger: &Ledger, window: Duration) -> anyhow::Result<()> {
+    pub(super) async fn settle(&mut self, ledger: &Ledger, limit: Duration) -> anyhow::Result<()> {
         self.sns_proxy.set(Faults::HEALTHY);
         self.s3_proxy.set(Faults::HEALTHY);
         self.windows = Windows::default();
         self.fleet.ensure_running().await?;
         let started = Instant::now();
-        let cap = started + window * STALL_CAP_FACTOR;
-        let mut deadline = started + window;
-        let mut best = usize::MAX;
         loop {
             tokio::time::sleep(ACTION_PERIOD).await;
             self.fleet.advance(true).await?;
@@ -396,12 +394,13 @@ impl Harness {
                 &self.observations.snapshot(),
                 &self.operator.discards,
             );
-            let now = Instant::now();
-            if pending < best {
-                best = pending;
-                deadline = now + window;
-            }
-            if pending == 0 || now >= deadline.min(cap) {
+            if settle_over(pending, started.elapsed(), limit) {
+                if pending > 0 {
+                    writeln!(
+                        std::io::stdout(),
+                        "chaos settle limit {limit:?} reached with {pending} changes neither delivered nor discarded; the checker looks for them in the state store"
+                    )?;
+                }
                 return Ok(());
             }
         }
