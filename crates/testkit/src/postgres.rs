@@ -19,10 +19,7 @@ const PASSWORD: &str = "postgres";
 const DATABASE: &str = "postgres";
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(100);
-const SERVER_ARGS: [&str; 11] = [
-    "postgres",
-    "-c",
-    "wal_level=logical",
+const FIXED_SERVER_ARGS: [&str; 8] = [
     "-c",
     "fsync=off",
     "-c",
@@ -36,6 +33,23 @@ const SERVER_ARGS: [&str; 11] = [
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PostgresOptions {
     pub tls: bool,
+    pub wal_level: WalLevel,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WalLevel {
+    #[default]
+    Logical,
+    Replica,
+}
+
+impl WalLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Logical => "logical",
+            Self::Replica => "replica",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,13 +86,23 @@ pub fn parse_lsn(text: &str) -> Result<u64, TestkitError> {
     Ok((u64::from(high) << 32) | u64::from(low))
 }
 
-fn tls_script() -> String {
+fn server_args(wal_level: WalLevel) -> Vec<String> {
+    let mut args = vec![
+        "postgres".to_owned(),
+        "-c".to_owned(),
+        format!("wal_level={}", wal_level.as_str()),
+    ];
+    args.extend(FIXED_SERVER_ARGS.iter().map(|arg| (*arg).to_owned()));
+    args
+}
+
+fn tls_script(wal_level: WalLevel) -> String {
     format!(
         "set -e; mkdir -p /etc/pgtls; cp /tls/server.crt /tls/server.key /etc/pgtls/; \
          chown -R postgres:postgres /etc/pgtls; chmod 600 /etc/pgtls/server.key; \
          exec docker-entrypoint.sh {} -c ssl=on \
          -c ssl_cert_file=/etc/pgtls/server.crt -c ssl_key_file=/etc/pgtls/server.key",
-        SERVER_ARGS.join(" ")
+        server_args(wal_level).join(" ")
     )
 }
 
@@ -105,14 +129,14 @@ impl Postgres {
                     "/tls/server.key",
                     certificates.server_key_pem().as_bytes().to_vec(),
                 )
-                .with_cmd(["-c".to_owned(), tls_script()])
+                .with_cmd(["-c".to_owned(), tls_script(options.wal_level)])
                 .start()
                 .await?;
             (container, Some(certificates))
         } else {
             let container = image
                 .with_env_var("POSTGRES_PASSWORD", PASSWORD)
-                .with_cmd(SERVER_ARGS)
+                .with_cmd(server_args(options.wal_level))
                 .start()
                 .await?;
             (container, None)

@@ -9,5 +9,5 @@ pub use error::TestkitError;
 pub use fixture::{read_fixture, write_fixture};
 pub use postgres::{
     DEFAULT_PG_VERSION, PG_VERSION_ENV, Postgres, PostgresOptions, SESSION_OPTIONS, SlotState,
-    parse_lsn, parse_pg_version,
+    WalLevel, parse_lsn, parse_pg_version,
 };

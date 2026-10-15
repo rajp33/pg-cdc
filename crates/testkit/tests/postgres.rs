@@ -86,7 +86,11 @@ async fn slot_state_and_capture_follow_the_slot() -> TestResult {
 
 #[tokio::test]
 async fn tls_option_enables_ssl_with_generated_ca() -> TestResult {
-    let pg = Postgres::start_with(PostgresOptions { tls: true }).await?;
+    let pg = Postgres::start_with(PostgresOptions {
+        tls: true,
+        ..PostgresOptions::default()
+    })
+    .await?;
     let ssl: String = pg
         .client()
         .await?

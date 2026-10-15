@@ -177,7 +177,11 @@ async fn d1_transactional_logical_message_is_not_streamed() -> TestResult {
 
 #[tokio::test]
 async fn scram_over_tls_verifies_the_server() -> TestResult {
-    let pg = Postgres::start_with(PostgresOptions { tls: true }).await?;
+    let pg = Postgres::start_with(PostgresOptions {
+        tls: true,
+        ..PostgresOptions::default()
+    })
+    .await?;
     let start = prepare(&pg, "tls_probe").await?;
     let mut roots = rustls::RootCertStore::empty();
     for certificate in CertificateDer::pem_file_iter(pg.ca_file().ok_or("no CA file")?)? {

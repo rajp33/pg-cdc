@@ -191,7 +191,11 @@ async fn pinned_session_settings_override_database_defaults() -> TestResult {
 
 #[tokio::test]
 async fn tls_require_streams_over_an_encrypted_replication_connection() -> TestResult {
-    let pg = Postgres::start_with(PostgresOptions { tls: true }).await?;
+    let pg = Postgres::start_with(PostgresOptions {
+        tls: true,
+        ..PostgresOptions::default()
+    })
+    .await?;
     support::prepare(
         &pg,
         &["CREATE TABLE orders (id int PRIMARY KEY)"],

@@ -174,7 +174,11 @@ async fn ssl_in_use(
 
 #[tokio::test]
 async fn tls_modes_encrypt_and_verify_as_configured() -> TestResult {
-    let pg = Postgres::start_with(PostgresOptions { tls: true }).await?;
+    let pg = Postgres::start_with(PostgresOptions {
+        tls: true,
+        ..PostgresOptions::default()
+    })
+    .await?;
 
     let mut require = params(&pg, TlsMode::Require);
     require.tls.ca_file = None;
