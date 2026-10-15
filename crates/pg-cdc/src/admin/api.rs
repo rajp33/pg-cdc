@@ -12,12 +12,14 @@ use tokio::task::JoinSet;
 
 use super::{
     Admin, HEAD_READ_CONCURRENCY, HOLDER_LOOKUP_TIMEOUT, OPERATION_TIMEOUT, PARKED_LENGTH_CAP,
-    PARKED_LIMIT_DEFAULT, PARKED_LIMIT_MAX, PARKED_SCAN_LIMIT,
+    PARKED_LIMIT_DEFAULT, PARKED_LIMIT_MAX, PARKED_SCAN_LIMIT, PARKED_SHOW_BYTES,
 };
 use crate::event::EventId;
 use crate::lane::OperateError;
 use crate::order::OrderKeyId;
-use crate::state::{LeaderRecord, ParkStatus, ParkedEvent, StateStore, StoreError, now_ms};
+use crate::state::{
+    LeaderRecord, ParkStatus, ParkedEntry, ParkedEvent, StateStore, StoreError, now_ms,
+};
 use crate::status::ParkedAccess;
 
 pub(super) struct Reply {
@@ -447,10 +449,32 @@ struct EventBody<'a> {
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+enum ShownBody<'a> {
+    Event(EventBody<'a>),
+    Withheld {
+        id: String,
+        bytes: u64,
+        withheld: bool,
+    },
+}
+
+#[derive(Serialize)]
 struct EventsBody<'a> {
     order_key: String,
-    events: Vec<EventBody<'a>>,
+    events: Vec<ShownBody<'a>>,
     next: Option<String>,
+}
+
+fn shown_body(entry: &ParkedEntry) -> Result<ShownBody<'_>, StoreError> {
+    match entry {
+        ParkedEntry::Loaded(event) => event_body(event).map(ShownBody::Event),
+        ParkedEntry::Withheld { id, bytes } => Ok(ShownBody::Withheld {
+            id: id.to_string(),
+            bytes: *bytes,
+            withheld: true,
+        }),
+    }
 }
 
 fn event_body(event: &ParkedEvent) -> Result<EventBody<'_>, StoreError> {
@@ -485,27 +509,36 @@ async fn try_show(admin: &Admin, key: &str, query: Option<&str>) -> Checked<Repl
     let after = query.after_event()?;
     let access = access(admin).await?;
     Ok(bounded(async {
-        let mut events = match access
+        let Ok(_inspection) = admin.inspections.acquire().await else {
+            return Reply::error(StatusCode::SERVICE_UNAVAILABLE, "pg-cdc is stopping");
+        };
+        let mut slice = match access
             .store
-            .read_parked(&key, after.as_ref(), limit.saturating_add(1))
+            .read_parked_within(
+                &key,
+                after.as_ref(),
+                limit.saturating_add(1),
+                PARKED_SHOW_BYTES,
+            )
             .await
         {
-            Ok(events) => events,
+            Ok(slice) => slice,
             Err(error) => return store_failure(&error),
         };
-        if events.is_empty() && after.is_none() {
+        if slice.entries.is_empty() && after.is_none() {
             return Reply::error(
                 StatusCode::NOT_FOUND,
                 format!("order key {key} has no parked events"),
             );
         }
-        let more = events.len() > limit;
-        events.truncate(limit);
-        let next = events
+        let more = slice.full || slice.entries.len() > limit;
+        slice.entries.truncate(limit);
+        let next = slice
+            .entries
             .last()
             .filter(|_| more)
-            .map(|event| event.id.to_string());
-        let bodies: Result<Vec<_>, _> = events.iter().map(event_body).collect();
+            .map(|entry| entry.id().to_string());
+        let bodies: Result<Vec<_>, _> = slice.entries.iter().map(shown_body).collect();
         match bodies {
             Ok(events) => Reply::json(
                 StatusCode::OK,
@@ -601,7 +634,7 @@ mod tests {
     use super::operate_failure;
     use crate::admin::{
         Admin, HEAD_READ_CONCURRENCY, HOLDER_LOOKUP_TIMEOUT, Identity, OPERATION_TIMEOUT,
-        PARKED_LENGTH_CAP, PARKED_SCAN_LIMIT, route,
+        PARKED_LENGTH_CAP, PARKED_SCAN_LIMIT, PARKED_SHOW_BYTES, PARKED_SHOW_CONCURRENCY, route,
     };
     use crate::event::EventId;
     use crate::health::{Health, Role};
@@ -610,8 +643,8 @@ mod tests {
     use crate::sink::{AttributeValue, Outbound, Outcome, Sink, SinkCapabilities, SinkError};
     use crate::state::memory::MemoryStateStore;
     use crate::state::{
-        LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore,
-        StoreError, SwapOutcome, Version, Versioned, now_ms,
+        LeaderRecord, LeaderState, ParkStatus, ParkedEntry, ParkedEvent, ParkedHead, ParkedQueues,
+        ParkedSlice, StateStore, StoreError, SwapOutcome, Version, Versioned, now_ms,
     };
     use crate::status::{LaneCounts, ParkedAccess, ParkedGauges, Status};
 
@@ -621,6 +654,7 @@ mod tests {
         heads: usize,
         lists: Vec<(usize, usize, usize)>,
         reads: Vec<(usize, usize)>,
+        loaded_bytes: Vec<usize>,
     }
 
     #[derive(Debug, Default)]
@@ -797,6 +831,44 @@ mod tests {
                 })
                 .collect();
             self.counts().reads.push((limit, read.len()));
+            Ok(read)
+        }
+
+        async fn read_parked_within(
+            &self,
+            key: &OrderKeyId,
+            after: Option<&EventId>,
+            limit: usize,
+            max_bytes: u64,
+        ) -> Result<ParkedSlice, StoreError> {
+            self.count()?;
+            let delay = {
+                let mut reads = self.reads();
+                reads.running += 1;
+                reads.peak_running = reads.peak_running.max(reads.running);
+                reads.delays.get(key).copied()
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let read = self
+                .inner
+                .read_parked_within(key, after, limit, max_bytes)
+                .await;
+            self.reads().running -= 1;
+            let mut read = read?;
+            let mut bytes = 0;
+            for entry in &mut read.entries {
+                if let ParkedEntry::Loaded(event) = entry {
+                    bytes += event.body.len();
+                    event.body =
+                        TrackedBody::wrap(event.body.clone(), &self.live_bodies, &self.peak_bodies);
+                }
+            }
+            let mut counts = self.counts();
+            counts.reads.push((limit, read.entries.len()));
+            counts.loaded_bytes.push(bytes);
+            drop(counts);
             Ok(read)
         }
 
@@ -1649,6 +1721,110 @@ mod tests {
             missing.body,
             json!({"error": format!("order key {ghost} has no parked events")})
         );
+        fixture.stop().await;
+    }
+
+    fn padded(key: OrderKeyId, ordinal: u32, bytes: u64) -> ParkedEvent {
+        let pad = "x".repeat(usize::try_from(bytes).unwrap());
+        ParkedEvent {
+            body: Bytes::from(format!(r#"{{"n":{ordinal},"pad":"{pad}"}}"#)),
+            ..parked(key, 0x10, ordinal, ParkStatus::Dead)
+        }
+    }
+
+    fn shown_ids(answer: &Answer) -> Vec<String> {
+        answer.body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn show_pages_by_envelope_bytes_and_withholds_an_event_too_large_to_show() {
+        let a = named("a");
+        let store = MemoryStateStore::new();
+        let third = PARKED_SHOW_BYTES / 3;
+        let huge = padded(a, 3, PARKED_SHOW_BYTES + (1 << 20));
+        let huge_bytes = huge.body.len();
+        seed(
+            &store,
+            &[
+                padded(a, 0, third),
+                padded(a, 1, third),
+                padded(a, 2, third),
+                huge,
+                parked(a, 0x10, 4, ParkStatus::Retrying),
+            ],
+        )
+        .await;
+        let counting = CountingStore::over(&store);
+        let fixture = Fixture::reading(counting.clone()).await;
+
+        let first = get(&fixture.admin, &format!("/parked/{a}")).await;
+        assert_eq!(first.status, 200);
+        assert_eq!(shown_ids(&first), [id_text(0x10, 0), id_text(0x10, 1)]);
+        assert_eq!(first.body["events"][1]["envelope"]["n"], 1);
+        assert_eq!(first.body["next"], id_text(0x10, 1));
+
+        let rest = get(
+            &fixture.admin,
+            &format!("/parked/{a}?after={}", id_text(0x10, 1)),
+        )
+        .await;
+        assert_eq!(rest.status, 200);
+        assert_eq!(
+            shown_ids(&rest),
+            [id_text(0x10, 2), id_text(0x10, 3), id_text(0x10, 4)]
+        );
+        assert_eq!(
+            rest.body["events"][1],
+            json!({"id": id_text(0x10, 3), "bytes": huge_bytes, "withheld": true})
+        );
+        assert_eq!(
+            rest.body["events"][2]["envelope"],
+            json!({"n": 4, "lsn": 16})
+        );
+        assert_eq!(rest.body["next"], Value::Null);
+
+        let loaded = counting.counts().loaded_bytes.clone();
+        assert_eq!(loaded.len(), 2);
+        for bytes in loaded {
+            assert!(
+                u64::try_from(bytes).unwrap() <= PARKED_SHOW_BYTES,
+                "one request loaded {bytes} envelope bytes"
+            );
+        }
+        fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_shows_share_the_inspection_budget() {
+        let keys = sorted_keys(6);
+        let store = MemoryStateStore::new();
+        for key in &keys {
+            seed(&store, &[parked(*key, 0x10, 0, ParkStatus::Dead)]).await;
+        }
+        let counting = CountingStore::over(&store);
+        {
+            let mut reads = counting.reads();
+            for key in &keys {
+                reads.delays.insert(*key, Duration::from_millis(100));
+            }
+        }
+        let fixture = Fixture::reading(counting.clone()).await;
+
+        let mut shows = tokio::task::JoinSet::new();
+        for key in &keys {
+            let admin = fixture.admin.clone();
+            let target = format!("/parked/{key}");
+            shows.spawn(async move { get(&admin, &target).await.status });
+        }
+        while let Some(status) = shows.join_next().await {
+            assert_eq!(status.unwrap(), 200);
+        }
+        assert_eq!(counting.reads().peak_running, PARKED_SHOW_CONCURRENCY);
         fixture.stop().await;
     }
 

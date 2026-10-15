@@ -6,8 +6,8 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use super::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore, StoreError,
-    SwapOutcome, Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StateStore,
+    StoreError, SwapOutcome, Version, Versioned,
 };
 use crate::event::EventId;
 use crate::lane::Stores;
@@ -111,6 +111,21 @@ impl StateStore for InstrumentedStateStore {
             StoreOperation::ReadParked,
             1,
             self.inner.read_parked(key, after, limit),
+        )
+        .await
+    }
+
+    async fn read_parked_within(
+        &self,
+        key: &OrderKeyId,
+        after: Option<&EventId>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<ParkedSlice, StoreError> {
+        timed(
+            StoreOperation::ReadParkedWithin,
+            1,
+            self.inner.read_parked_within(key, after, limit, max_bytes),
         )
         .await
     }
@@ -244,6 +259,17 @@ mod tests {
             self.call(self.inner.read_parked(key, after, limit)).await
         }
 
+        async fn read_parked_within(
+            &self,
+            key: &OrderKeyId,
+            after: Option<&EventId>,
+            limit: usize,
+            max_bytes: u64,
+        ) -> Result<ParkedSlice, StoreError> {
+            self.call(self.inner.read_parked_within(key, after, limit, max_bytes))
+                .await
+        }
+
         async fn set_parked_status(
             &self,
             key: &OrderKeyId,
@@ -336,6 +362,17 @@ mod tests {
         );
         let read = state.read_parked(&key, None, 10).await.unwrap();
         assert_eq!(read, plain.read_parked(&key, None, 10).await.unwrap());
+        let within = state
+            .read_parked_within(&key, None, 10, 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            within,
+            plain
+                .read_parked_within(&key, None, 10, 1 << 20)
+                .await
+                .unwrap()
+        );
         state
             .set_parked_status(&key, &id, ParkStatus::Dead)
             .await
@@ -365,6 +402,7 @@ mod tests {
                 "load_parked_heads",
                 "list_parked_queues",
                 "read_parked",
+                "read_parked_within",
                 "set_parked_status",
                 "remove_parked",
                 "read_leader",
@@ -374,11 +412,12 @@ mod tests {
         );
     }
 
-    const ALL_OPERATIONS: [StoreOperation; 9] = [
+    const ALL_OPERATIONS: [StoreOperation; 10] = [
         StoreOperation::AppendParked,
         StoreOperation::LoadParkedHeads,
         StoreOperation::ListParkedQueues,
         StoreOperation::ReadParked,
+        StoreOperation::ReadParkedWithin,
         StoreOperation::SetParkedStatus,
         StoreOperation::RemoveParked,
         StoreOperation::ReadLeader,
@@ -396,6 +435,10 @@ mod tests {
             state.load_parked_heads(key.partition()).await.is_ok(),
             state.list_parked_queues(None, 10, 10).await.is_ok(),
             state.read_parked(&key, None, 10).await.is_ok(),
+            state
+                .read_parked_within(&key, None, 10, 1 << 20)
+                .await
+                .is_ok(),
             state
                 .set_parked_status(&key, &id, ParkStatus::Dead)
                 .await
@@ -419,7 +462,7 @@ mod tests {
     async fn each_store_call_records_exactly_its_own_duration() {
         let seen = recording();
         let inner = Arc::new(Slow::default());
-        assert_eq!(call_each_operation(&inner).await, vec![true; 9]);
+        assert_eq!(call_each_operation(&inner).await, vec![true; 10]);
         assert_eq!(*seen.lock().unwrap(), timed_in_turn());
     }
 
@@ -430,7 +473,7 @@ mod tests {
             fail: true,
             ..Slow::default()
         });
-        assert_eq!(call_each_operation(&inner).await, vec![false; 9]);
+        assert_eq!(call_each_operation(&inner).await, vec![false; 10]);
         assert_eq!(*seen.lock().unwrap(), timed_in_turn());
     }
 }

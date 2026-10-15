@@ -217,8 +217,8 @@ mod tests {
     use crate::sink::{Outbound, Outcome, SinkCapabilities, SinkError};
     use crate::state::memory::MemoryStateStore;
     use crate::state::{
-        LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StoreError, SwapOutcome,
-        Version, Versioned,
+        LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StoreError,
+        SwapOutcome, Version, Versioned,
     };
     use crate::validate::Invalid;
     use async_trait::async_trait;
@@ -344,6 +344,18 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<ParkedEvent>, StoreError> {
             self.inner.read_parked(key, after, limit).await
+        }
+
+        async fn read_parked_within(
+            &self,
+            key: &OrderKeyId,
+            after: Option<&EventId>,
+            limit: usize,
+            max_bytes: u64,
+        ) -> Result<ParkedSlice, StoreError> {
+            self.inner
+                .read_parked_within(key, after, limit, max_bytes)
+                .await
         }
 
         async fn set_parked_status(

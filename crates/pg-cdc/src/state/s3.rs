@@ -13,9 +13,9 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 
 use super::{
-    LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues,
-    StateStore, StoreError, SwapOutcome, Version, Versioned, decode_leader, decode_parked,
-    encode_parked, parse_parked_name, store_root,
+    Admission, ByteBudget, LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEntry,
+    ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StateStore, StoreError, SwapOutcome,
+    Version, Versioned, decode_leader, decode_parked, encode_parked, parse_parked_name, store_root,
 };
 use crate::aws::aws_loader;
 use crate::event::EventId;
@@ -126,6 +126,7 @@ impl ReadAhead {
 
 struct Page {
     objects: Vec<String>,
+    sizes: Vec<u64>,
     prefixes: Vec<String>,
     next: Option<String>,
 }
@@ -322,11 +323,14 @@ impl S3StateStore {
             .send()
             .await
             .map_err(|error| unavailable(&error))?;
-        let objects = output
+        let (objects, sizes) = output
             .contents()
             .iter()
-            .filter_map(|object| object.key().map(str::to_owned))
-            .collect();
+            .filter_map(|object| {
+                let size = object.size().and_then(|size| u64::try_from(size).ok());
+                Some((object.key()?.to_owned(), size.unwrap_or(u64::MAX)))
+            })
+            .unzip();
         let prefixes = output
             .common_prefixes()
             .iter()
@@ -339,6 +343,7 @@ impl S3StateStore {
             .flatten();
         Ok(Page {
             objects,
+            sizes,
             prefixes,
             next,
         })
@@ -601,6 +606,69 @@ impl StateStore for S3StateStore {
             .collect();
         events.sort_unstable_by_key(|event| event.id);
         Ok(events)
+    }
+
+    async fn read_parked_within(
+        &self,
+        key: &OrderKeyId,
+        after: Option<&EventId>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<ParkedSlice, StoreError> {
+        let prefix = format!("{}{key}/", self.parked_prefix());
+        let mut start_after = after.map(|after| self.object(key, after));
+        let mut budget = ByteBudget::new(limit, max_bytes);
+        let mut planned: Vec<(EventId, Option<u64>)> = Vec::new();
+        let mut full = false;
+        'listing: while planned.len() < limit {
+            let page = self
+                .list_page(
+                    &prefix,
+                    None,
+                    start_after.take(),
+                    None,
+                    page_size(limit - planned.len()),
+                )
+                .await?;
+            for (object, bytes) in page.objects.iter().zip(&page.sizes) {
+                let Some((_, id)) = self.parse(object) else {
+                    continue;
+                };
+                match budget.admit(*bytes) {
+                    Admission::Load => planned.push((id, None)),
+                    Admission::Withhold => planned.push((id, Some(*bytes))),
+                    Admission::Full => {
+                        full = true;
+                        break 'listing;
+                    }
+                    Admission::Done => break 'listing,
+                }
+            }
+            match (page.next, page.objects.last()) {
+                (Some(_), Some(last)) => start_after = Some(last.clone()),
+                _ => break,
+            }
+        }
+        let loading = planned
+            .iter()
+            .filter(|(_, withheld)| withheld.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        let mut loaded: HashMap<EventId, ParkedEvent> = self
+            .read_events(*key, loading)
+            .await?
+            .into_iter()
+            .flatten()
+            .map(|event| (event.id, event))
+            .collect();
+        let entries = planned
+            .into_iter()
+            .filter_map(|(id, withheld)| match withheld {
+                Some(bytes) => Some(ParkedEntry::Withheld { id, bytes }),
+                None => loaded.remove(&id).map(ParkedEntry::Loaded),
+            })
+            .collect();
+        Ok(ParkedSlice { entries, full })
     }
 
     async fn set_parked_status(

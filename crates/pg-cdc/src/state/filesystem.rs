@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, oneshot};
 
 use super::{
-    LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues,
-    StateStore, StoreError, SwapOutcome, Version, Versioned, decode_parked, encode_parked,
+    Admission, ByteBudget, LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEntry,
+    ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StateStore, StoreError, SwapOutcome,
+    Version, Versioned, decode_parked, encode_parked,
 };
 use crate::event::EventId;
 use crate::order::OrderKeyId;
@@ -404,6 +405,50 @@ fn read(
     Ok(events)
 }
 
+fn read_within(
+    root: &Path,
+    key: OrderKeyId,
+    after: Option<EventId>,
+    limit: usize,
+    max_bytes: u64,
+    cancelled: Cancelled<'_>,
+) -> Result<ParkedSlice, StoreError> {
+    let dir = key_dir(root, &key);
+    let mut budget = ByteBudget::new(limit, max_bytes);
+    let mut slice = ParkedSlice::default();
+    for id in smallest_ids(&dir, after, limit, cancelled)? {
+        check(cancelled)?;
+        let path = dir.join(format!("{id}.json"));
+        let bytes = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(unavailable(&path, &error)),
+        };
+        match budget.admit(bytes) {
+            Admission::Load => {}
+            Admission::Withhold => {
+                slice.entries.push(ParkedEntry::Withheld { id, bytes });
+                continue;
+            }
+            Admission::Full => {
+                slice.full = true;
+                break;
+            }
+            Admission::Done => break,
+        }
+        let stored = match fs::read(&path) {
+            Ok(stored) => stored,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(unavailable(&path, &error)),
+        };
+        slice.entries.push(ParkedEntry::Loaded(decode_parked(
+            &super::parked_name(&key, &id),
+            &stored,
+        )?));
+    }
+    Ok(slice)
+}
+
 fn set_status(
     root: &Path,
     key: OrderKeyId,
@@ -551,6 +596,20 @@ impl StateStore for FilesystemStateStore {
         let (key, after) = (*key, after.copied());
         self.blocking(move |root, cancelled| read(root, key, after, limit, cancelled))
             .await
+    }
+
+    async fn read_parked_within(
+        &self,
+        key: &OrderKeyId,
+        after: Option<&EventId>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<ParkedSlice, StoreError> {
+        let (key, after) = (*key, after.copied());
+        self.blocking(move |root, cancelled| {
+            read_within(root, key, after, limit, max_bytes, cancelled)
+        })
+        .await
     }
 
     async fn set_parked_status(

@@ -468,6 +468,7 @@ pub trait StateStore: Send + Sync {
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError>;
     async fn list_parked_queues(&self, after: Option<&OrderKeyId>, limit: usize, length_cap: usize) -> Result<ParkedQueues, StoreError>;
     async fn read_parked(&self, key: &OrderKeyId, after: Option<&EventId>, limit: usize) -> Result<Vec<ParkedEvent>, StoreError>;
+    async fn read_parked_within(&self, key: &OrderKeyId, after: Option<&EventId>, limit: usize, max_bytes: u64) -> Result<ParkedSlice, StoreError>;
     async fn set_parked_status(&self, key: &OrderKeyId, id: &EventId, status: ParkStatus) -> Result<(), StoreError>;
     async fn remove_parked(&self, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError>;
     async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError>;
@@ -480,6 +481,7 @@ The types:
 - `ParkedEvent` holds the order key id, event id, status (`retrying` or `dead`), attempts, first failure time, last error and the encoded envelope.
 - `ParkedHead` holds the order key id, head event id and queue length.
 - `ParkedQueues` holds a page of `ParkedHead`s and `next`, the order key id to continue after when more queues may follow.
+- `ParkedSlice` holds entries, each a loaded `ParkedEvent` or a withheld event's id and stored size, and `full`, set when the read stopped before an event because loading it would pass `max_bytes`.
 - `LeaderRecord` holds the epoch, holder, state (`active` or `released`), confirmed LSN and update time.
 
 Contract, checked by a shared conformance suite that every adapter must pass:
@@ -493,6 +495,7 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 7. Concurrent calls are safe. pg-cdc bounds them with `state_store.max_concurrency` (default 256) and backs off on throttling.
 8. `append_parked` lands each order key's events in id order. If it fails or is cancelled, the events it stored for each key are a prefix of that key's events in the call, so a queue never has a gap below its head. An event that cannot be encoded fails the call before anything is written. The suite checks the encoding rule; each adapter's own tests check the prefix rule by injecting a fault in the middle of a key's events.
 9. `list_parked_queues` returns the queues whose order key id is above `after`, in ascending order key id order, at most `limit` of them, each with its lowest id as the head and its length capped at `length_cap`; a key with no events is not listed. Its work is bounded by the page, `limit` queues of at most `length_cap` events each, whatever other queues hold. Startup keeps using `load_parked_heads` (§10.6); `list_parked_queues` serves the admin API (§16.2).
+10. `read_parked_within` walks a queue's events above `after` in ascending id order, at most `limit` of them, and loads an event only while the stored sizes it has loaded stay within `max_bytes`. An event larger than `max_bytes` on its own is returned withheld, with its id and stored size, without loading it; the walk stops, with `full` set, before an event that would take the loaded total past `max_bytes`. It serves the admin API's queue inspection (§16.2), so inspecting large parked envelopes holds a bounded amount of memory.
 
 ### 11.4 S3 StateStore
 
@@ -500,6 +503,7 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 - **`load_parked_heads(p)`** lists the `parked/<pp>` prefix, where `pp` is the partition as two hex digits. The first object under each key is its head.
 - **`list_parked_queues`** lists the `parked/` prefix with delimiter `/` and `StartAfter` past `after`'s objects, so each key is one common prefix, then lists each returned key's prefix up to `length_cap` objects (one page when `length_cap` is at most 1,000), under the store's concurrency bound.
 - **`read_parked`** lists with `StartAfter`, then fetches each object.
+- **`read_parked_within`** takes each object's size from the same listing and fetches only the objects it loads.
 - **Read-ahead.** A read from the head of a queue (`after` empty, `limit` at most 1,000) lists one page of up to 1,000 ids, keeps them in memory and fetches only the first `limit`; the next reads from the head fetch the kept ids by name without listing, so draining a key costs one `ListObjectsV2` per 1,000 events instead of one per event. Successful removals drop their ids, and when a key's ids run out the next read lists again, which finds events appended since. The read-ahead never answers that a queue is empty: only a fresh listing does. If a kept id's object is gone, the key's ids are dropped and the read falls back to a fresh listing. An append below a kept id drops that key's ids. Every `swap_leader` call empties the read-ahead, so each leadership claim starts with nothing kept, and a listing that began before the claim is not kept. At most 100,000 ids are kept in all (about 2 MiB); filling past that drops other keys' ids. The read-ahead relies on the owning lane being the only writer of its keys' queues (§12), and on appends landing above a queue's stored ids (§11.3, item 8; §10.6).
 - **`remove_parked`** sends `DeleteObjects` in quiet mode, at most 1,000 objects per request, the requests in parallel under the concurrency bound. A missing object counts as deleted, as item 5 requires; any per-object error in the reply fails the whole call, and the lane retries it with backoff without sending the events again.
 - **A status change** rewrites the object; only the owning lane writes it.
@@ -513,6 +517,7 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 - **Append** writes a temp file, fsyncs it, then `link()`s it to the final name, which fails if that name exists and so gives create-only semantics. It then fsyncs the directory.
 - **The leader compare-and-swap** runs under an exclusive lock on `leader.lock`, with the version stored in the record.
 - **Single host only.** Active/standby across hosts needs S3, or the later Postgres store.
+- **Listings scan directories.** A directory has no order, so finding a queue's head reads all of its entries; listing and reads keep only the page they return in memory and stop at the next entry once cancelled.
 
 ### 11.6 PayloadStore
 
@@ -824,7 +829,7 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
 | `GET /readyz` | 200 only when active and streaming |
 | `GET /status` | Role, epoch, slot, confirmed LSN, in-flight counts, parked and dead counts, and time since the last status update |
 | `GET /parked` | Parked queues with head id, head status, attempts, first failure, length and last error, filterable by status, paged with `limit` (default 100, at most 1,000) and `after`; `length` is capped at 1,000 and `length_capped` marks a queue at least that long |
-| `GET /parked/{order_key_id}` | The events in one queue |
+| `GET /parked/{order_key_id}` | The events in one queue, paged with `limit` and `after` and at most 8 MiB of stored events per page; an event larger than that is listed with its id and size but not its envelope. At most two inspections load events at once |
 | `POST /parked/{order_key_id}/redrive` | Mark the dead head retrying again |
 | `POST /parked/{order_key_id}/discard?id=<event id>` | Remove the head, only if it still has that id |
 

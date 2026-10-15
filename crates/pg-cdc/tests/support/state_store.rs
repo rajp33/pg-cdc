@@ -6,8 +6,8 @@ use pg_cdc::event::EventId;
 use pg_cdc::order::OrderKeyId;
 use pg_cdc::sink::AttributeValue;
 use pg_cdc::state::{
-    LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore,
-    StoreError, SwapOutcome, Version, Versioned,
+    LeaderRecord, LeaderState, ParkStatus, ParkedEntry, ParkedEvent, ParkedHead, ParkedQueues,
+    ParkedSlice, StateStore, StoreError, SwapOutcome, Version, Versioned,
 };
 use pg_cdc_decoder::Lsn;
 
@@ -22,6 +22,7 @@ where
     empty_calls_succeed(store.as_ref()).await?;
     queues_list_in_key_order_from_a_cursor_with_capped_lengths(store.as_ref()).await?;
     reads_return_ascending_ids_and_respect_after_and_limit(store.as_ref()).await?;
+    bounded_reads_stop_at_the_byte_budget_and_withhold_what_never_fits(store.as_ref()).await?;
     appends_are_create_only(store.as_ref()).await?;
     an_append_with_a_malformed_event_is_all_or_nothing(store.as_ref()).await?;
     heads_are_the_lowest_id_per_queue_in_their_partition(store.as_ref()).await?;
@@ -170,6 +171,76 @@ async fn reads_return_ascending_ids_and_respect_after_and_limit(
         vec![]
     );
     assert_eq!(store.read_parked(&key(0x20, 2)?, None, 10).await?, vec![]);
+    Ok(())
+}
+
+async fn bounded_reads_stop_at_the_byte_budget_and_withhold_what_never_fits(
+    store: &dyn StateStore,
+) -> TestResult {
+    let queue = key(0x22, 1)?;
+    let sized = |ordinal: u32, pad: usize| ParkedEvent {
+        body: Bytes::from(format!(r#"{{"pad":"{}"}}"#, "x".repeat(pad))),
+        ..event(queue, id(9, ordinal), ParkStatus::Retrying)
+    };
+    let events = [
+        sized(0, 10_000),
+        sized(1, 10_000),
+        sized(2, 30_000),
+        sized(3, 10_000),
+        sized(4, 10_000),
+    ];
+    store.append_parked(&events).await?;
+    let [e0, e1, e2, e3, e4] = &events;
+    let budget = 25_000;
+    let loaded = |event: &ParkedEvent| ParkedEntry::Loaded(event.clone());
+    let withheld = |entry: Option<&ParkedEntry>| matches!(entry, Some(ParkedEntry::Withheld { id, bytes }) if *id == e2.id && *bytes >= 30_000);
+
+    let first = store.read_parked_within(&queue, None, 10, budget).await?;
+    assert_eq!(first.entries.len(), 3);
+    assert_eq!(first.entries.get(..2), Some(&[loaded(e0), loaded(e1)][..]));
+    assert!(withheld(first.entries.get(2)));
+    assert!(first.full);
+
+    let rest = store
+        .read_parked_within(&queue, Some(&e1.id), 10, budget)
+        .await?;
+    assert_eq!(rest.entries.len(), 3);
+    assert!(withheld(rest.entries.first()));
+    assert_eq!(rest.entries.get(1..), Some(&[loaded(e3), loaded(e4)][..]));
+    assert!(!rest.full);
+
+    let limited = store.read_parked_within(&queue, None, 2, budget).await?;
+    assert_eq!(
+        limited,
+        ParkedSlice {
+            entries: vec![loaded(e0), loaded(e1)],
+            full: false,
+        }
+    );
+    let one = store
+        .read_parked_within(&queue, Some(&e1.id), 1, budget)
+        .await?;
+    assert_eq!(one.entries.len(), 1);
+    assert!(withheld(one.entries.first()) && !one.full);
+    let ended = ParkedSlice::default();
+    assert_eq!(
+        store
+            .read_parked_within(&queue, Some(&e4.id), 10, budget)
+            .await?,
+        ended
+    );
+    assert_eq!(
+        store
+            .read_parked_within(&key(0x22, 2)?, None, 10, budget)
+            .await?,
+        ended
+    );
+    assert_eq!(
+        store.read_parked_within(&queue, None, 0, budget).await?,
+        ended
+    );
+    let all: Vec<_> = events.iter().map(|event| (queue, event.id)).collect();
+    store.remove_parked(&all).await?;
     Ok(())
 }
 

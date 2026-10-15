@@ -64,6 +64,70 @@ pub struct ParkedQueues {
     pub next: Option<OrderKeyId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParkedEntry {
+    Loaded(ParkedEvent),
+    Withheld { id: EventId, bytes: u64 },
+}
+
+impl ParkedEntry {
+    pub fn id(&self) -> EventId {
+        match self {
+            Self::Loaded(event) => event.id,
+            Self::Withheld { id, .. } => *id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParkedSlice {
+    pub entries: Vec<ParkedEntry>,
+    pub full: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    Load,
+    Withhold,
+    Full,
+    Done,
+}
+
+#[derive(Debug)]
+pub(crate) struct ByteBudget {
+    limit: usize,
+    max_bytes: u64,
+    taken: usize,
+    loaded: u64,
+}
+
+impl ByteBudget {
+    pub(crate) fn new(limit: usize, max_bytes: u64) -> Self {
+        Self {
+            limit,
+            max_bytes,
+            taken: 0,
+            loaded: 0,
+        }
+    }
+
+    pub(crate) fn admit(&mut self, bytes: u64) -> Admission {
+        if self.taken >= self.limit {
+            return Admission::Done;
+        }
+        if bytes > self.max_bytes {
+            self.taken += 1;
+            return Admission::Withhold;
+        }
+        if self.loaded.saturating_add(bytes) > self.max_bytes {
+            return Admission::Full;
+        }
+        self.taken += 1;
+        self.loaded += bytes;
+        Admission::Load
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeaderState {
@@ -122,6 +186,13 @@ pub trait StateStore: Send + Sync + fmt::Debug {
         after: Option<&EventId>,
         limit: usize,
     ) -> Result<Vec<ParkedEvent>, StoreError>;
+    async fn read_parked_within(
+        &self,
+        key: &OrderKeyId,
+        after: Option<&EventId>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<ParkedSlice, StoreError>;
     async fn set_parked_status(
         &self,
         key: &OrderKeyId,
@@ -417,6 +488,18 @@ mod tests {
         ] {
             assert_eq!(parse_parked_name(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_byte_budget_loads_until_full_and_withholds_what_never_fits() {
+        let mut budget = ByteBudget::new(4, 10);
+        assert_eq!(budget.admit(4), Admission::Load);
+        assert_eq!(budget.admit(11), Admission::Withhold);
+        assert_eq!(budget.admit(6), Admission::Load);
+        assert_eq!(budget.admit(1), Admission::Full);
+        assert_eq!(budget.admit(0), Admission::Load);
+        assert_eq!(budget.admit(0), Admission::Done);
+        assert_eq!(ByteBudget::new(0, 10).admit(0), Admission::Done);
     }
 
     #[test]

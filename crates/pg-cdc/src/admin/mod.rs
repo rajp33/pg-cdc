@@ -14,6 +14,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 pub use client::{ClientError, PARKED_TIMEOUT, Reply, check_health, health_target, request};
 
@@ -30,6 +31,8 @@ pub const PARKED_LIMIT_MAX: usize = 1000;
 pub const PARKED_SCAN_LIMIT: usize = 1000;
 pub const PARKED_LENGTH_CAP: usize = 1000;
 pub const HEAD_READ_CONCURRENCY: usize = 16;
+pub const PARKED_SHOW_BYTES: u64 = 8 << 20;
+pub const PARKED_SHOW_CONCURRENCY: usize = 2;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,7 @@ pub struct Admin {
     status: Status,
     identity: Arc<Identity>,
     store: Arc<OnceLock<Arc<dyn StateStore>>>,
+    inspections: Arc<Semaphore>,
 }
 
 impl Admin {
@@ -54,6 +58,7 @@ impl Admin {
             status,
             identity: Arc::new(identity),
             store: Arc::new(OnceLock::new()),
+            inspections: Arc::new(Semaphore::new(PARKED_SHOW_CONCURRENCY)),
         }
     }
 

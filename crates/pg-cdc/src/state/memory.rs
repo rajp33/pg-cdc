@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 
 use super::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore, StoreError,
-    SwapOutcome, Version, Versioned,
+    Admission, ByteBudget, LeaderRecord, ParkStatus, ParkedEntry, ParkedEvent, ParkedHead,
+    ParkedQueues, ParkedSlice, StateStore, StoreError, SwapOutcome, Version, Versioned,
 };
 use crate::event::EventId;
 use crate::order::OrderKeyId;
@@ -118,6 +118,35 @@ impl StateStore for MemoryStateStore {
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    async fn read_parked_within(
+        &self,
+        key: &OrderKeyId,
+        after: Option<&EventId>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<ParkedSlice, StoreError> {
+        let inner = self.lock()?;
+        let mut slice = ParkedSlice::default();
+        let Some(queue) = inner.parked.get(key) else {
+            return Ok(slice);
+        };
+        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut budget = ByteBudget::new(limit, max_bytes);
+        for (id, event) in queue.range((lower, Bound::Unbounded)) {
+            let bytes = u64::try_from(event.body.len()).unwrap_or(u64::MAX);
+            match budget.admit(bytes) {
+                Admission::Load => slice.entries.push(ParkedEntry::Loaded(event.clone())),
+                Admission::Withhold => slice.entries.push(ParkedEntry::Withheld { id: *id, bytes }),
+                Admission::Full => {
+                    slice.full = true;
+                    break;
+                }
+                Admission::Done => break,
+            }
+        }
+        Ok(slice)
     }
 
     async fn set_parked_status(

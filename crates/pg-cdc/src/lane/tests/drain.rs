@@ -82,6 +82,19 @@ impl StateStore for ModelS3 {
         Ok(events)
     }
 
+    async fn read_parked_within(
+        &self,
+        key: &OrderKeyId,
+        after: Option<&EventId>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<ParkedSlice, StoreError> {
+        self.requests(1).await;
+        self.inner
+            .read_parked_within(key, after, limit, max_bytes)
+            .await
+    }
+
     async fn set_parked_status(
         &self,
         key: &OrderKeyId,

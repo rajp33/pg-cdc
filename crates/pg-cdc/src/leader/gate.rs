@@ -12,8 +12,8 @@ use crate::order::OrderKeyId;
 use crate::payload::{PayloadRef, PayloadStore};
 use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 use crate::state::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore, StoreError,
-    SwapOutcome, Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StateStore,
+    StoreError, SwapOutcome, Version, Versioned,
 };
 
 pub const FENCED: &str = "sink and store writes are fenced";
@@ -226,6 +226,20 @@ impl StateStore for GatedStateStore {
         )
     }
 
+    async fn read_parked_within(
+        &self,
+        key: &OrderKeyId,
+        after: Option<&EventId>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<ParkedSlice, StoreError> {
+        or_unavailable(
+            self.gate
+                .read(self.inner.read_parked_within(key, after, limit, max_bytes))
+                .await,
+        )
+    }
+
     async fn set_parked_status(
         &self,
         key: &OrderKeyId,
@@ -311,7 +325,7 @@ mod tests {
     use tokio::time::{Instant, advance, sleep, timeout};
 
     use super::*;
-    use crate::state::LeaderState;
+    use crate::state::{LeaderState, ParkedEntry};
 
     const LIMITS: SinkCapabilities = SinkCapabilities {
         max_batch_messages: 7,
@@ -449,6 +463,20 @@ mod tests {
         ) -> Result<Vec<ParkedEvent>, StoreError> {
             self.run("read_parked").await;
             Ok(vec![parked_event()])
+        }
+
+        async fn read_parked_within(
+            &self,
+            _key: &OrderKeyId,
+            _after: Option<&EventId>,
+            _limit: usize,
+            _max_bytes: u64,
+        ) -> Result<ParkedSlice, StoreError> {
+            self.run("read_parked_within").await;
+            Ok(ParkedSlice {
+                entries: vec![ParkedEntry::Loaded(parked_event())],
+                full: true,
+            })
         }
 
         async fn set_parked_status(
@@ -808,6 +836,10 @@ mod tests {
             Err(unavailable_error())
         );
         assert_eq!(
+            state.read_parked_within(&key(), None, 1, 10).await,
+            Err(unavailable_error())
+        );
+        assert_eq!(
             state
                 .set_parked_status(&key(), &id(), ParkStatus::Dead)
                 .await,
@@ -852,6 +884,13 @@ mod tests {
             Ok(vec![parked_event()])
         );
         assert_eq!(
+            state.read_parked_within(&key(), None, 1, 10).await,
+            Ok(ParkedSlice {
+                entries: vec![ParkedEntry::Loaded(parked_event())],
+                full: true,
+            })
+        );
+        assert_eq!(
             state
                 .set_parked_status(&key(), &id(), ParkStatus::Dead)
                 .await,
@@ -874,6 +913,7 @@ mod tests {
                 "list_parked_queues",
                 "read_leader",
                 "read_parked",
+                "read_parked_within",
                 "set_parked_status",
                 "swap_leader"
             ]
