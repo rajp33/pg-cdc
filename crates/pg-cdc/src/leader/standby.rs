@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-use crate::leader::POLL_INTERVAL;
+use crate::leader::{POLL_INTERVAL, unless_cancelled};
 
 pub const OBJECT_IN_USE: &str = "55006";
 
@@ -66,10 +66,7 @@ where
 {
     let mut announced = false;
     loop {
-        if shutdown.is_cancelled() {
-            return Ok(None);
-        }
-        let Some(answer) = shutdown.run_until_cancelled(probe.holder()).await else {
+        let Some(answer) = unless_cancelled(shutdown, probe.holder()).await else {
             return Ok(None);
         };
         match answer.map_err(AcquireError::Probe)? {
@@ -82,12 +79,13 @@ where
                     tracing::info!(holder_pid, "waiting as standby");
                 }
             }
-            SlotHolder::Free => match start().await {
-                Ok(value) => return Ok(Some(value)),
-                Err(StartError::InUse) => {
+            SlotHolder::Free => match unless_cancelled(shutdown, start()).await {
+                None => return Ok(None),
+                Some(Ok(value)) => return Ok(Some(value)),
+                Some(Err(StartError::InUse)) => {
                     tracing::info!("another task took the slot first; waiting as standby");
                 }
-                Err(StartError::Failed(error)) => return Err(AcquireError::Start(error)),
+                Some(Err(StartError::Failed(error))) => return Err(AcquireError::Start(error)),
             },
         }
         if !pause(shutdown).await {
@@ -102,7 +100,7 @@ mod tests {
     use std::future::{Ready, ready};
     use std::sync::Mutex;
 
-    use tokio::time::{Duration, Instant, sleep};
+    use tokio::time::{Duration, Instant, sleep, timeout};
 
     use super::*;
 
@@ -335,5 +333,35 @@ mod tests {
         assert!(matches!(acquired, Ok(None)));
         assert_eq!(origin.elapsed(), Duration::from_secs(1));
         assert_eq!(start.calls(), secs(&[0]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_while_a_start_is_pending_returns_none() {
+        let origin = Instant::now();
+        let probe = ScriptedProbe::new(origin, vec![Ok(SlotHolder::Free)]);
+        let starts = Mutex::new(Vec::new());
+        let start = || {
+            starts.lock().unwrap().push(origin.elapsed());
+            std::future::pending::<Result<&'static str, StartError<&'static str>>>()
+        };
+        let shutdown = CancellationToken::new();
+        let canceller = {
+            let shutdown = shutdown.clone();
+            async move {
+                sleep(Duration::from_secs(3)).await;
+                shutdown.cancel();
+            }
+        };
+
+        let (acquired, ()) = timeout(Duration::from_secs(60), async {
+            tokio::join!(acquire(&probe, start, &shutdown), canceller)
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(acquired, Ok(None)));
+        assert_eq!(origin.elapsed(), Duration::from_secs(3));
+        assert_eq!(*starts.lock().unwrap(), secs(&[0]));
+        assert_eq!(probe.calls(), secs(&[0]));
     }
 }
