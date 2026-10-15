@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::rig::{self, Bench, ConfigSpec, SinkSpec, StoreSpec};
 use super::{LoadOptions, Verdict, write_report};
-use crate::chaos::evidence::{Observations, read_stored};
+use crate::chaos::evidence::{Observations, message_groups, read_stored};
 use crate::chaos::outstanding;
 use crate::checker::{self, Evidence};
 use crate::cluster::PgCdc;
@@ -281,7 +281,8 @@ async fn prepare<'a>(bench: &'a Bench, options: &'a LoadOptions) -> anyhow::Resu
     let tap = Tap::new({
         let deliveries = Arc::clone(&deliveries);
         move |form, response| deliveries.record(form, response)
-    });
+    })
+    .ordered_by(message_groups);
     let sns_proxy = FaultProxy::start_with_tap(upstream, Upstream::Sns, 1, Some(tap)).await?;
     let mut spawner = Spawner {
         bench,

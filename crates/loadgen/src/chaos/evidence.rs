@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
@@ -96,31 +96,51 @@ fn successful_ids(response: &[u8]) -> HashSet<String> {
         .collect()
 }
 
-pub fn accepted_messages(form: &[u8], response: &[u8]) -> Vec<Published> {
+#[derive(Debug, Default)]
+struct Form {
+    action: Option<String>,
+    single: Entry,
+    batch: BTreeMap<u32, Entry>,
+}
+
+fn parse_form(form: &[u8]) -> Form {
     let text = String::from_utf8_lossy(form);
-    let mut action = None;
-    let mut single = Entry::default();
-    let mut batch: BTreeMap<u32, Entry> = BTreeMap::new();
+    let mut parsed = Form::default();
     for (name, value) in text.split('&').filter_map(|pair| pair.split_once('=')) {
         let value = percent_decode(value);
         if name == "Action" {
-            action = Some(value);
+            parsed.action = Some(value);
         } else if let Some((member, field)) = name
             .strip_prefix(BATCH_MEMBER)
             .and_then(|rest| rest.split_once('.'))
         {
             if let Ok(member) = member.parse() {
-                batch.entry(member).or_default().set(field, value);
+                parsed.batch.entry(member).or_default().set(field, value);
             }
         } else {
-            single.set(name, value);
+            parsed.single.set(name, value);
         }
     }
-    match action.as_deref() {
-        Some("Publish") => single.published().into_iter().collect(),
+    parsed
+}
+
+pub fn message_groups(form: &[u8]) -> Vec<String> {
+    let parsed = parse_form(form);
+    let groups: BTreeSet<String> = std::iter::once(parsed.single)
+        .chain(parsed.batch.into_values())
+        .filter_map(|entry| entry.group)
+        .collect();
+    groups.into_iter().collect()
+}
+
+pub fn accepted_messages(form: &[u8], response: &[u8]) -> Vec<Published> {
+    let parsed = parse_form(form);
+    match parsed.action.as_deref() {
+        Some("Publish") => parsed.single.published().into_iter().collect(),
         Some("PublishBatch") => {
             let successful = successful_ids(response);
-            batch
+            parsed
+                .batch
                 .into_values()
                 .filter(|entry| entry.id.as_ref().is_some_and(|id| successful.contains(id)))
                 .filter_map(Entry::published)
@@ -348,6 +368,24 @@ mod tests {
             Vec::<Published>::new()
         );
         assert_eq!(accepted_messages(b"", OK), Vec::<Published>::new());
+    }
+
+    #[test]
+    fn a_publish_is_ordered_by_every_message_group_it_carries() {
+        let batch = b"Action=PublishBatch&PublishBatchRequestEntries.member.1.Id=0&PublishBatchRequestEntries.member.1.Message=one&PublishBatchRequestEntries.member.1.MessageGroupId=g2&PublishBatchRequestEntries.member.2.Id=1&PublishBatchRequestEntries.member.2.Message=two&PublishBatchRequestEntries.member.2.MessageGroupId=g1&PublishBatchRequestEntries.member.3.Id=2&PublishBatchRequestEntries.member.3.Message=three&PublishBatchRequestEntries.member.3.MessageGroupId=g2";
+        assert_eq!(message_groups(batch), ["g1", "g2"]);
+        assert_eq!(
+            message_groups(b"Action=Publish&Message=m&MessageGroupId=k%2F1"),
+            ["k/1"]
+        );
+        assert_eq!(
+            message_groups(b"Action=Publish&Message=m"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            message_groups(b"Action=GetTopicAttributes&TopicArn=t"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

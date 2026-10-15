@@ -8,7 +8,7 @@ use pg_cdc_testkit::{AwsEmulator, Postgres};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 
-use super::evidence::{Observations, read_stored};
+use super::evidence::{Observations, message_groups, read_stored};
 use super::fleet::{Fleet, Seen, artifact_path};
 use super::operator::Operator;
 use super::{
@@ -165,7 +165,8 @@ impl Harness {
             move |request, response| {
                 observations.record_publish(request, response);
             }
-        });
+        })
+        .ordered_by(message_groups);
         let sns_proxy = FaultProxy::start_with_tap(
             upstream,
             Upstream::Sns,

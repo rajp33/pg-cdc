@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,7 +15,7 @@ use hyper::{Method, Request, Response, StatusCode, client, server};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedMutexGuard, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 const ACCEPT_RETRY: Duration = Duration::from_millis(10);
@@ -22,13 +23,41 @@ const S3_ERROR_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Error><Cod
 const SNS_ERROR_BODY: &str = "<ErrorResponse><Error><Type>Receiver</Type><Code>InternalFailure</Code><Message>chaos</Message></Error></ErrorResponse>";
 
 type TapFn = dyn Fn(&[u8], &[u8]) + Send + Sync;
+type OrderGroups = fn(&[u8]) -> Vec<String>;
 
 #[derive(Clone)]
-pub struct Tap(Arc<TapFn>);
+pub struct Tap {
+    record: Arc<TapFn>,
+    groups: Option<OrderGroups>,
+}
 
 impl Tap {
     pub fn new(tap: impl Fn(&[u8], &[u8]) + Send + Sync + 'static) -> Self {
-        Self(Arc::new(tap))
+        Self {
+            record: Arc::new(tap),
+            groups: None,
+        }
+    }
+
+    #[must_use]
+    pub fn ordered_by(self, groups: OrderGroups) -> Self {
+        Self {
+            groups: Some(groups),
+            ..self
+        }
+    }
+
+    fn groups(&self, request: &[u8]) -> Vec<String> {
+        let mut groups = self
+            .groups
+            .map(|groups| groups(request))
+            .unwrap_or_default();
+        groups.sort_unstable();
+        groups.dedup();
+        if groups.is_empty() {
+            groups.push(String::new());
+        }
+        groups
     }
 }
 
@@ -109,7 +138,7 @@ impl FaultProxy {
             rng: Mutex::new(fastrand::Rng::with_seed(seed)),
             counters: Counters::default(),
             tap,
-            turn: Semaphore::new(1),
+            turns: Mutex::default(),
         });
         let server = tokio::spawn(accept_loop(listener, Arc::clone(&shared)));
         Ok(Self {
@@ -147,7 +176,7 @@ struct Shared {
     rng: Mutex<fastrand::Rng>,
     counters: Counters,
     tap: Option<Tap>,
-    turn: Semaphore,
+    turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Shared {
@@ -238,9 +267,9 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
     if let Mode::Brownout(latency) = faults.mode {
         tokio::time::sleep(latency).await;
     }
-    let _turn = match shared.tap {
-        Some(_) => Some(shared.turn.acquire().await.map_err(|_| Dropped)?),
-        None => None,
+    let _turns = match &shared.tap {
+        Some(tap) => take_turns(&shared, &tap.groups(&body)).await,
+        None => Vec::new(),
     };
     let Ok((reply, reply_body)) = forward(&shared, parts, body.clone()).await else {
         return Ok(bad_gateway());
@@ -252,13 +281,28 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
     if let Some(tap) = &shared.tap
         && reply.status().is_success()
     {
-        (tap.0)(&body, &reply_body);
+        (tap.record)(&body, &reply_body);
     }
     if shared.draw(faults.error_after_forward_rate) {
         Ok(injected_error(&shared))
     } else {
         Ok(reply)
     }
+}
+
+async fn take_turns(shared: &Shared, groups: &[String]) -> Vec<OwnedMutexGuard<()>> {
+    let locks: Vec<_> = {
+        let mut turns = shared.turns.lock().unwrap_or_else(PoisonError::into_inner);
+        groups
+            .iter()
+            .map(|group| Arc::clone(turns.entry(group.clone()).or_default()))
+            .collect()
+    };
+    let mut guards = Vec::with_capacity(locks.len());
+    for lock in locks {
+        guards.push(lock.lock_owned().await);
+    }
+    guards
 }
 
 fn record_request(shared: &Shared, parts: &request::Parts, body: &Bytes) {
@@ -566,7 +610,7 @@ mod tests {
                             let body = request.into_body().collect().await.unwrap().to_bytes();
                             let body = String::from_utf8(body.to_vec()).unwrap();
                             recorded.lock().unwrap().push(body.clone());
-                            if body == "slow" {
+                            if body.ends_with("slow") {
                                 tokio::time::sleep(Duration::from_millis(300)).await;
                             }
                             Ok::<_, std::convert::Infallible>(Response::new(Full::new(
@@ -607,6 +651,53 @@ mod tests {
         let arrived = arrived.lock().unwrap().clone();
         assert_eq!(arrived, ["slow", "fast"]);
         assert_eq!(*tapped.lock().unwrap(), arrived);
+    }
+
+    fn group_of(request: &[u8]) -> Vec<String> {
+        let body = String::from_utf8(request.to_vec()).unwrap();
+        body.split_once(':')
+            .map(|(group, _)| vec![group.to_owned()])
+            .unwrap_or_default()
+    }
+
+    async fn grouped_proxy(upstream: SocketAddr) -> (FaultProxy, Arc<Mutex<Vec<String>>>) {
+        let tapped: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&tapped);
+        let tap = Tap::new(move |request, _| {
+            sink.lock()
+                .unwrap()
+                .push(String::from_utf8(request.to_vec()).unwrap());
+        })
+        .ordered_by(group_of);
+        let proxy = FaultProxy::start_with_tap(upstream, Upstream::Sns, 1, Some(tap))
+            .await
+            .unwrap();
+        (proxy, tapped)
+    }
+
+    async fn slow_then_fast(proxy: &FaultProxy, slow: &'static str, fast: &'static str) {
+        let (slow, fast) = tokio::join!(call(proxy, Method::POST, "/", slow), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            call(proxy, Method::POST, "/", fast).await
+        });
+        assert_eq!(slow.unwrap().0, 200);
+        assert_eq!(fast.unwrap().0, 200);
+    }
+
+    #[tokio::test]
+    async fn only_requests_sharing_an_order_group_wait_for_each_other() {
+        let (upstream_addr, arrived) = slow_first_upstream().await;
+        let (proxy, tapped) = grouped_proxy(upstream_addr).await;
+
+        slow_then_fast(&proxy, "a:slow", "a:fast").await;
+        assert_eq!(*arrived.lock().unwrap(), ["a:slow", "a:fast"]);
+        assert_eq!(*tapped.lock().unwrap(), ["a:slow", "a:fast"]);
+
+        arrived.lock().unwrap().clear();
+        tapped.lock().unwrap().clear();
+        slow_then_fast(&proxy, "a:slow", "b:fast").await;
+        assert_eq!(*arrived.lock().unwrap(), ["a:slow", "b:fast"]);
+        assert_eq!(*tapped.lock().unwrap(), ["b:fast", "a:slow"]);
     }
 
     #[tokio::test]
