@@ -187,7 +187,8 @@ impl Lane {
             return;
         }
         self.append_due = None;
-        let appended = self.store.append_parked(&events).await;
+        let store = Arc::clone(&self.store);
+        let appended = self.publishing(store.append_parked(&events)).await;
         if let Err(error) = &appended {
             self.store_failed("append", error);
             self.to_append.extend(keys);
@@ -236,7 +237,7 @@ impl Lane {
         }
         let mut answered = HashSet::new();
         let mut failure = None;
-        while let Some(joined) = reads.join_next().await {
+        while let Some(joined) = self.publishing(reads.join_next()).await {
             let Ok((key, read)) = joined else {
                 continue;
             };
@@ -339,7 +340,8 @@ impl Lane {
 
     async fn flush_removes(&mut self) {
         let removals = std::mem::take(&mut self.to_remove);
-        if let Err(error) = self.store.remove_parked(&removals).await {
+        let store = Arc::clone(&self.store);
+        if let Err(error) = self.publishing(store.remove_parked(&removals)).await {
             self.store_failed("remove", &error);
             self.to_remove = removals;
             return;
@@ -367,10 +369,10 @@ impl Lane {
     }
 
     async fn flush_kills(&mut self) {
+        let store = Arc::clone(&self.store);
         while let Some((key, id)) = self.to_kill.pop() {
             if let Err(error) = self
-                .store
-                .set_parked_status(&key, &id, ParkStatus::Dead)
+                .publishing(store.set_parked_status(&key, &id, ParkStatus::Dead))
                 .await
             {
                 self.store_failed("mark dead", &error);

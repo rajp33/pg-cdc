@@ -15,7 +15,7 @@ impl Lane {
         let (Some(payload), Some(head)) = (self.payload.clone(), self.original(&key)) else {
             return;
         };
-        let reference = match payload.put(&head.id, &head.body).await {
+        let reference = match self.publishing(payload.put(&head.id, &head.body)).await {
             Ok(reference) => reference,
             Err(error) => {
                 let error = SinkError(format!("cannot store the oversize payload: {error}"));

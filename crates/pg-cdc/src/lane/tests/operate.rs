@@ -326,21 +326,6 @@ async fn a_discard_leaves_no_stale_retry_to_ready_the_key_twice() {
     assert_eq!(delivered, (1..=60).collect::<Vec<u32>>());
 }
 
-fn three_keys_in_one_partition() -> Vec<Vec<u8>> {
-    let mut by_partition: HashMap<u8, Vec<Vec<u8>>> = HashMap::new();
-    for number in 0..4000 {
-        let key = format!("key-{number}").into_bytes();
-        let keys = by_partition
-            .entry(OrderKeyId::of(&key).partition())
-            .or_default();
-        keys.push(key);
-        if keys.len() == 3 {
-            return keys.clone();
-        }
-    }
-    panic!("no three keys share a partition");
-}
-
 #[tokio::test(start_paused = true)]
 async fn a_discard_takes_the_key_out_of_the_ready_queue() {
     let limits = SinkCapabilities {

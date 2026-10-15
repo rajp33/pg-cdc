@@ -141,6 +141,8 @@ struct TestStore {
     release: Notify,
     load_delay: Duration,
     append_delay: Duration,
+    status_delay: Duration,
+    remove_delay: Duration,
     loads: AtomicUsize,
     loading: AtomicUsize,
     peak_loading: AtomicUsize,
@@ -291,6 +293,7 @@ impl StateStore for TestStore {
         status: ParkStatus,
     ) -> Result<(), StoreError> {
         self.status_changes.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.status_delay).await;
         if take_failure(&self.fail_status_changes) {
             return Err(outage());
         }
@@ -299,6 +302,7 @@ impl StateStore for TestStore {
     }
 
     async fn remove_parked(&self, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError> {
+        tokio::time::sleep(self.remove_delay).await;
         if take_failure(&self.fail_removes) {
             return Err(outage());
         }
@@ -513,6 +517,21 @@ impl Harness {
             .await
             .is_err()
     }
+}
+
+fn three_keys_in_one_partition() -> Vec<Vec<u8>> {
+    let mut by_partition: HashMap<u8, Vec<Vec<u8>>> = HashMap::new();
+    for number in 0..4000 {
+        let key = format!("key-{number}").into_bytes();
+        let keys = by_partition
+            .entry(OrderKeyId::of(&key).partition())
+            .or_default();
+        keys.push(key);
+        if keys.len() == 3 {
+            return keys.clone();
+        }
+    }
+    panic!("no three keys share a partition");
 }
 
 fn key_in_lane(lane: usize, lanes: usize, skip: usize) -> Vec<u8> {

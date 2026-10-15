@@ -10,6 +10,7 @@ mod tests;
 use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -356,6 +357,21 @@ impl Lane {
         self.stats_dirty.then_some(self.stats_due).flatten()
     }
 
+    async fn publishing<F: Future>(&mut self, io: F) -> F::Output {
+        let mut io = pin!(io);
+        loop {
+            self.publish_stats(Instant::now());
+            let Some(due) = self.stats_wake() else {
+                return io.await;
+            };
+            tokio::select! {
+                biased;
+                output = &mut io => return output,
+                () = tokio::time::sleep_until(due) => {}
+            }
+        }
+    }
+
     fn accept(&mut self, inbound: Inbound) -> bool {
         match inbound {
             Inbound::Event(pending) => self.accept_event(pending),
@@ -526,10 +542,15 @@ impl Lane {
                 keys.push(key);
             }
         }
-        let outcomes = match self.permits.acquire().await {
-            Ok(_permit) => self.sink.send(&batch).await,
-            Err(_) => Vec::new(),
-        };
+        let (permits, sink) = (Arc::clone(&self.permits), Arc::clone(&self.sink));
+        let outcomes = self
+            .publishing(async {
+                match permits.acquire().await {
+                    Ok(_permit) => sink.send(&batch).await,
+                    Err(_) => Vec::new(),
+                }
+            })
+            .await;
         if outcomes.len() != batch.len() {
             tracing::error!(
                 sent = batch.len(),

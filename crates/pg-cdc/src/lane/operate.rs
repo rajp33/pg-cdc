@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use tokio::sync::{mpsc, oneshot};
@@ -112,8 +113,8 @@ impl Lane {
         if !stored.dead {
             return Err(OperateError::NotDead { key, head });
         }
-        self.store
-            .set_parked_status(&key, &head, ParkStatus::Retrying)
+        let store = Arc::clone(&self.store);
+        self.publishing(store.set_parked_status(&key, &head, ParkStatus::Retrying))
             .await?;
         if let Some(state) = self.keys.get_mut(&key) {
             if let Some(stored) = state.stored.as_mut() {
@@ -146,7 +147,8 @@ impl Lane {
         if stored.dead_on_append || still_queued {
             return Err(OperateError::Parking { key });
         }
-        self.store.remove_parked(&[(key, id)]).await?;
+        let store = Arc::clone(&self.store);
+        self.publishing(store.remove_parked(&[(key, id)])).await?;
         let _ = self
             .parked
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |parked| {
