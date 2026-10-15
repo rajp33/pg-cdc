@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pg_cdc::config::DEFAULT_MAX_PARKED_EVENTS;
+use pg_cdc::config::{DEFAULT_MAX_PARKED_EVENTS, LeadershipConfig};
 use pg_cdc::health::{Health, Role};
 use pg_cdc::leader::lease::FenceReason;
 use pg_cdc::leader::record::TakeoverError;
 use pg_cdc::order::{OrderBy, OrderKeyId};
-use pg_cdc::session::{SessionConfig, SessionError};
+use pg_cdc::session::{HANDOVER_TAIL, SessionConfig, SessionError};
 use pg_cdc::state::memory::MemoryStateStore;
 use pg_cdc::state::{LeaderRecord, LeaderState, StateStore, SwapOutcome, Versioned, now_ms};
 use pg_cdc::validate::Invalid;
@@ -21,6 +21,17 @@ const FAST: Duration = Duration::from_millis(200);
 const BUFFER: usize = 64;
 const TWO_POLLS: Duration = Duration::from_millis(4500);
 const TAKEOVER: Duration = Duration::from_secs(4);
+const TAKEOVER_AFTER_HANDOVER: Duration = Duration::from_secs(3);
+const HANDOVER_DRAIN: Duration = Duration::from_secs(1);
+
+fn handover() -> SessionConfig {
+    let mut config = support::config(FAST, BUFFER);
+    config.leadership = LeadershipConfig {
+        drain_timeout: HANDOVER_DRAIN,
+        ..support::TEST_LEADERSHIP
+    };
+    config
+}
 
 async fn orders(pg: &Postgres) -> TestResult {
     support::prepare(
@@ -127,14 +138,20 @@ async fn l3_a_standby_never_writes_while_another_session_holds_the_slot() -> Tes
     assert_eq!(snapshot.role, Role::Standby);
 
     a.stop().await?;
-    active(&health, TAKEOVER).await?;
+    let stopped = Instant::now();
     pg.execute("INSERT INTO orders VALUES (4, 'b')").await?;
+    active(&health, TAKEOVER).await?;
     loop {
         let event = b.next_event().await?;
         if event["after"]["id"] == 4 {
             break;
         }
     }
+    assert!(
+        stopped.elapsed() < TAKEOVER_AFTER_HANDOVER,
+        "{:?}",
+        stopped.elapsed()
+    );
     let record = leader(&shared).await?.value;
     assert_eq!(record.epoch, 2);
     assert_eq!(record.holder, "holder-b");
@@ -629,4 +646,190 @@ async fn l1_a_session_stuck_in_a_catalog_lookup_fences_and_frees_the_slot() -> T
     assert_eq!(record.epoch, 2);
     assert_eq!(record.holder, "holder-b");
     b.stop().await
+}
+
+#[tokio::test]
+async fn a_clean_handover_releases_the_record_at_the_confirmed_lsn() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let shared = memory();
+    let mut a = support::spawn_in_context(
+        support::params(&pg),
+        handover(),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    for id in 1..=3 {
+        pg.execute(&format!("INSERT INTO orders VALUES ({id}, 'a')"))
+            .await?;
+    }
+    a.next_events(3).await?;
+
+    a.request_stop();
+    let (result, _) = a
+        .finished_with_output(HANDOVER_DRAIN * 2 + HANDOVER_TAIL)
+        .await?;
+
+    assert!(result.is_ok(), "{result:?}");
+    let slot = pg.slot_state(SLOT).await?.ok_or("the slot disappeared")?;
+    let record = leader(&shared).await?.value;
+    assert_eq!((record.epoch, record.state), (1, LeaderState::Released));
+    assert_eq!(record.holder, "holder-a");
+    assert_eq!(
+        Some(record.confirmed_lsn.0),
+        slot.confirmed_flush_lsn,
+        "{record:?} {slot:?}"
+    );
+
+    let started = Instant::now();
+    let mut b = support::spawn_in_context(
+        support::params(&pg),
+        handover(),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-b"),
+    );
+    pg.execute("INSERT INTO orders VALUES (4, 'b')").await?;
+    let event = tokio::time::timeout(TAKEOVER_AFTER_HANDOVER, b.next_event()).await??;
+    assert_eq!(event["after"]["id"], 4);
+    assert!(
+        started.elapsed() < support::TEST_LEADERSHIP.fence_delay,
+        "{:?}",
+        started.elapsed()
+    );
+    let record = leader(&shared).await?.value;
+    assert_eq!(record.epoch, 2);
+    assert_eq!(record.holder, "holder-b");
+    assert_eq!(record.state, LeaderState::Active);
+    b.stop().await
+}
+
+#[tokio::test]
+async fn a_handover_with_a_stuck_sink_keeps_the_record_active_and_ends_within_the_budget()
+-> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let shared = memory();
+    let mut a = support::spawn_in_context(
+        support::params(&pg),
+        handover(),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    a.set_mode(Mode::Hold);
+    active(&a.health(), WAIT).await?;
+    pg.execute("INSERT INTO orders VALUES (1, 'a')").await?;
+    a.wait_for_sink_call().await?;
+
+    let stopping = Instant::now();
+    a.request_stop();
+    let budget = HANDOVER_DRAIN * 2 + HANDOVER_TAIL + Duration::from_secs(1);
+    let (result, delivered) = a.finished_with_output(budget).await?;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(delivered, 0);
+    assert!(stopping.elapsed() <= budget, "{:?}", stopping.elapsed());
+    let record = leader(&shared).await?.value;
+    assert_eq!((record.epoch, record.state), (1, LeaderState::Active));
+    assert_eq!(record.holder, "holder-a");
+
+    let started = Instant::now();
+    let mut b = support::spawn_in_context(
+        support::params(&pg),
+        handover(),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-b"),
+    );
+    let event = b.next_event().await?;
+    assert_eq!(event["after"]["id"], 1);
+    assert!(
+        started.elapsed() >= support::TEST_LEADERSHIP.fence_delay,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(leader(&shared).await?.value.epoch, 2);
+    b.stop().await
+}
+
+#[tokio::test]
+async fn shutdown_before_the_claim_leaves_the_record_untouched() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let shared = memory();
+    let mut a = support::spawn_in_context(
+        support::params(&pg),
+        handover(),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    pg.execute("INSERT INTO orders VALUES (1, 'a')").await?;
+    a.next_event().await?;
+    a.abort().await?;
+    let before = leader(&shared).await?;
+    assert_eq!(before.value.state, LeaderState::Active);
+
+    let b = support::spawn_in_context(
+        support::params(&pg),
+        handover(),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-b"),
+    );
+    active(&b.health(), WAIT).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    b.request_stop();
+    let (result, delivered) = b
+        .finished_with_output(HANDOVER_TAIL + Duration::from_secs(1))
+        .await?;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(delivered, 0);
+    assert_eq!(leader(&shared).await?, before);
+    pg.wait_for_slot(SLOT, WAIT, |state| !state.active).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_release_that_cannot_reach_the_store_still_exits_within_the_budget() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let shared = memory();
+    let store = RecordingStore::over(Arc::clone(&shared));
+    let a = support::spawn_in_context(
+        support::params(&pg),
+        handover(),
+        store.stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    tokio::time::timeout(
+        WAIT,
+        a.health()
+            .subscribe()
+            .wait_for(|snapshot| snapshot.delivering),
+    )
+    .await??;
+    store.stall_leader_swaps();
+
+    let stopping = Instant::now();
+    a.request_stop();
+    let budget = HANDOVER_TAIL + Duration::from_secs(1);
+    let (result, _) = a.finished_with_output(budget).await?;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(stopping.elapsed() <= budget, "{:?}", stopping.elapsed());
+    let swaps = store
+        .calls()
+        .iter()
+        .filter(|call| **call == "swap_leader")
+        .count();
+    assert_eq!(swaps, 2, "{:?}", store.calls());
+    let record = leader(&shared).await?.value;
+    assert_eq!((record.epoch, record.state), (1, LeaderState::Active));
+    pg.wait_for_slot(SLOT, WAIT, |state| !state.active).await?;
+    Ok(())
 }

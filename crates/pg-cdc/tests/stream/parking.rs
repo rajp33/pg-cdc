@@ -2,11 +2,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use pg_cdc::config::DEFAULT_DRAIN_TIMEOUT;
 use pg_cdc::event::EventId;
 use pg_cdc::lane::Stores;
 use pg_cdc::order::{OrderBy, OrderKeyId};
 use pg_cdc::payload::S3PayloadStore;
-use pg_cdc::session::{DRAIN_TIMEOUT, SessionConfig};
+use pg_cdc::session::{HANDOVER_TAIL, SessionConfig};
 use pg_cdc::sink::SinkCapabilities;
 use pg_cdc::state::memory::MemoryStateStore;
 use pg_cdc::state::{ParkStatus, ParkedEvent, StateStore};
@@ -280,7 +281,7 @@ async fn shutdown_parks_what_the_sink_did_not_take_and_the_next_session_drains_i
     let stopping = tokio::time::Instant::now();
     first.stop().await?;
     assert!(
-        stopping.elapsed() < DRAIN_TIMEOUT * 2 + Duration::from_secs(5),
+        stopping.elapsed() < DEFAULT_DRAIN_TIMEOUT * 2 + HANDOVER_TAIL + Duration::from_secs(5),
         "shutdown took {:?}",
         stopping.elapsed()
     );

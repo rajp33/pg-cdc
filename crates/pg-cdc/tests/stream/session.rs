@@ -6,8 +6,9 @@ use pg_cdc_testkit::{Postgres, PostgresOptions};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 
+use pg_cdc::config::DEFAULT_DRAIN_TIMEOUT;
 use pg_cdc::order::OrderBy;
-use pg_cdc::session::DRAIN_TIMEOUT;
+use pg_cdc::session::HANDOVER_TAIL;
 
 use crate::support::{self, Mode, SLOT, TestResult, WAIT};
 
@@ -295,7 +296,7 @@ async fn shutdown_with_a_failing_sink_and_store_stops_cleanly_and_replays_the_un
     let stopping = tokio::time::Instant::now();
     first.stop().await?;
     assert!(
-        stopping.elapsed() < DRAIN_TIMEOUT * 2 + Duration::from_secs(5),
+        stopping.elapsed() < DEFAULT_DRAIN_TIMEOUT * 2 + HANDOVER_TAIL + Duration::from_secs(5),
         "shutdown took {:?}",
         stopping.elapsed()
     );

@@ -10,7 +10,7 @@ use pg_cdc_replication::{
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinError;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -26,17 +26,18 @@ use crate::health::{Health, Role};
 use crate::lane::{LaneError, LaneSettings, LaneStopped, Lanes, Pending, Report, Stores};
 use crate::leader::gate::{WriteGate, gated_sink, gated_stores};
 use crate::leader::lease::{FenceReason, hold_lease};
-use crate::leader::record::{Claim, TakeoverError, take_over};
+use crate::leader::record::{Claim, Release, TakeoverError, release, take_over};
 use crate::leader::standby::{
     AcquireError, OBJECT_IN_USE, ProbeError, SlotHolder, SlotProbe, StartError, acquire,
 };
 use crate::order::{OrderBy, order_key};
 use crate::sink::{Outbound, Sink};
+use crate::state::StateStore;
 use crate::validate::{Invalid, ValidationError, validate};
 
 pub const REPLICATION_BUFFER: usize = 64;
-pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HANDOVER_TAIL: Duration = Duration::from_secs(3);
+pub const LANE_STOP_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -201,9 +202,11 @@ async fn attempt(
         health: &context.health,
         leadership: Leadership {
             gate: Arc::clone(&gate),
+            state: Arc::clone(&stores.state),
             pending: Some(takeover),
             claim: None,
         },
+        drain_timeout: config.leadership.drain_timeout,
     };
     drop(reports);
     let result = session
@@ -250,11 +253,29 @@ fn spawn_takeover(
     }))
 }
 
-async fn stop_within_tail(stream: ReplicationStream) {
-    match timeout(HANDOVER_TAIL, stream.stop()).await {
+async fn stop_by(stream: ReplicationStream, deadline: Instant) {
+    match timeout_at(deadline, stream.stop()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(%error, "replication stream did not stop cleanly"),
         Err(_) => tracing::warn!("replication stream did not stop within the handover tail"),
+    }
+}
+
+async fn release_by(state: &dyn StateStore, claim: &Claim, confirmed_lsn: Lsn, deadline: Instant) {
+    match timeout_at(deadline, release(state, claim, confirmed_lsn)).await {
+        Ok(Release::Released) => tracing::info!(
+            epoch = claim.record.epoch,
+            %confirmed_lsn,
+            "released the leader record"
+        ),
+        Ok(Release::Conflict) => tracing::error!(
+            epoch = claim.record.epoch,
+            "another writer changed the leader record; leaving it as it is"
+        ),
+        Err(_) => tracing::warn!(
+            epoch = claim.record.epoch,
+            "could not release the leader record within the handover tail"
+        ),
     }
 }
 
@@ -400,6 +421,7 @@ async fn replication_config(
 
 struct Leadership {
     gate: Arc<WriteGate>,
+    state: Arc<dyn StateStore>,
     pending: Option<PendingClaim>,
     claim: Option<Claim>,
 }
@@ -417,6 +439,7 @@ struct Session<'a> {
     slot: &'a str,
     health: &'a Health,
     leadership: Leadership,
+    drain_timeout: Duration,
 }
 
 enum Ended {
@@ -442,35 +465,57 @@ impl Session<'_> {
             Ended::Fenced(reason) => return self.fenced(stream, reason).await,
             Ended::Body(result) => result,
         };
-        drop(lease);
         match result {
             Err(error @ SessionError::Takeover(_)) => {
+                drop(lease);
                 tracing::error!(slot = self.slot, %error, "cannot take over the slot; releasing it");
                 self.leadership.gate.fence();
                 self.lanes.stop(Duration::ZERO).await;
-                stop_within_tail(stream).await;
+                stop_by(stream, Instant::now() + HANDOVER_TAIL).await;
                 Err(error)
             }
             Err(error) => {
+                drop(lease);
                 self.leadership.gate.fence();
                 Err(error)
             }
-            Ok(()) if self.leadership.claim.is_none() => {
-                self.leadership.pending = None;
-                self.leadership.gate.fence();
-                self.lanes.stop(Duration::ZERO).await;
-                stop_within_tail(stream).await;
-                Ok(())
-            }
             Ok(()) => {
-                self.lanes.stop(Duration::ZERO).await;
-                if let Err(error) = stream.stop().await {
-                    tracing::warn!(%error, "replication stream did not stop cleanly");
-                }
-                self.leadership.gate.fence();
+                self.hand_over(stream, lease).await;
                 Ok(())
             }
         }
+    }
+
+    async fn hand_over(mut self, stream: ReplicationStream, lease: Lease) {
+        let deadline = Instant::now() + HANDOVER_TAIL;
+        self.leadership.pending = None;
+        let claim = self.leadership.claim.take();
+        let grace = if claim.is_some() {
+            LANE_STOP_GRACE.min(deadline.saturating_duration_since(Instant::now()))
+        } else {
+            Duration::ZERO
+        };
+        let clean = timeout_at(deadline, self.lanes.stop(grace))
+            .await
+            .unwrap_or(false);
+        let fenced_by_lease = lease.is_finished();
+        drop(lease);
+        self.leadership.gate.fence();
+        if let Some(claim) = claim {
+            let abandoned_writes = self.leadership.gate.abandoned_writes();
+            if fenced_by_lease || abandoned_writes > 0 {
+                tracing::warn!(
+                    abandoned_writes,
+                    clean,
+                    fenced_by_lease,
+                    "leaving the leader record active; the next holder waits fence_delay"
+                );
+            } else {
+                let confirmed = self.ack.confirmed();
+                release_by(self.leadership.state.as_ref(), &claim, confirmed, deadline).await;
+            }
+        }
+        stop_by(stream, deadline).await;
     }
 
     async fn body(
@@ -482,6 +527,8 @@ impl Session<'_> {
     ) -> Result<(), SessionError> {
         self.stream(stream, settled, shutdown, start).await?;
         if self.leadership.claim.is_some() {
+            self.health.set_role(Role::Draining);
+            self.health.set_delivering(false);
             self.drain(stream, settled).await?;
         }
         Ok(())
@@ -554,7 +601,7 @@ impl Session<'_> {
         }
         tracing::warn!(
             unsettled = self.ack.inflight_events(),
-            timeout_ms = DRAIN_TIMEOUT.as_millis(),
+            timeout_ms = self.drain_timeout.as_millis(),
             "parking the events still in flight after the drain timeout"
         );
         self.lanes.park_all();
@@ -573,13 +620,14 @@ impl Session<'_> {
         stream: &ReplicationStream,
         settled: &mut mpsc::UnboundedReceiver<Report>,
     ) -> Result<bool, SessionError> {
+        let drain_timeout = self.drain_timeout;
         let settle_all = async {
             while self.ack.inflight_events() > 0 {
                 self.report(settled.recv().await, stream)?;
             }
             Ok(())
         };
-        match tokio::time::timeout(DRAIN_TIMEOUT, settle_all).await {
+        match tokio::time::timeout(drain_timeout, settle_all).await {
             Ok(result) => result.map(|()| true),
             Err(_) => Ok(false),
         }

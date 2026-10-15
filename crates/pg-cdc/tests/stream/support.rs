@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -203,6 +203,7 @@ pub(crate) struct RecordingStore {
     calls: Mutex<Vec<&'static str>>,
     detach: Mutex<Option<Duration>>,
     landed: Arc<AtomicUsize>,
+    stalled: AtomicBool,
 }
 
 impl RecordingStore {
@@ -212,7 +213,12 @@ impl RecordingStore {
             calls: Mutex::default(),
             detach: Mutex::default(),
             landed: Arc::new(AtomicUsize::new(0)),
+            stalled: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn stall_leader_swaps(&self) {
+        self.stalled.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn detach_appends(&self, delay: Duration) {
@@ -329,6 +335,9 @@ impl StateStore for RecordingStore {
         expected: Option<&Version>,
     ) -> Result<SwapOutcome, StoreError> {
         self.record("swap_leader");
+        if self.stalled.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.inner.swap_leader(next, expected).await
     }
 }
@@ -348,6 +357,7 @@ pub(crate) struct TestSink {
     mode: watch::Receiver<Mode>,
     failures: watch::Sender<u64>,
     delivered: mpsc::UnboundedSender<Bytes>,
+    calls: watch::Sender<u64>,
 }
 
 fn contains(body: &[u8], marker: &str) -> bool {
@@ -366,6 +376,7 @@ impl Sink for TestSink {
     }
 
     async fn send(&self, batch: &[Outbound]) -> Vec<Outcome> {
+        self.calls.send_modify(|count| *count += 1);
         let mut mode = self.mode.clone();
         let Ok(current) = mode
             .wait_for(|mode| *mode != Mode::Hold)
@@ -404,6 +415,7 @@ pub(crate) struct Running {
     events: mpsc::UnboundedReceiver<Bytes>,
     mode: watch::Sender<Mode>,
     failures: watch::Receiver<u64>,
+    calls: watch::Receiver<u64>,
     health: Health,
 }
 
@@ -446,11 +458,13 @@ pub(crate) fn spawn_in_context(
     let (mode, mode_receiver) = watch::channel(Mode::Deliver);
     let (failures_sender, failures) = watch::channel(0);
     let (delivered, events) = mpsc::unbounded_channel();
+    let (calls_sender, calls) = watch::channel(0);
     let sink: Arc<dyn Sink> = Arc::new(TestSink {
         limits,
         mode: mode_receiver,
         failures: failures_sender,
         delivered,
+        calls: calls_sender,
     });
     let shutdown = CancellationToken::new();
     let health = context.health.clone();
@@ -461,6 +475,7 @@ pub(crate) fn spawn_in_context(
         events,
         mode,
         failures,
+        calls,
         health,
     }
 }
@@ -535,6 +550,15 @@ impl Running {
     pub(crate) async fn wait_for_failures(&mut self, count: u64) -> TestResult {
         tokio::time::timeout(WAIT, self.failures.wait_for(|failed| *failed >= count)).await??;
         Ok(())
+    }
+
+    pub(crate) async fn wait_for_sink_call(&mut self) -> TestResult {
+        tokio::time::timeout(WAIT, self.calls.wait_for(|calls| *calls >= 1)).await??;
+        Ok(())
+    }
+
+    pub(crate) fn request_stop(&self) {
+        self.shutdown.cancel();
     }
 
     pub(crate) async fn stop(self) -> TestResult {
