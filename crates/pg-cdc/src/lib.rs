@@ -1,13 +1,17 @@
 pub mod ack;
+pub mod admin;
 mod aws;
 pub mod catalog;
 pub mod config;
 pub mod connection;
 pub mod event;
+pub mod health;
 pub mod lane;
+pub mod leader;
 pub mod order;
 pub mod payload;
 pub mod session;
 pub mod sink;
 pub mod state;
 pub mod supervisor;
+pub mod validate;

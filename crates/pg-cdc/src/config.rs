@@ -1,5 +1,7 @@
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use secrecy::SecretString;
@@ -7,6 +9,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 use serde_json::{Map, Value};
 
+use crate::leader::POLL_INTERVAL;
 use crate::order::OrderBy;
 
 pub const ENV_PREFIX: &str = "PGCDC__";
@@ -19,6 +22,10 @@ pub const DEFAULT_PARK_AFTER: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_PARKED_EVENTS: u64 = 10_000_000;
 pub const DEFAULT_STORE_CONCURRENCY: usize = 32;
 pub const MAX_CONCURRENCY: usize = 4096;
+pub const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(6);
+pub const DEFAULT_FENCE_DELAY: Duration = Duration::from_secs(10);
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_ADMIN_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9187);
 const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +40,10 @@ pub struct Config {
     pub state_store: StateStoreConfig,
     #[serde(default)]
     pub payload_store: Option<PayloadStoreConfig>,
+    #[serde(default)]
+    pub leadership: LeadershipConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +122,42 @@ impl Default for DeliveryConfig {
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
             park_after: DEFAULT_PARK_AFTER,
             max_parked_events: DEFAULT_MAX_PARKED_EVENTS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeadershipConfig {
+    #[serde(default = "default_lease_timeout", deserialize_with = "de_duration")]
+    pub lease_timeout: Duration,
+    #[serde(default = "default_fence_delay", deserialize_with = "de_duration")]
+    pub fence_delay: Duration,
+    #[serde(default = "default_drain_timeout", deserialize_with = "de_duration")]
+    pub drain_timeout: Duration,
+}
+
+impl Default for LeadershipConfig {
+    fn default() -> Self {
+        Self {
+            lease_timeout: DEFAULT_LEASE_TIMEOUT,
+            fence_delay: DEFAULT_FENCE_DELAY,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    #[serde(default = "default_admin_listen", deserialize_with = "de_socket_addr")]
+    pub listen: SocketAddr,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            listen: DEFAULT_ADMIN_LISTEN,
         }
     }
 }
@@ -479,6 +526,7 @@ impl Config {
             return Err(ConfigError::MissingPassword);
         }
         self.delivery.validate()?;
+        self.leadership.validate()?;
         self.state_store.validate()?;
         if let Some(PayloadStoreConfig::S3(payload)) = &self.payload_store {
             validate_bucket("payload_store.bucket", &payload.bucket)?;
@@ -515,6 +563,41 @@ impl DeliveryConfig {
             });
         }
         Ok(())
+    }
+}
+
+impl LeadershipConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.lease_timeout <= POLL_INTERVAL {
+            return Err(invalid_duration(
+                "leadership.lease_timeout",
+                self.lease_timeout,
+                "must be greater than the 2s lease check interval",
+            ));
+        }
+        if self.fence_delay <= self.lease_timeout {
+            return Err(invalid_duration(
+                "leadership.fence_delay",
+                self.fence_delay,
+                "must be greater than leadership.lease_timeout",
+            ));
+        }
+        if self.drain_timeout.is_zero() {
+            return Err(invalid_duration(
+                "leadership.drain_timeout",
+                self.drain_timeout,
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn invalid_duration(field: &'static str, value: Duration, reason: &'static str) -> ConfigError {
+    ConfigError::InvalidValue {
+        field,
+        value: format!("{}ms", value.as_millis()),
+        reason,
     }
 }
 
@@ -560,6 +643,22 @@ fn default_park_after() -> Duration {
 
 fn default_max_parked_events() -> u64 {
     DEFAULT_MAX_PARKED_EVENTS
+}
+
+fn default_lease_timeout() -> Duration {
+    DEFAULT_LEASE_TIMEOUT
+}
+
+fn default_fence_delay() -> Duration {
+    DEFAULT_FENCE_DELAY
+}
+
+fn default_drain_timeout() -> Duration {
+    DEFAULT_DRAIN_TIMEOUT
+}
+
+fn default_admin_listen() -> SocketAddr {
+    DEFAULT_ADMIN_LISTEN
 }
 
 fn default_store_concurrency() -> usize {
@@ -630,6 +729,15 @@ fn de_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D
     parse_duration(&text).ok_or_else(|| {
         de::Error::custom(format!(
             "invalid duration {text:?}; use an integer with ms, s, m or h"
+        ))
+    })
+}
+
+fn de_socket_addr<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SocketAddr, D::Error> {
+    let text = de_string(deserializer)?;
+    SocketAddr::from_str(&text).map_err(|_| {
+        de::Error::custom(format!(
+            "admin.listen {text:?} must be an IP address and port such as 127.0.0.1:9187"
         ))
     })
 }
@@ -1426,6 +1534,156 @@ state_store:
                 ),
                 "{sections}"
             );
+        }
+    }
+
+    fn leadership(body: &str) -> String {
+        format!("{MINIMAL}leadership:\n{body}\n")
+    }
+
+    fn admin(body: &str) -> String {
+        format!("{MINIMAL}admin:\n{body}\n")
+    }
+
+    fn invalid_field(yaml: &str) -> &'static str {
+        match parse(yaml, with_password()) {
+            Err(ConfigError::InvalidValue { field, .. }) => field,
+            other => panic!("expected an invalid value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leadership_and_admin_default_to_the_spec_values() {
+        let config = parse(MINIMAL, with_password()).unwrap();
+        assert_eq!(config.leadership, LeadershipConfig::default());
+        assert_eq!(config.leadership.lease_timeout, Duration::from_secs(6));
+        assert_eq!(config.leadership.fence_delay, Duration::from_secs(10));
+        assert_eq!(config.leadership.drain_timeout, Duration::from_secs(5));
+        assert_eq!(config.admin, AdminConfig::default());
+        assert_eq!(config.admin.listen, "127.0.0.1:9187".parse().unwrap());
+        assert_eq!(config.admin.listen, DEFAULT_ADMIN_LISTEN);
+    }
+
+    #[test]
+    fn leadership_timers_and_admin_listen_parse_from_yaml_and_environment() {
+        let yaml = format!(
+            "{}admin:\n  listen: 192.168.1.5:9300\n",
+            leadership("  lease_timeout: 4s\n  fence_delay: 4500ms\n  drain_timeout: 1s")
+        );
+        let config = parse(&yaml, with_password()).unwrap();
+        assert_eq!(
+            config.leadership,
+            LeadershipConfig {
+                lease_timeout: Duration::from_secs(4),
+                fence_delay: Duration::from_millis(4500),
+                drain_timeout: Duration::from_secs(1),
+            }
+        );
+        assert_eq!(config.admin.listen, "192.168.1.5:9300".parse().unwrap());
+
+        let mut vars = with_password();
+        vars.extend(env(&[
+            ("PGCDC__LEADERSHIP__FENCE_DELAY", "7s"),
+            ("PGCDC__ADMIN__LISTEN", "0.0.0.0:9000"),
+        ]));
+        let config = parse(&yaml, vars).unwrap();
+        assert_eq!(config.leadership.lease_timeout, Duration::from_secs(4));
+        assert_eq!(config.leadership.fence_delay, Duration::from_secs(7));
+        assert_eq!(config.leadership.drain_timeout, Duration::from_secs(1));
+        assert_eq!(config.admin.listen, "0.0.0.0:9000".parse().unwrap());
+    }
+
+    #[test]
+    fn fence_delay_must_exceed_lease_timeout() {
+        for fence_delay in ["6s", "5s", "1ms"] {
+            let yaml = leadership(&format!("  fence_delay: {fence_delay}"));
+            assert_eq!(
+                invalid_field(&yaml),
+                "leadership.fence_delay",
+                "{fence_delay}"
+            );
+        }
+        let error = parse(&leadership("  fence_delay: 6s"), with_password()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "leadership.fence_delay \"6000ms\" is invalid: must be greater than leadership.lease_timeout"
+        );
+        parse(&leadership("  fence_delay: 6001ms"), with_password()).unwrap();
+    }
+
+    #[test]
+    fn lease_timeout_must_exceed_the_check_interval() {
+        assert_eq!(
+            invalid_field(&leadership("  lease_timeout: 2s")),
+            "leadership.lease_timeout"
+        );
+        assert_eq!(
+            invalid_field(&leadership("  lease_timeout: 1s")),
+            "leadership.lease_timeout"
+        );
+        let error = parse(&leadership("  lease_timeout: 2s"), with_password()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "leadership.lease_timeout \"2000ms\" is invalid: must be greater than the 2s lease check interval"
+        );
+        let config = parse(
+            &leadership("  lease_timeout: 2001ms\n  fence_delay: 3s"),
+            with_password(),
+        )
+        .unwrap();
+        assert_eq!(config.leadership.lease_timeout, Duration::from_millis(2001));
+    }
+
+    #[test]
+    fn lease_timeout_is_checked_before_fence_delay() {
+        let yaml = leadership("  lease_timeout: 2s\n  fence_delay: 1s\n  drain_timeout: 0s");
+        assert_eq!(invalid_field(&yaml), "leadership.lease_timeout");
+        let yaml = leadership("  fence_delay: 1s\n  drain_timeout: 0s");
+        assert_eq!(invalid_field(&yaml), "leadership.fence_delay");
+    }
+
+    #[test]
+    fn drain_timeout_must_be_positive() {
+        assert_eq!(
+            invalid_field(&leadership("  drain_timeout: 0s")),
+            "leadership.drain_timeout"
+        );
+        let error = parse(&leadership("  drain_timeout: 0s"), with_password()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "leadership.drain_timeout \"0ms\" is invalid: must be greater than zero"
+        );
+        parse(&leadership("  drain_timeout: 1ms"), with_password()).unwrap();
+    }
+
+    #[test]
+    fn admin_listen_must_be_an_ip_and_port() {
+        for listen in ["localhost:9187", "9187", "127.0.0.1", "db.internal:80"] {
+            let error = parse(&admin(&format!("  listen: {listen}")), with_password()).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::Invalid(_)),
+                "{listen}: {error}"
+            );
+            let text = error.to_string();
+            assert!(text.contains("admin.listen"), "{text}");
+            assert!(
+                text.contains("must be an IP address and port such as 127.0.0.1:9187"),
+                "{text}"
+            );
+        }
+        let config = parse(&admin("  listen: \"[::1]:9187\""), with_password()).unwrap();
+        assert_eq!(config.admin.listen, "[::1]:9187".parse().unwrap());
+        let config = parse(&admin("  listen: 127.0.0.1:0"), with_password()).unwrap();
+        assert_eq!(config.admin.listen.port(), 0);
+    }
+
+    #[test]
+    fn unknown_leadership_and_admin_keys_are_rejected() {
+        for yaml in [leadership("  lease: 6s"), admin("  port: 1")] {
+            assert!(matches!(
+                parse(&yaml, with_password()),
+                Err(ConfigError::Invalid(_))
+            ));
         }
     }
 
