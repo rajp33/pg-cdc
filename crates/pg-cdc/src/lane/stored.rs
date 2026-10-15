@@ -305,6 +305,15 @@ impl Lane {
             Outcome::Delivered => {
                 state.backoff.reset();
                 state.failure = None;
+                if state
+                    .queue
+                    .front()
+                    .is_some_and(|pending| pending.outbound.id == head.id)
+                    && let Some(pending) = state.queue.pop_front()
+                    && let Ok(settled) = pending.ticket.settle(outcome)
+                {
+                    let _ = self.reports.send(Report::Settled(settled));
+                }
                 self.to_remove.push((key, head.id));
             }
             Outcome::Retryable(error) => {

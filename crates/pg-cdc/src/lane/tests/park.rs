@@ -264,3 +264,35 @@ async fn park_all_leaves_events_of_unloaded_partitions_to_the_replay_skip() {
     );
     assert_eq!(harness.sink.batches(), Vec::<Vec<u32>>::new());
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_append_that_lands_only_part_of_a_queue_delivers_each_event_once_in_order() {
+    fastrand::seed(1);
+    let start = Instant::now();
+    let script: Script = Box::new(move |ordinal, _| {
+        if ordinal == 0 && Instant::now() < start + Duration::from_millis(1050) {
+            Outcome::Retryable(SinkError("throttled".to_owned()))
+        } else {
+            Outcome::Delivered
+        }
+    });
+    let store = TestStore::default();
+    store.fail_appends.store(8, Ordering::SeqCst);
+    store.land_on_failure.store(1, Ordering::SeqCst);
+    let setup = parking_after(Duration::from_secs(1));
+    let mut harness = Harness::start(setup, ScriptedSink::new(LIMITS, script), store).await;
+    for ordinal in 0..3 {
+        harness.send(ordinal, b"k", 10).unwrap();
+    }
+    assert_eq!(harness.settle(3).await, Lsn(102));
+    assert!(harness.quiet_for(Duration::from_secs(120)).await);
+    let delivered: Vec<u32> = harness
+        .sink
+        .sends()
+        .iter()
+        .filter(|sent| sent.delivered)
+        .map(|sent| sent.ordinal)
+        .collect();
+    assert_eq!(delivered, vec![0, 1, 2]);
+    assert_eq!(harness.store.queue(b"k").await, vec![]);
+}
