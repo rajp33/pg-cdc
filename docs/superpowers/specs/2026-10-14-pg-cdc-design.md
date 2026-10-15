@@ -396,6 +396,7 @@ Each adapter is an object-safe async trait (`async-trait`), selected by `type` i
 ```rust
 #[async_trait]
 pub trait Sink: Send + Sync {
+    fn name(&self) -> &'static str { "custom" }
     fn capabilities(&self) -> SinkCapabilities;
     async fn preflight(&self) -> Result<(), SinkError>;
     async fn send(&self, batch: &[Outbound]) -> Vec<Outcome>;
@@ -428,6 +429,7 @@ Contract:
 - **No sink-side retries.** The sink neither retries nor backs off; the pipeline does. SDK-level retries are disabled.
 - **`preflight` gates health.** It runs at startup and must succeed before the task reports healthy. `capabilities` is valid only after it has run.
 - **Encoding is shared.** The pipeline encodes envelopes and attributes, so every sink receives the same body.
+- **`name` labels telemetry.** It is the `sink` attribute of the batch-send span (§17.2). The provided method returns `"custom"`; the v1 sinks return `"sns"`, `"stdout"` and `"discard"`, and a wrapper returns its inner sink's name.
 
 v1 sinks:
 
@@ -464,6 +466,7 @@ v1 sinks:
 pub trait StateStore: Send + Sync {
     async fn append_parked(&self, events: &[ParkedEvent]) -> Result<(), StoreError>;
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError>;
+    async fn list_parked_queues(&self, after: Option<&OrderKeyId>, limit: usize, length_cap: usize) -> Result<ParkedQueues, StoreError>;
     async fn read_parked(&self, key: &OrderKeyId, after: Option<&EventId>, limit: usize) -> Result<Vec<ParkedEvent>, StoreError>;
     async fn set_parked_status(&self, key: &OrderKeyId, id: &EventId, status: ParkStatus) -> Result<(), StoreError>;
     async fn remove_parked(&self, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError>;
@@ -476,6 +479,7 @@ The types:
 
 - `ParkedEvent` holds the order key id, event id, status (`retrying` or `dead`), attempts, first failure time, last error and the encoded envelope.
 - `ParkedHead` holds the order key id, head event id and queue length.
+- `ParkedQueues` holds a page of `ParkedHead`s and `next`, the order key id to continue after when more queues may follow.
 - `LeaderRecord` holds the epoch, holder, state (`active` or `released`), confirmed LSN and update time.
 
 Contract, checked by a shared conformance suite that every adapter must pass:
@@ -488,11 +492,13 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 6. `swap_leader` is an atomic compare-and-swap, and `expected: None` means create-if-absent.
 7. Concurrent calls are safe. pg-cdc bounds them with `state_store.max_concurrency` (default 32) and backs off on throttling.
 8. `append_parked` lands each order key's events in id order. If it fails or is cancelled, the events it stored for each key are a prefix of that key's events in the call, so a queue never has a gap below its head. An event that cannot be encoded fails the call before anything is written. The suite checks the encoding rule; each adapter's own tests check the prefix rule by injecting a fault in the middle of a key's events.
+9. `list_parked_queues` returns the queues whose order key id is above `after`, in ascending order key id order, at most `limit` of them, each with its lowest id as the head and its length capped at `length_cap`; a key with no events is not listed. Its work is bounded by the page, `limit` queues of at most `length_cap` events each, whatever other queues hold. Startup keeps using `load_parked_heads` (§10.6); `list_parked_queues` serves the admin API (§16.2).
 
 ### 11.4 S3 StateStore
 
 - **Parked events** live at `<prefix>/<pipeline>/parked/<order key id>/<event id>.json`. They are written with `If-None-Match: *`, so a 412 means the object already exists and counts as success. One append writes each order key's events one at a time in id order and stops that key at its first failure; different keys are written in parallel.
 - **`load_parked_heads(p)`** lists the `parked/<pp>` prefix, where `pp` is the partition as two hex digits. The first object under each key is its head.
+- **`list_parked_queues`** lists the `parked/` prefix with delimiter `/` and `StartAfter` past `after`'s objects, so each key is one common prefix, then lists each returned key's prefix up to `length_cap` objects (one page when `length_cap` is at most 1,000), under the store's concurrency bound.
 - **`read_parked`** lists with `StartAfter`, then fetches each object.
 - **A status change** rewrites the object; only the owning lane writes it.
 - **The leader record** lives at `<prefix>/<pipeline>/leader.json`. It is changed with `If-Match: <etag>` and created with `If-None-Match: *`.
@@ -815,13 +821,14 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
 | `GET /healthz` | 200 when startup validation (§13.2), sink preflight and the store check pass, and, for an active task, the lease is valid |
 | `GET /readyz` | 200 only when active and streaming |
 | `GET /status` | Role, epoch, slot, confirmed LSN, in-flight counts, parked and dead counts, and time since the last status update |
-| `GET /parked` | Parked queues with head id, head status, length and last error, filterable by status |
+| `GET /parked` | Parked queues with head id, head status, attempts, first failure, length and last error, filterable by status, paged with `limit` (default 100, at most 1,000) and `after`; `length` is capped at 1,000 and `length_capped` marks a queue at least that long |
 | `GET /parked/{order_key_id}` | The events in one queue |
 | `POST /parked/{order_key_id}/redrive` | Mark the dead head retrying again |
 | `POST /parked/{order_key_id}/discard?id=<event id>` | Remove the head, only if it still has that id |
 
 - **No races with delivery.** Parked operations run inside the owning lane.
 - **Standbys refuse them.** A standby answers with 409 and the current holder from the leader record.
+- **Only the active holder answers.** Every parked endpoint answers 409 unless this task holds claimed lanes, so a task waiting `fence_delay`, a draining task and a fenced task refuse too; the body carries `role`, and `holder`, `leader_state` and `epoch` from the leader record. Before the state store is ready the endpoints answer 503 (`pg-cdc is starting`), and an operation that outlives 30 s answers 504, since it may still complete.
 
 ## 17. Observability
 
@@ -863,7 +870,7 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
 | `pgcdc.status_update.age` | gauge (s) | |
 | `pgcdc.role` | gauge | 0 standby, 1 active, 2 draining |
 | `pgcdc.leader.epoch` | gauge | |
-| `pgcdc.takeovers` | counter | `kind` (clean, unclean) |
+| `pgcdc.takeovers` | counter | `kind` (clean, unclean; a first takeover counts as clean) |
 | `pgcdc.decode.fallbacks` | counter | `type` |
 | `pgcdc.tables_without_full_identity` | gauge | |
 
@@ -875,11 +882,10 @@ Suggested alerts:
 - status update age above 30 s;
 - no active task, or more than one.
 
-### 17.4 Logs and profiles
+### 17.4 Logs
 
 - **Logs.** `tracing` writes JSON logs with trace and span ids, and they export over OTLP when telemetry is enabled.
 - **Logs never block.** Lines go through a bounded buffer of 8,192 lines to their own writer thread; a line that does not fit is dropped. At exit the buffer is flushed for at most 1 s, and after SIGTERM only within what remains of the shutdown budget (`2 × drain_timeout + 3 s`).
-- **Profiles.** An optional `pprof` build feature, off by default, serves CPU profiles on the admin port for load tests.
 
 ## 18. Testing
 
@@ -895,7 +901,7 @@ Suggested alerts:
 The integration tests use testcontainers:
 
 - Postgres 14, 15, 16, 17 and 18 with `wal_level=logical`;
-- LocalStack for SNS, SQS and S3, reading delivered messages back through an SQS subscription.
+- moto for SNS, SQS and S3, reading delivered messages back through an SQS subscription.
 
 They cover:
 
@@ -911,7 +917,7 @@ The harness:
 
 1. writes a known workload;
 2. SIGKILLs pg-cdc at random points;
-3. injects sink and store faults through a `chaos` wrapper;
+3. injects sink and store faults through a `chaos` wrapper: a fault-injecting proxy in front of the sink and store endpoints;
 4. drops connections;
 5. runs clean and crash takeovers between two instances.
 
@@ -919,7 +925,7 @@ A checker then asserts that every committed change was either delivered at least
 
 ### 18.4 Conformance
 
-- **StateStore suite:** run against the filesystem store locally, and against the S3 store on LocalStack or MinIO.
+- **StateStore suite:** run against the filesystem and memory stores locally, and against the S3 store on moto.
 - **Sink suite:** outcome classification and batch limits.
 
 ### 18.5 Load
@@ -972,6 +978,8 @@ Each milestone ends in working, tested software and gets its own implementation 
    - Before release, review the patent landscape for watermark-based CDC (Netflix DBLog).
 2. **Admin API authentication.** Required before the admin API is exposed beyond localhost.
 3. **Segmented S3 parking layout.** Only if load tests or real outages show per-event objects are too slow or too costly.
+
+Also in v1.1, outside the ranking: an optional `pprof` build feature for CPU profiles, off by default and served on the admin port for load tests.
 
 ### v1.2: open-source release
 
