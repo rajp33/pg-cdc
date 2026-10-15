@@ -504,7 +504,7 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 - **`remove_parked`** sends `DeleteObjects` in quiet mode, at most 1,000 objects per request, the requests in parallel under the concurrency bound. A missing object counts as deleted, as item 5 requires; any per-object error in the reply fails the whole call, and the lane retries it with backoff without sending the events again.
 - **A status change** rewrites the object; only the owning lane writes it.
 - **The leader record** lives at `<prefix>/<pipeline>/leader.json`. It is changed with `If-Match: <etag>` and created with `If-None-Match: *`.
-- **Throttling.** `503 SlowDown` and other 5xx responses are retried with backoff.
+- **Throttling.** `503 SlowDown` and other 5xx responses are retried with backoff. When throttling outlasts the client's 3 attempts, the call fails as unavailable and the lane retries it with its store backoff (100 ms to 30 s): an event that cannot park stays in flight and holds its WAL, a delivered head whose removal fails is not sent again, and the process keeps running.
 - **Encryption.** Parked objects hold row data, so the bucket should use default encryption (SSE-KMS).
 
 ### 11.5 Filesystem StateStore

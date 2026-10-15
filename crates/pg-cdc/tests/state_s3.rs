@@ -1,23 +1,30 @@
 #[path = "support/state_store.rs"]
 mod state_store;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use aws_sdk_s3::config::interceptors::{
-    BeforeTransmitInterceptorContextMut, BeforeTransmitInterceptorContextRef,
+    BeforeDeserializationInterceptorContextMut, BeforeTransmitInterceptorContextMut,
+    BeforeTransmitInterceptorContextRef,
 };
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{
     BehaviorVersion, ConfigBag, Credentials, Intercept, Region, RuntimeComponents,
 };
 use aws_sdk_s3::error::BoxError;
+use aws_sdk_s3::primitives::SdkBody;
 use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
+use bytes::Bytes;
+use pg_cdc::ack::AckTracker;
 use pg_cdc::event::EventId;
+use pg_cdc::lane::{LaneSettings, Lanes, Pending, Report, Stores};
 use pg_cdc::order::OrderKeyId;
-use pg_cdc::state::s3::S3StateStore;
+use pg_cdc::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
+use pg_cdc::state::s3::{S3_MAX_ATTEMPTS, S3StateStore};
 use pg_cdc::state::{
     LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, StateStore,
     StoreError, SwapOutcome,
@@ -26,6 +33,8 @@ use pg_cdc_decoder::Lsn;
 use pg_cdc_testkit::AwsEmulator;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::time::Instant;
 
 use state_store::{TestResult, event, id, key};
 
@@ -878,5 +887,270 @@ async fn leader_calls_do_not_wait_behind_parking_traffic() -> TestResult {
         "a parked-event call ran past the held permit"
     );
     appending.abort();
+    Ok(())
+}
+
+const SLOW_DOWN: &str =
+    "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>";
+
+#[derive(Debug, Default)]
+struct Storm {
+    on: AtomicBool,
+    injected: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct SlowDownStorm(Arc<Storm>);
+
+impl Intercept for SlowDownStorm {
+    fn name(&self) -> &'static str {
+        "SlowDownStorm"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        if self.0.on.load(Ordering::SeqCst) {
+            let request = context.request_mut();
+            let elsewhere = request
+                .uri()
+                .replacen(&format!("/{BUCKET}"), "/slowdown-storm", 1);
+            request.set_uri(elsewhere)?;
+        }
+        Ok(())
+    }
+
+    fn modify_before_deserialization(
+        &self,
+        context: &mut BeforeDeserializationInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        if self.0.on.load(Ordering::SeqCst) {
+            let response = context.response_mut();
+            *response.status_mut() = 503_u16.try_into()?;
+            response.headers_mut().remove("content-length");
+            *response.body_mut() = SdkBody::from(SLOW_DOWN);
+            self.0.injected.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordingSink {
+    down: AtomicBool,
+    delivered: Mutex<Vec<(OrderKeyId, EventId)>>,
+}
+
+impl RecordingSink {
+    fn delivered(&self) -> Vec<(OrderKeyId, EventId)> {
+        self.delivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl Sink for RecordingSink {
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities {
+            max_batch_messages: 10,
+            max_batch_bytes: 1 << 20,
+            max_message_bytes: 1 << 20,
+        }
+    }
+
+    async fn preflight(&self) -> Result<(), SinkError> {
+        Ok(())
+    }
+
+    async fn send(&self, batch: &[Outbound]) -> Vec<Outcome> {
+        if self.down.load(Ordering::SeqCst) {
+            return batch
+                .iter()
+                .map(|_| Outcome::Retryable(SinkError("down".to_owned())))
+                .collect();
+        }
+        self.delivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(
+                batch
+                    .iter()
+                    .map(|outbound| (outbound.order_key, outbound.id)),
+            );
+        batch.iter().map(|_| Outcome::Delivered).collect()
+    }
+}
+
+struct Writer {
+    lanes: Lanes,
+    ack: AckTracker,
+    reports: mpsc::UnboundedReceiver<Report>,
+    settled: usize,
+    written: Vec<(OrderKeyId, EventId)>,
+}
+
+impl Writer {
+    fn write(&mut self, queue: OrderKeyId) -> TestResult {
+        let ordinal = u32::try_from(self.written.len())?;
+        let id = id(0x100, ordinal);
+        self.ack.begin()?;
+        let ticket = self.ack.track(16)?;
+        self.ack.commit(Lsn(0x100 + u64::from(ordinal)))?;
+        self.lanes.dispatch(Pending {
+            outbound: Outbound {
+                id,
+                order_key: queue,
+                attributes: Vec::new(),
+                body: Bytes::from(format!(r#"{{"n":{ordinal}}}"#)),
+            },
+            ticket,
+            arrived: Instant::now(),
+            committed_ms: None,
+        })?;
+        self.written.push((queue, id));
+        Ok(())
+    }
+
+    fn settled(&mut self) -> TestResult<usize> {
+        while let Ok(report) = self.reports.try_recv() {
+            match report {
+                Report::Settled(settled) => {
+                    self.ack.settle(settled)?;
+                    self.settled += 1;
+                }
+                Report::Fatal(error) => return Err(error.into()),
+            }
+        }
+        Ok(self.settled)
+    }
+}
+
+async fn until(what: &str, mut done: impl FnMut() -> TestResult<bool>) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !done()? {
+        if Instant::now() > deadline {
+            return Err(format!("timed out waiting until {what}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+async fn parked_objects(s3: &aws_sdk_s3::Client) -> TestResult<i32> {
+    let listed = s3
+        .list_objects_v2()
+        .bucket(BUCKET)
+        .prefix("orders/parked/")
+        .send()
+        .await?;
+    Ok(listed.key_count().unwrap_or(0))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slowdown_storm_past_the_sdk_retries_neither_loses_nor_resends_events() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let storm = Arc::new(Storm::default());
+    let stormy = aws_sdk_s3::Client::from_conf(
+        s3.config()
+            .to_builder()
+            .retry_config(RetryConfig::standard().with_max_attempts(S3_MAX_ATTEMPTS))
+            .interceptor(SlowDownStorm(Arc::clone(&storm)))
+            .build(),
+    );
+    let state: Arc<dyn StateStore> = Arc::new(S3StateStore::new(
+        stormy,
+        BUCKET.to_owned(),
+        "",
+        "orders",
+        32,
+    ));
+    let sink = Arc::new(RecordingSink::default());
+    let dyn_sink: Arc<dyn Sink> = sink.clone();
+    let (reports, receiver) = mpsc::unbounded_channel();
+    let lanes = Lanes::spawn(
+        LaneSettings {
+            lanes: 4,
+            park_after: Duration::from_millis(300),
+            max_parked_events: 0,
+            store_concurrency: 8,
+        },
+        &dyn_sink,
+        &Stores {
+            state,
+            payload: None,
+        },
+        &Arc::new(Semaphore::new(8)),
+        &reports,
+    );
+    let mut writer = Writer {
+        lanes,
+        ack: AckTracker::new(Lsn(0)),
+        reports: receiver,
+        settled: 0,
+        written: Vec::new(),
+    };
+    let queues: Vec<OrderKeyId> = (1..=8).map(|n| key(0x46, n)).collect::<TestResult<_>>()?;
+    for queue in &queues {
+        writer.write(*queue)?;
+    }
+    until("the first events are delivered", || {
+        Ok(sink.delivered().len() == 8)
+    })
+    .await?;
+
+    sink.down.store(true, Ordering::SeqCst);
+    storm.on.store(true, Ordering::SeqCst);
+    for _ in 0..5 {
+        for queue in &queues {
+            writer.write(*queue)?;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        writer.settled()?,
+        8,
+        "an event settled while S3 refused every request"
+    );
+    assert_eq!(parked_objects(&s3).await?, 0);
+    storm.on.store(false, Ordering::SeqCst);
+    until("every event is parked", || Ok(writer.settled()? == 48)).await?;
+    assert_eq!(parked_objects(&s3).await?, 40);
+
+    storm.on.store(true, Ordering::SeqCst);
+    sink.down.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(parked_objects(&s3).await?, 40);
+    storm.on.store(false, Ordering::SeqCst);
+    until("the parked queues drain", || {
+        Ok(sink.delivered().len() >= 48)
+    })
+    .await?;
+    for queue in &queues {
+        writer.write(*queue)?;
+    }
+    until("events after the storm are delivered", || {
+        Ok(sink.delivered().len() >= 56 && writer.settled()? == 56)
+    })
+    .await?;
+    assert_eq!(parked_objects(&s3).await?, 0);
+
+    let injected = storm.injected.load(Ordering::SeqCst);
+    assert!(injected > 30, "only {injected} SlowDown replies");
+    let mut sent: BTreeMap<OrderKeyId, Vec<EventId>> = BTreeMap::new();
+    for (queue, id) in sink.delivered() {
+        sent.entry(queue).or_default().push(id);
+    }
+    let mut expected: BTreeMap<OrderKeyId, Vec<EventId>> = BTreeMap::new();
+    for (queue, id) in &writer.written {
+        expected.entry(*queue).or_default().push(*id);
+    }
+    assert_eq!(sent, expected);
     Ok(())
 }
