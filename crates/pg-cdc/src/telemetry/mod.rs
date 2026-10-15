@@ -1,10 +1,16 @@
 use std::fmt;
 use std::time::Duration;
 
-use tracing_subscriber::{Layer, Registry};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::fmt::format::{Format, Json, Writer};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::config::TelemetryConfig;
 use crate::health::Health;
+use crate::logs::NonBlocking;
 use crate::metrics::AlreadyInstalled;
 use crate::status::Status;
 
@@ -156,6 +162,93 @@ impl Telemetry {
     }
 }
 
+pub fn subscriber(
+    writer: NonBlocking,
+    filter: EnvFilter,
+    layers: Option<TelemetryLayers>,
+) -> Box<dyn Subscriber + Send + Sync> {
+    let registry = Registry::default();
+    match layers {
+        None => Box::new(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(writer)
+                    .with_filter(filter),
+            ),
+        ),
+        Some(layers) => Box::new(
+            registry.with(layers.into_layer()).with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .event_format(TraceIdFormat::new())
+                    .with_writer(writer)
+                    .with_filter(filter),
+            ),
+        ),
+    }
+}
+
+#[derive(Debug)]
+struct TraceIdFormat {
+    inner: Format<Json>,
+}
+
+impl TraceIdFormat {
+    fn new() -> Self {
+        Self {
+            inner: tracing_subscriber::fmt::format().json(),
+        }
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for TraceIdFormat
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        context: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let Some((trace_id, span_id)) = current_ids() else {
+            return self.inner.format_event(context, writer, event);
+        };
+        let mut line = String::new();
+        self.inner
+            .format_event(context, Writer::new(&mut line), event)?;
+        match line.trim_end().strip_suffix('}') {
+            Some(body) => writeln!(
+                writer,
+                "{body},\"trace_id\":\"{trace_id}\",\"span_id\":\"{span_id}\"}}"
+            ),
+            None => writer.write_str(&line),
+        }
+    }
+}
+
+#[cfg(feature = "otel")]
+fn current_ids() -> Option<(String, String)> {
+    use opentelemetry::trace::TraceContextExt as _;
+
+    let context = opentelemetry::Context::current();
+    let span = context.span();
+    let span_context = span.span_context();
+    (span_context.is_valid() && span_context.is_sampled()).then(|| {
+        (
+            format!("{:032x}", span_context.trace_id()),
+            format!("{:016x}", span_context.span_id()),
+        )
+    })
+}
+
+#[cfg(not(feature = "otel"))]
+fn current_ids() -> Option<(String, String)> {
+    None
+}
+
 pub fn plan(config: &TelemetryConfig, env_endpoint: Option<&str>) -> TelemetryPlan {
     let configured = config.otlp_endpoint.as_deref().filter(|e| !e.is_empty());
     let environment = env_endpoint.filter(|e| !e.is_empty());
@@ -171,12 +264,13 @@ pub fn plan(config: &TelemetryConfig, env_endpoint: Option<&str>) -> TelemetryPl
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::Arc;
+    use std::io::{self, Write};
     use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use pg_cdc_testkit::{OtlpReceiver, blackhole};
-    use tracing_subscriber::layer::SubscriberExt;
+    use serde_json::Value;
 
     use super::*;
     use crate::health::Role;
@@ -190,6 +284,40 @@ mod tests {
             otlp_endpoint: endpoint.map(str::to_owned),
             trace_sample_ratio: ratio,
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn lines(buffer: &Shared, flush: &crate::logs::LogFlush) -> Vec<Value> {
+        assert!(flush.flush(Duration::from_secs(5)));
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn message(line: &Value) -> &str {
+        line["fields"]["message"].as_str().unwrap()
+    }
+
+    fn is_hex(value: &Value, digits: usize) -> bool {
+        value.as_str().is_some_and(|text| {
+            text.len() == digits && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
     }
 
     fn identity() -> TelemetryIdentity {
@@ -267,6 +395,23 @@ mod tests {
         assert!(!metrics::enabled());
         assert!(telemetry.flush(Duration::ZERO));
         assert!(telemetry.shutdown(Duration::ZERO));
+    }
+
+    #[test]
+    fn without_telemetry_debug_spans_are_disabled_at_their_callsites() {
+        let buffer = Shared::default();
+        let (writer, flush) = crate::logs::non_blocking(buffer.clone(), 64).unwrap();
+        let subscriber = subscriber(writer, EnvFilter::new("info"), None);
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!(target: "pg_cdc::lane", "sink_send");
+            assert!(span.is_disabled());
+            tracing::info!(target: "pg_cdc::session", "hello");
+        });
+        let lines = lines(&buffer, &flush);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(message(&lines[0]), "hello");
+        assert!(lines[0].get("trace_id").is_none());
+        assert!(lines[0].get("span_id").is_none());
     }
 
     #[cfg(not(feature = "otel"))]
@@ -483,6 +628,29 @@ mod tests {
                 .unwrap();
             assert!(exports.span_names().contains("sink_send"));
             assert!(exports.log_bodies().contains(&"hello".to_owned()));
+            assert!(telemetry.shutdown(FLUSH));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn log_lines_inside_a_sampled_span_carry_trace_and_span_ids() {
+            let receiver = OtlpReceiver::start().await.unwrap();
+            let (telemetry, layers) = install(&receiver.endpoint(), &Status::new(), &Health::new());
+            let buffer = Shared::default();
+            let (writer, flush) = crate::logs::non_blocking(buffer.clone(), 64).unwrap();
+            let subscriber = subscriber(writer, EnvFilter::new("info"), layers);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!(target: "pg_cdc::session", "handover");
+                span.in_scope(|| tracing::info!(target: "pg_cdc::session", "inside"));
+                tracing::info!(target: "pg_cdc::session", "outside");
+            });
+            let lines = lines(&buffer, &flush);
+            let inside = lines.iter().find(|l| message(l) == "inside").unwrap();
+            assert!(is_hex(&inside["trace_id"], 32), "{inside}");
+            assert!(is_hex(&inside["span_id"], 16), "{inside}");
+            assert_eq!(inside["fields"]["message"], "inside");
+            let outside = lines.iter().find(|l| message(l) == "outside").unwrap();
+            assert!(outside.get("trace_id").is_none(), "{outside}");
+            assert!(outside.get("span_id").is_none(), "{outside}");
             assert!(telemetry.shutdown(FLUSH));
         }
 
