@@ -14,7 +14,7 @@ enum Seen {
         count: u64,
     },
     CommitToDelivery(Duration),
-    Sink(SinkOutcome),
+    Sink(SinkOutcome, Duration),
     Other,
 }
 
@@ -36,7 +36,7 @@ impl Recorder for Collecting {
                 count,
             },
             Measurement::CommitToDelivery(elapsed) => Seen::CommitToDelivery(elapsed),
-            Measurement::Sink { outcome, .. } => Seen::Sink(outcome),
+            Measurement::Sink { outcome, elapsed } => Seen::Sink(outcome, elapsed),
             _ => Seen::Other,
         };
         self.0.lock().unwrap().push(seen);
@@ -63,6 +63,17 @@ fn counted(seen: &Mutex<Vec<Seen>>, table: &str, outcome: EventOutcome) -> u64 {
             _ => 0,
         })
         .sum()
+}
+
+fn sink_points(seen: &Mutex<Vec<Seen>>) -> Vec<(SinkOutcome, Duration)> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| match entry {
+            Seen::Sink(outcome, elapsed) => Some((*outcome, *elapsed)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn label(name: &str, value: &str) -> (String, AttributeValue) {
@@ -115,7 +126,10 @@ async fn delivery_records_events_sink_calls_and_commit_latency() {
         count: 1,
     };
     assert_eq!(seen.iter().filter(|entry| **entry == delivered).count(), 3);
-    assert!(seen.contains(&Seen::Sink(SinkOutcome::Delivered)));
+    assert!(
+        seen.iter()
+            .any(|entry| matches!(entry, Seen::Sink(SinkOutcome::Delivered, _)))
+    );
     let latencies: Vec<Duration> = seen
         .iter()
         .filter_map(|entry| match entry {
@@ -158,9 +172,9 @@ async fn parking_and_dead_events_are_counted() {
     assert_eq!(counted(&seen, "payments", EventOutcome::Parked), 1);
     assert_eq!(counted(&seen, "payments", EventOutcome::Dead), 1);
     assert!(
-        seen.lock()
-            .unwrap()
-            .contains(&Seen::Sink(SinkOutcome::Retryable))
+        sink_points(&seen)
+            .iter()
+            .any(|(outcome, _)| *outcome == SinkOutcome::Retryable)
     );
 }
 
@@ -302,4 +316,73 @@ async fn an_oversized_parked_head_counts_as_dead_under_its_labels() {
         dead_events(&seen),
         vec![("orders".to_owned(), "update".to_owned(), 1)]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_sink_call_records_one_point_timed_over_the_call() {
+    let seen = recording();
+    let mut sink = ScriptedSink::delivering();
+    sink.latency = Duration::from_millis(30);
+    let mut harness = Harness::new(1, 1, sink).await;
+    for (ordinal, key) in [(0, b"a"), (1, b"a"), (2, b"b")] {
+        harness.send(ordinal, key, 1).unwrap();
+    }
+    harness.settle(3).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let calls = harness.sink.batches().len();
+    assert!(calls >= 2, "{:?}", harness.sink.batches());
+    assert_eq!(
+        sink_points(&seen),
+        vec![(SinkOutcome::Delivered, Duration::from_millis(30)); calls]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mixed_batch_records_its_worst_outcome() {
+    let seen = recording();
+    let script: Script = Box::new(|ordinal, attempt| match (ordinal, attempt) {
+        (1, 1) => Outcome::Retryable(SinkError("throttled".to_owned())),
+        (2, _) => Outcome::Terminal(SinkError("rejected".to_owned())),
+        _ => Outcome::Delivered,
+    });
+    let mut harness = Harness::new(1, 1, ScriptedSink::new(LIMITS, script)).await;
+    for (ordinal, key) in [(0, b"a"), (1, b"b"), (2, b"c")] {
+        harness.send(ordinal, key, 1).unwrap();
+    }
+    harness.settle(3).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(harness.sink.batches()[0], vec![0, 1, 2]);
+    let outcomes: Vec<SinkOutcome> = sink_points(&seen)
+        .into_iter()
+        .map(|(outcome, _)| outcome)
+        .collect();
+    assert_eq!(outcomes.first(), Some(&SinkOutcome::Terminal));
+    assert_eq!(outcomes.len(), harness.sink.batches().len());
+}
+
+#[test]
+fn the_worst_outcome_wins_terminal_over_retryable_over_delivered() {
+    let seen = recording();
+    let delivered = || Outcome::Delivered;
+    let retryable = || Outcome::Retryable(SinkError("throttled".to_owned()));
+    let terminal = || Outcome::Terminal(SinkError("rejected".to_owned()));
+    let elapsed = Duration::from_millis(7);
+    let cases = [
+        (vec![delivered(), delivered()], SinkOutcome::Delivered),
+        (vec![delivered(), retryable()], SinkOutcome::Retryable),
+        (vec![retryable(), delivered()], SinkOutcome::Retryable),
+        (vec![delivered(), terminal()], SinkOutcome::Terminal),
+        (vec![terminal(), retryable()], SinkOutcome::Terminal),
+        (
+            vec![retryable(), terminal(), delivered()],
+            SinkOutcome::Terminal,
+        ),
+    ];
+    for (outcomes, _) in &cases {
+        record_sink_call(&tracing::Span::none(), outcomes, Some(elapsed));
+    }
+    record_sink_call(&tracing::Span::none(), &[terminal()], None);
+    let expected: Vec<(SinkOutcome, Duration)> =
+        cases.iter().map(|(_, worst)| (*worst, elapsed)).collect();
+    assert_eq!(sink_points(&seen), expected);
 }
