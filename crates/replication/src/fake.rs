@@ -56,6 +56,15 @@ pub(crate) fn spawn_start(
     (start, FakeServer::new(server))
 }
 
+pub(crate) fn spawn_login(
+    config: ReplicationConfig,
+) -> (JoinHandle<Result<(), ReplicationError>>, FakeServer) {
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let check =
+        tokio::spawn(async move { crate::startup::verify_on(Box::new(client), &config).await });
+    (check, FakeServer::new(server))
+}
+
 pub(crate) async fn started(config: ReplicationConfig) -> (ReplicationStream, FakeServer) {
     let (start, mut server) = spawn_start(config);
     server.read_startup().await;

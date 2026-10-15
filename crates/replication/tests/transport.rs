@@ -4,7 +4,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use pg_cdc_decoder::Lsn;
 use pg_cdc_decoder::message::{LogicalMessage, decode};
-use pg_cdc_replication::{ReplicationConfig, ReplicationEvent, ReplicationStream, TlsSetup};
+use pg_cdc_replication::{
+    ReplicationConfig, ReplicationEvent, ReplicationStream, TlsSetup, verify_login,
+};
 use pg_cdc_testkit::{Postgres, PostgresOptions, SESSION_OPTIONS};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, ServerName};
@@ -228,6 +230,34 @@ async fn a_wrong_password_is_28p01() -> TestResult {
     .err()
     .ok_or("a wrong password connected")?;
     assert_eq!(error.sqlstate(), Some("28P01"), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_login_check_needs_the_replication_attribute_and_never_takes_the_slot() -> TestResult {
+    let pg = Postgres::start().await?;
+    let start = prepare(&pg, "login_probe").await?;
+    verify_login(&config(&pg, start)).await?;
+    let state = pg.slot_state(SLOT).await?.ok_or("the slot disappeared")?;
+    assert!(!state.active);
+
+    let holder = ReplicationStream::start(config(&pg, start)).await?;
+    verify_login(&config(&pg, start)).await?;
+    let state = pg.slot_state(SLOT).await?.ok_or("the slot disappeared")?;
+    assert_eq!(state.active_pid, Some(i32::try_from(holder.backend_pid())?));
+
+    pg.execute("CREATE ROLE no_replication LOGIN PASSWORD 'no_replication'")
+        .await?;
+    let error = verify_login(&ReplicationConfig {
+        user: "no_replication".to_owned(),
+        password: Some(SecretString::from("no_replication".to_owned())),
+        ..config(&pg, start)
+    })
+    .await
+    .err()
+    .ok_or("a role without REPLICATION opened a walsender")?;
+    assert_eq!(error.sqlstate(), Some("42501"), "{error}");
+    holder.stop().await?;
     Ok(())
 }
 

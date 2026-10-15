@@ -99,10 +99,37 @@ async fn negotiate_tls(
     Ok(Box::new(stream))
 }
 
+pub async fn verify_login(config: &ReplicationConfig) -> Result<(), ReplicationError> {
+    let timeout = config.connect_timeout;
+    let check = async { verify_on(open(config).await?, config).await };
+    tokio::time::timeout(timeout, check)
+        .await
+        .unwrap_or(Err(ReplicationError::Timeout(timeout)))
+}
+
+pub(crate) async fn verify_on(
+    io: Box<dyn Io>,
+    config: &ReplicationConfig,
+) -> Result<(), ReplicationError> {
+    let mut conn = Conn::new(io);
+    login(&mut conn, config).await?;
+    frontend::terminate(&mut conn.write);
+    conn.flush().await
+}
+
 pub(crate) async fn handshake(
     conn: &mut Conn,
     config: &ReplicationConfig,
 ) -> Result<u32, ReplicationError> {
+    let backend_pid = login(conn, config).await?;
+    let sql = start_replication_sql(&config.slot, config.start_lsn, &config.publication);
+    frontend::query(&sql, &mut conn.write)?;
+    conn.flush().await?;
+    expect_copy_both(conn).await?;
+    Ok(backend_pid)
+}
+
+async fn login(conn: &mut Conn, config: &ReplicationConfig) -> Result<u32, ReplicationError> {
     frontend::startup_message(
         [
             ("user", config.user.as_str()),
@@ -115,12 +142,7 @@ pub(crate) async fn handshake(
     )?;
     conn.flush().await?;
     authenticate(conn, config).await?;
-    let backend_pid = wait_until_ready(conn).await?;
-    let sql = start_replication_sql(&config.slot, config.start_lsn, &config.publication);
-    frontend::query(&sql, &mut conn.write)?;
-    conn.flush().await?;
-    expect_copy_both(conn).await?;
-    Ok(backend_pid)
+    wait_until_ready(conn).await
 }
 
 async fn authenticate(conn: &mut Conn, config: &ReplicationConfig) -> Result<(), ReplicationError> {
@@ -390,6 +412,55 @@ mod tests {
             rest.is_empty(),
             "the client sent {rest:?} after the refusal"
         );
+    }
+
+    #[tokio::test]
+    async fn a_login_check_authenticates_and_terminates_without_starting_replication() {
+        let (check, mut server) = fake::spawn_login(fake::config());
+        let parameters = server.read_startup().await;
+        assert!(
+            parameters.contains(&("replication".to_owned(), "database".to_owned())),
+            "{parameters:?}"
+        );
+        server.auth(3, b"").await;
+        let reply = server.read().await;
+        assert_eq!(
+            (reply.tag, reply.body.as_slice()),
+            (b'p', &b"password\0"[..])
+        );
+        server.ready(4242).await;
+        let terminate = server.read().await;
+        assert_eq!((terminate.tag, terminate.body.len()), (b'X', 0));
+        check.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_login_check_surfaces_a_refused_walsender() {
+        let (check, mut server) = fake::spawn_login(fake::config());
+        server.read_startup().await;
+        server.auth(0, b"").await;
+        server
+            .error("42501", "permission denied to start WAL sender")
+            .await;
+        let error = check.await.unwrap().unwrap_err();
+        assert_eq!(error.sqlstate(), Some("42501"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_login_check_against_a_silent_server_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = fake::config();
+        config.port = listener.local_addr().unwrap().port();
+        config.connect_timeout = Duration::from_millis(200);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut server = FakeServer::new(socket);
+            server.read_startup().await;
+            std::future::pending::<()>().await;
+        });
+        let error = crate::verify_login(&config).await.unwrap_err();
+        assert!(matches!(error, ReplicationError::Timeout(_)), "{error:?}");
+        server.abort();
     }
 
     #[tokio::test]
