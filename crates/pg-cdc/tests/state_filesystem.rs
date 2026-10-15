@@ -145,3 +145,14 @@ mod unsyncable_directories {
         Ok(())
     }
 }
+
+#[tokio::test]
+async fn a_concurrency_above_the_semaphore_limit_is_capped_instead_of_panicking() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = FilesystemStateStore::new(dir.path(), "orders", usize::MAX);
+    let queue = key(0x01, 1)?;
+    let parked = event(queue, id(1, 0), ParkStatus::Retrying);
+    store.append_parked(std::slice::from_ref(&parked)).await?;
+    assert_eq!(store.read_parked(&queue, None, 10).await?, vec![parked]);
+    Ok(())
+}

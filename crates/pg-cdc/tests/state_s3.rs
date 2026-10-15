@@ -119,7 +119,13 @@ async fn heads_load_across_listing_pages() -> TestResult {
 #[tokio::test]
 async fn a_missing_bucket_reports_the_store_unavailable() -> TestResult {
     let aws = AwsEmulator::start().await?;
-    let store = S3StateStore::new(aws.s3().await, "missing".to_owned(), "", "orders", 4);
+    let store = S3StateStore::new(
+        aws.s3().await,
+        "missing".to_owned(),
+        "",
+        "orders",
+        usize::MAX,
+    );
     let result = store.load_parked_heads(0).await;
     assert!(
         matches!(&result, Err(StoreError::Unavailable(message)) if message.contains("NoSuchBucket")),

@@ -129,7 +129,9 @@ pub async fn run_session(
         .await
         .map_err(|error| stream_fault(error, start))?;
     let (reports, mut settled) = mpsc::unbounded_channel();
-    let permits = Arc::new(Semaphore::new(config.sink_concurrency.max(1)));
+    let permits = Arc::new(Semaphore::new(
+        config.sink_concurrency.clamp(1, Semaphore::MAX_PERMITS),
+    ));
     let mut session = Session {
         control: &control,
         types: TypeResolver::new(),

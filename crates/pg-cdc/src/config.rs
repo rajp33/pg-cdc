@@ -18,6 +18,7 @@ pub const MAX_ATTRIBUTE_COLUMNS: usize = 7;
 pub const DEFAULT_PARK_AFTER: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_PARKED_EVENTS: u64 = 10_000_000;
 pub const DEFAULT_STORE_CONCURRENCY: usize = 32;
+pub const MAX_CONCURRENCY: usize = 4096;
 const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,13 +153,7 @@ impl StateStoreConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.max_concurrency() == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "state_store.max_concurrency",
-                value: "0".to_owned(),
-                reason: "must be greater than zero",
-            });
-        }
+        check_concurrency("state_store.max_concurrency", self.max_concurrency())?;
         match self {
             Self::S3(s3) => validate_bucket("state_store.bucket", &s3.bucket),
             Self::Filesystem(filesystem) if filesystem.path.as_os_str().is_empty() => {
@@ -188,6 +183,17 @@ pub struct S3PayloadConfig {
     pub prefix: String,
     #[serde(default, deserialize_with = "de_opt_string")]
     pub region: Option<String>,
+}
+
+fn check_concurrency(field: &'static str, value: usize) -> Result<(), ConfigError> {
+    if (1..=MAX_CONCURRENCY).contains(&value) {
+        return Ok(());
+    }
+    Err(ConfigError::InvalidValue {
+        field,
+        value: value.to_string(),
+        reason: "must be from 1 to 4096",
+    })
 }
 
 fn validate_bucket(field: &'static str, bucket: &str) -> Result<(), ConfigError> {
@@ -477,13 +483,7 @@ impl Config {
         if let Some(PayloadStoreConfig::S3(payload)) = &self.payload_store {
             validate_bucket("payload_store.bucket", &payload.bucket)?;
         }
-        if self.sink.max_concurrency() == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "sink.max_concurrency",
-                value: "0".to_owned(),
-                reason: "must be greater than zero",
-            });
-        }
+        check_concurrency("sink.max_concurrency", self.sink.max_concurrency())?;
         match &self.sink {
             SinkConfig::Sns(sns) => sns.validate(),
             SinkConfig::Stdout(_) | SinkConfig::Discard(_) => Ok(()),
@@ -1149,18 +1149,32 @@ state_store:
             let config = parse(&MINIMAL.replace("stdout", sink), vars).unwrap();
             assert_eq!(config.sink.max_concurrency(), 3, "{sink}");
 
-            let zero = MINIMAL.replace(
+            for bad in ["0", "4097", "18446744073709551615"] {
+                let invalid = MINIMAL.replace(
+                    "type: stdout\n",
+                    &format!("type: {sink}\n  max_concurrency: {bad}\n"),
+                );
+                assert!(
+                    matches!(
+                        parse(&invalid, with_password()),
+                        Err(ConfigError::InvalidValue {
+                            field: "sink.max_concurrency",
+                            ..
+                        })
+                    ),
+                    "{sink} {bad}"
+                );
+            }
+            let most = MINIMAL.replace(
                 "type: stdout\n",
-                &format!("type: {sink}\n  max_concurrency: 0\n"),
+                &format!("type: {sink}\n  max_concurrency: 4096\n"),
             );
-            assert!(
-                matches!(
-                    parse(&zero, with_password()),
-                    Err(ConfigError::InvalidValue {
-                        field: "sink.max_concurrency",
-                        ..
-                    })
-                ),
+            assert_eq!(
+                parse(&most, with_password())
+                    .unwrap()
+                    .sink
+                    .max_concurrency(),
+                MAX_CONCURRENCY,
                 "{sink}"
             );
 
@@ -1365,6 +1379,14 @@ state_store:
         for (sections, field) in [
             (
                 "state_store:\n  type: filesystem\n  path: /x\n  max_concurrency: 0\n",
+                "state_store.max_concurrency",
+            ),
+            (
+                "state_store:\n  type: filesystem\n  path: /x\n  max_concurrency: 4097\n",
+                "state_store.max_concurrency",
+            ),
+            (
+                "state_store:\n  type: s3\n  bucket: b\n  max_concurrency: 18446744073709551615\n",
                 "state_store.max_concurrency",
             ),
             (

@@ -75,7 +75,9 @@ impl S3StateStore {
             client,
             bucket,
             root: store_root(prefix, pipeline),
-            permits: Arc::new(Semaphore::new(max_concurrency.max(1))),
+            permits: Arc::new(Semaphore::new(
+                max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
+            )),
         }
     }
 

@@ -34,7 +34,9 @@ impl FilesystemStateStore {
     pub fn new(path: &Path, pipeline: &str, max_concurrency: usize) -> Self {
         Self {
             root: path.join(pipeline),
-            permits: Arc::new(Semaphore::new(max_concurrency.max(1))),
+            permits: Arc::new(Semaphore::new(
+                max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
+            )),
         }
     }
 
