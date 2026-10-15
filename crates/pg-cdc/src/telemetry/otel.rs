@@ -6,7 +6,10 @@ use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, Value};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+use opentelemetry_otlp::{
+    LogExporter, MetricExporter, SpanExporter, WithExportConfig, WithTonicConfig,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{SdkMeterProvider, Temporality};
@@ -77,10 +80,32 @@ pub(super) fn build(
     status: &Status,
     health: &Health,
 ) -> Result<(Providers, TelemetryLayers), TelemetryError> {
+    build_with(
+        endpoint,
+        &collector_tls(),
+        sample_ratio,
+        identity,
+        status,
+        health,
+    )
+}
+
+fn collector_tls() -> ClientTlsConfig {
+    ClientTlsConfig::new().with_webpki_roots()
+}
+
+fn build_with(
+    endpoint: &str,
+    tls: &ClientTlsConfig,
+    sample_ratio: f64,
+    identity: &TelemetryIdentity,
+    status: &Status,
+    health: &Health,
+) -> Result<(Providers, TelemetryLayers), TelemetryError> {
     let resource = resource(identity, std::env::var(SERVICE_NAME_VARIABLE).ok());
-    let tracer = tracer_provider(endpoint, sample_ratio, &resource)?;
-    let meter = meter_provider(endpoint, &resource)?;
-    let logger = logger_provider(endpoint, &resource)?;
+    let tracer = tracer_provider(endpoint, tls, sample_ratio, &resource)?;
+    let meter = meter_provider(endpoint, tls, &resource)?;
+    let logger = logger_provider(endpoint, tls, &resource)?;
     let meter_handle = meter.meter(METER_NAME);
     register_gauges(&meter_handle, status, health);
     let recorder = OtelRecorder::new(&meter_handle);
@@ -124,11 +149,13 @@ fn exporter_error(signal: &'static str, error: &impl std::fmt::Display) -> Telem
 
 fn tracer_provider(
     endpoint: &str,
+    tls: &ClientTlsConfig,
     sample_ratio: f64,
     resource: &Resource,
 ) -> Result<SdkTracerProvider, TelemetryError> {
     let exporter = SpanExporter::builder()
         .with_tonic()
+        .with_tls_config(tls.clone())
         .with_endpoint(endpoint)
         .with_timeout(EXPORT_TIMEOUT)
         .build()
@@ -142,9 +169,14 @@ fn tracer_provider(
         .build())
 }
 
-fn meter_provider(endpoint: &str, resource: &Resource) -> Result<SdkMeterProvider, TelemetryError> {
+fn meter_provider(
+    endpoint: &str,
+    tls: &ClientTlsConfig,
+    resource: &Resource,
+) -> Result<SdkMeterProvider, TelemetryError> {
     let exporter = MetricExporter::builder()
         .with_tonic()
+        .with_tls_config(tls.clone())
         .with_endpoint(endpoint)
         .with_timeout(EXPORT_TIMEOUT)
         .with_temporality(Temporality::Cumulative)
@@ -158,10 +190,12 @@ fn meter_provider(endpoint: &str, resource: &Resource) -> Result<SdkMeterProvide
 
 fn logger_provider(
     endpoint: &str,
+    tls: &ClientTlsConfig,
     resource: &Resource,
 ) -> Result<SdkLoggerProvider, TelemetryError> {
     let exporter = LogExporter::builder()
         .with_tonic()
+        .with_tls_config(tls.clone())
         .with_endpoint(endpoint)
         .with_timeout(EXPORT_TIMEOUT)
         .build()
@@ -355,6 +389,9 @@ fn register_gauges(meter: &Meter, status: &Status, health: &Health) {
 #[cfg(test)]
 mod tests {
     use opentelemetry::Key;
+    use opentelemetry_otlp::tonic_types::transport::Certificate;
+    use pg_cdc_testkit::{OtlpReceiver, Received};
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
 
@@ -398,6 +435,69 @@ mod tests {
         );
         let blank = resource(&identity(), Some(String::new()));
         assert_eq!(attribute(&blank, "service.name").as_deref(), Some("pg-cdc"));
+    }
+
+    #[test]
+    fn the_collector_trust_store_is_the_webpki_roots() {
+        let tls = format!("{:?}", collector_tls());
+        assert!(tls.contains("with_webpki_roots: true"), "{tls}");
+    }
+
+    const SETTLE: Duration = Duration::from_secs(10);
+    const FLUSH: Duration = Duration::from_secs(5);
+
+    fn export_one_of_each(receiver: &OtlpReceiver, tls: &ClientTlsConfig) -> Providers {
+        let (providers, layers) = build_with(
+            &receiver.endpoint(),
+            tls,
+            1.0,
+            &identity(),
+            &Status::new(),
+            &Health::new(),
+        )
+        .unwrap();
+        let subscriber = tracing_subscriber::registry().with(layers.into_layer());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!(target: "pg_cdc::lane", "sink_send");
+            let _entered = span.enter();
+            tracing::info!(target: "pg_cdc::session", "hello");
+        });
+        metrics::record(Measurement::Takeover(TakeoverKind::Clean));
+        assert!(providers.flush(FLUSH));
+        providers
+    }
+
+    fn every_signal(exports: &Received) -> bool {
+        exports.span_names().contains("sink_send")
+            && exports.log_bodies().iter().any(|body| body == "hello")
+            && exports.sum("pgcdc.takeovers", &[("kind", "clean")]) == Some(1.0)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_signal_exports_over_https_to_a_collector_the_exporters_trust() {
+        let receiver = OtlpReceiver::start_tls().await.unwrap();
+        let trusted =
+            collector_tls().ca_certificate(Certificate::from_pem(receiver.ca_pem().unwrap()));
+        let providers = export_one_of_each(&receiver, &trusted);
+        receiver.wait_for(SETTLE, every_signal).await.unwrap();
+        assert!(providers.shutdown(FLUSH));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_signal_reaches_a_collector_whose_certificate_is_untrusted() {
+        let receiver = OtlpReceiver::start_tls().await.unwrap();
+        let providers = export_one_of_each(&receiver, &collector_tls());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let exports = receiver.received();
+        assert_eq!(
+            (
+                exports.metrics.len(),
+                exports.spans.len(),
+                exports.logs.len()
+            ),
+            (0, 0, 0)
+        );
+        assert!(providers.shutdown(FLUSH));
     }
 
     #[test]
