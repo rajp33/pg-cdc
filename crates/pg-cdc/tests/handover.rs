@@ -29,6 +29,7 @@ const LOSER_QUIET: Duration = Duration::from_secs(3);
 const SLOT: &str = "handover_slot";
 const TOOK_OVER: &str = "took over the slot";
 const STANDBY: &str = "waiting as standby";
+const RECONNECTING: &str = "replication session ended; reconnecting";
 
 struct Deployment {
     pg: Postgres,
@@ -75,6 +76,16 @@ impl Deployment {
 
     fn leader_record(&self) -> TestResult<Value> {
         leader_record(self.state.path())
+    }
+
+    fn config_as(&self, user: &str) -> TestResult<tempfile::NamedTempFile> {
+        let text = std::fs::read_to_string(self.config.path())?.replace(
+            &format!("\n  user: {}\n", self.pg.user()),
+            &format!("\n  user: {user}\n"),
+        );
+        let mut config = tempfile::NamedTempFile::new()?;
+        config.write_all(text.as_bytes())?;
+        Ok(config)
     }
 
     async fn wait_for_record(&self, state: &str, epoch: u64) -> TestResult<bool> {
@@ -222,6 +233,24 @@ impl Task {
             }
             if Instant::now() >= deadline {
                 return Ok(None);
+            }
+            sleep(POLL).await;
+        }
+    }
+
+    async fn wait_for_logs(&self, message: &str, count: usize) -> TestResult<Vec<Value>> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let found: Vec<Value> = snapshot(&self.logs)?
+                .into_iter()
+                .map(|(_, log)| log)
+                .filter(|log| log_message(log) == Some(message))
+                .collect();
+            if found.len() >= count {
+                return Ok(found);
+            }
+            if Instant::now() >= deadline || self.find_log(STANDBY)?.is_some() {
+                return Err(format!("{} {message:?} logs, not {count}", found.len()).into());
             }
             sleep(POLL).await;
         }
@@ -581,6 +610,49 @@ async fn a_standby_that_loses_the_race_keeps_polling() -> TestResult {
     loser.sigterm().await?;
     let status = loser.exit(SHUTDOWN_BUDGET).await?;
     assert!(status.success(), "{status}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replacement_without_replication_stays_unhealthy_while_the_holder_streams() -> TestResult
+{
+    let deployment = Deployment::start().await?;
+    let mut a = deployment.spawn()?;
+    a.wait_for_log(TOOK_OVER).await?;
+    deployment.insert(1, 1, "one").await?;
+    a.wait_for_row(1, "one").await?;
+    let walsender = deployment.walsender_pid().await?;
+    deployment
+        .pg
+        .execute("CREATE ROLE no_replication LOGIN PASSWORD 'no_replication'")
+        .await?;
+    let config = deployment.config_as("no_replication")?;
+    let mut b = Task::spawn(config.path(), "no_replication")?;
+    let failures = b.wait_for_logs(RECONNECTING, 2).await?;
+    for failure in &failures {
+        let error = log_field(failure, "error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(error.contains("42501"), "{error}");
+    }
+    assert!(
+        !b.health_ok().await?,
+        "a replacement without REPLICATION must stay unhealthy"
+    );
+    assert!(
+        b.find_log(STANDBY)?.is_none(),
+        "the replacement went standby"
+    );
+    assert!(a.running()?, "the holder exited");
+    assert_eq!(deployment.walsender_pid().await?, walsender);
+    deployment.insert(2, 2, "one").await?;
+    a.wait_for_row(2, "one").await?;
+    assert_eq!(b.events()?.len(), 0);
+    for task in [&mut a, &mut b] {
+        task.sigterm().await?;
+        let status = task.exit(SHUTDOWN_BUDGET).await?;
+        assert!(status.success(), "{status}");
+    }
     Ok(())
 }
 

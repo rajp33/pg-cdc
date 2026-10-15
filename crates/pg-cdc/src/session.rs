@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use pg_cdc_decoder::Lsn;
 use pg_cdc_decoder::message::{DecodeError, LogicalMessage, Relation, decode};
 use pg_cdc_replication::{
-    ReplicationConfig, ReplicationError, ReplicationEvent, ReplicationStream,
+    ReplicationConfig, ReplicationError, ReplicationEvent, ReplicationStream, verify_login,
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinError;
@@ -39,6 +39,8 @@ pub const REPLICATION_BUFFER: usize = 64;
 pub const HANDOVER_TAIL: Duration = Duration::from_secs(3);
 pub const LANE_STOP_GRACE: Duration = Duration::from_secs(1);
 pub const CONTROL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+const INSUFFICIENT_PRIVILEGE: &str = "42501";
 
 #[must_use]
 pub fn shutdown_budget(drain_timeout: Duration) -> Duration {
@@ -328,7 +330,45 @@ async fn prepare(
     )
     .await
     .map_err(|_| SessionError::ControlStalled(CONTROL_QUERY_TIMEOUT))??;
+    check_login(&params, config, health).await?;
+    health.set_validated(true);
     Ok((params, control))
+}
+
+async fn check_login(
+    params: &ConnectParams,
+    config: &SessionConfig,
+    health: &Health,
+) -> Result<(), SessionError> {
+    let replication = replication_config(params, config, Lsn(0)).await?;
+    let Err(error) = verify_login(&replication).await else {
+        return Ok(());
+    };
+    let error = login_fault(error);
+    if matches!(error, SessionError::Invalid(_)) {
+        health.set_validated(false);
+    }
+    Err(error)
+}
+
+fn refused(error: &ReplicationError) -> bool {
+    match error {
+        ReplicationError::Server { sqlstate, .. } => {
+            sqlstate.starts_with("28") || sqlstate == INSUFFICIENT_PRIVILEGE
+        }
+        ReplicationError::PasswordRequired
+        | ReplicationError::UnsupportedAuthentication(_)
+        | ReplicationError::UnsupportedSasl(_) => true,
+        _ => false,
+    }
+}
+
+fn login_fault(error: ReplicationError) -> SessionError {
+    if refused(&error) {
+        Invalid::ReplicationDenied(error.to_string()).into()
+    } else {
+        SessionError::Replication(error)
+    }
 }
 
 async fn check_source(
@@ -337,7 +377,7 @@ async fn check_source(
     health: &Health,
 ) -> Result<(), SessionError> {
     match validate(control.client(), &config.slot, &config.publication).await {
-        Ok(_) => health.set_validated(true),
+        Ok(_) => {}
         Err(ValidationError::Invalid(invalid)) => {
             health.set_validated(false);
             return Err(invalid.into());
@@ -422,6 +462,8 @@ impl SlotProbe for ControlProbe {
 pub fn start_error(error: ReplicationError, at: Lsn) -> StartError<SessionError> {
     if error.sqlstate() == Some(OBJECT_IN_USE) {
         StartError::InUse
+    } else if refused(&error) {
+        StartError::Failed(login_fault(error))
     } else {
         StartError::Failed(stream_fault(error, at))
     }
@@ -881,6 +923,52 @@ mod tests {
             stream_fault(ReplicationError::Protocol("startup".to_owned()), Lsn(0x20)).fault_lsn(),
             Some(Lsn(0x20))
         ));
+    }
+
+    #[test]
+    fn a_refused_replication_login_is_a_misconfiguration() {
+        let server = |sqlstate: &str| ReplicationError::Server {
+            sqlstate: sqlstate.to_owned(),
+            message: "refused".to_owned(),
+        };
+        let refusals = || {
+            [
+                server("42501"),
+                server("28000"),
+                server("28P01"),
+                ReplicationError::PasswordRequired,
+                ReplicationError::UnsupportedAuthentication(7),
+                ReplicationError::UnsupportedSasl("SCRAM-SHA-256-PLUS".to_owned()),
+            ]
+        };
+        for error in refusals() {
+            let text = error.to_string();
+            assert!(
+                matches!(
+                    start_error(error, Lsn(0x10)),
+                    StartError::Failed(SessionError::Invalid(Invalid::ReplicationDenied(ref reason)))
+                        if *reason == text
+                ),
+                "{text}"
+            );
+        }
+        for error in refusals() {
+            let text = error.to_string();
+            assert!(
+                matches!(
+                    login_fault(error),
+                    SessionError::Invalid(Invalid::ReplicationDenied(ref reason)) if *reason == text
+                ),
+                "{text}"
+            );
+        }
+        for error in [server("53300"), server("57P03"), ReplicationError::Closed] {
+            let text = error.to_string();
+            assert!(
+                matches!(login_fault(error), SessionError::Replication(_)),
+                "{text}"
+            );
+        }
     }
 
     #[test]

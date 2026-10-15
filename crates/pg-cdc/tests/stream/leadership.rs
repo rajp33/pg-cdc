@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pg_cdc::config::{DEFAULT_MAX_PARKED_EVENTS, LeadershipConfig};
+use pg_cdc::connection::ConnectParams;
 use pg_cdc::health::{Health, Role};
 use pg_cdc::leader::POLL_INTERVAL;
 use pg_cdc::leader::lease::FenceReason;
@@ -14,6 +15,7 @@ use pg_cdc::state::{LeaderRecord, LeaderState, StateStore, SwapOutcome, Versione
 use pg_cdc::validate::Invalid;
 use pg_cdc_decoder::Lsn;
 use pg_cdc_testkit::Postgres;
+use secrecy::SecretString;
 use serde_json::Value;
 
 use crate::support::{self, ControlProxy, LIMITS, Mode, RecordingStore, SLOT, TestResult, WAIT};
@@ -187,6 +189,92 @@ async fn a_missing_publication_fails_validation_without_taking_the_slot() -> Tes
     let slot = pg.slot_state(SLOT).await?.ok_or("the slot disappeared")?;
     assert!(!slot.active);
     Ok(())
+}
+
+async fn without_replication(pg: &Postgres) -> TestResult<ConnectParams> {
+    pg.execute("CREATE ROLE no_replication LOGIN PASSWORD 'no_replication'")
+        .await?;
+    Ok(ConnectParams {
+        user: "no_replication".to_owned(),
+        password: Some(SecretString::from("no_replication".to_owned())),
+        ..support::params(pg)
+    })
+}
+
+fn replication_denied(result: &Result<(), SessionError>) -> bool {
+    matches!(
+        result,
+        Err(SessionError::Invalid(Invalid::ReplicationDenied(reason))) if reason.contains("42501")
+    )
+}
+
+#[tokio::test]
+async fn a_role_without_replication_fails_validation_without_taking_a_free_slot() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let params = without_replication(&pg).await?;
+    let context = support::context();
+    for _ in 0..2 {
+        let session = support::spawn_in_context(
+            params.clone(),
+            support::config(FAST, BUFFER),
+            support::memory_stores(),
+            LIMITS,
+            context.clone(),
+        );
+        let result = session.finished(Duration::from_secs(5)).await?;
+        assert!(replication_denied(&result), "{result:?}");
+        let snapshot = context.health.snapshot();
+        assert!(!snapshot.validated, "{snapshot:?}");
+        assert!(!snapshot.healthy(), "{snapshot:?}");
+        let slot = pg.slot_state(SLOT).await?.ok_or("the slot disappeared")?;
+        assert!(!slot.active);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_role_without_replication_never_turns_healthy_beside_the_holder() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let mut holder = support::spawn_in_context(
+        support::params(&pg),
+        support::config(FAST, BUFFER),
+        support::memory_stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    pg.execute("INSERT INTO orders VALUES (1, 'a')").await?;
+    assert_eq!(holder.next_event().await?["after"]["id"], 1);
+    let walsender = pg
+        .slot_state(SLOT)
+        .await?
+        .and_then(|state| state.active_pid);
+
+    let context = support::context_for("holder-b");
+    let replacement = support::spawn_in_context(
+        without_replication(&pg).await?,
+        support::config(FAST, BUFFER),
+        support::memory_stores(),
+        LIMITS,
+        context.clone(),
+    );
+    let result = replacement.finished(Duration::from_secs(5)).await?;
+
+    assert!(replication_denied(&result), "{result:?}");
+    let snapshot = context.health.snapshot();
+    assert!(!snapshot.validated, "{snapshot:?}");
+    assert!(!snapshot.healthy(), "{snapshot:?}");
+    assert_eq!(snapshot.role, Role::Standby);
+    assert_eq!(
+        pg.slot_state(SLOT)
+            .await?
+            .and_then(|state| state.active_pid),
+        walsender
+    );
+    pg.execute("INSERT INTO orders VALUES (2, 'a')").await?;
+    assert_eq!(holder.next_event().await?["after"]["id"], 2);
+    holder.stop().await
 }
 
 #[tokio::test]
@@ -1010,6 +1098,9 @@ async fn the_final_status_update_reaches_the_slot_before_the_release() -> TestRe
     Ok(())
 }
 
+const CONTROL: usize = 0;
+const STREAMING: usize = 2;
+
 #[tokio::test]
 async fn a_final_status_update_that_cannot_be_sent_keeps_the_record_active() -> TestResult {
     let pg = Postgres::start().await?;
@@ -1029,8 +1120,8 @@ async fn a_final_status_update_that_cannot_be_sent_keeps_the_record_active() -> 
     a.wait_for_sink_call().await?;
 
     a.request_stop();
-    proxy.freeze(0)?;
-    proxy.sever(1)?;
+    proxy.freeze(CONTROL)?;
+    proxy.sever(STREAMING)?;
     tokio::time::sleep(Duration::from_millis(300)).await;
     a.set_mode(Mode::Deliver);
     let budget = HANDOVER_DRAIN * 2 + HANDOVER_TAIL + Duration::from_secs(1);

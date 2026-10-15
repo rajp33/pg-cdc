@@ -49,6 +49,8 @@ pub enum Invalid {
     SlotLost(String),
     #[error("publication {0} does not exist")]
     PublicationMissing(String),
+    #[error("the configured role cannot open a replication connection: {0}")]
+    ReplicationDenied(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
