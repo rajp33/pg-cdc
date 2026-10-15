@@ -24,6 +24,7 @@ run = [
   "taplo fmt --check",
   "typos",
   "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+  "cargo clippy -p pg-cdc --no-default-features --lib --bins -- -D warnings",
   "cargo doc --workspace --no-deps --all-features",
 ]
 

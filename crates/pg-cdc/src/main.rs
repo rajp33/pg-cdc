@@ -33,11 +33,16 @@ use pg_cdc::state::filesystem::FilesystemStateStore;
 use pg_cdc::state::s3::{S3StateStore, s3_client};
 use pg_cdc::status::Status;
 use pg_cdc::supervisor::{LiveSession, preflight, store_ready, supervise};
+use pg_cdc::telemetry::{
+    OTLP_ENDPOINT_VARIABLE, Telemetry, TelemetryIdentity, TelemetryLayers, TelemetryPlan, plan,
+    subscriber,
+};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -103,6 +108,7 @@ enum ParkedStatusArg {
 
 const ADMIN_LISTEN_VARIABLE: &str = "PGCDC__ADMIN__LISTEN";
 const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+const OTLP_PROTOCOL_VARIABLE: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -299,17 +305,42 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<PendingLog
             return (ExitCode::FAILURE, None);
         }
     };
-    let logs = match init_logging(&config.sink) {
+    let holder = holder_id();
+    let status = Status::new();
+    let health = Health::new();
+    let plan = plan(
+        &config.telemetry,
+        std::env::var(OTLP_ENDPOINT_VARIABLE).ok().as_deref(),
+    );
+    let _entered = runtime.enter();
+    let identity = TelemetryIdentity {
+        pipeline: config.pipeline.clone(),
+        holder: holder.clone(),
+    };
+    let (telemetry, layers) = match Telemetry::install(&plan, &identity, &status, &health) {
+        Ok(installed) => installed,
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "pg-cdc: cannot start telemetry: {error}");
+            return (ExitCode::FAILURE, None);
+        }
+    };
+    let logs = match init_logging(&config.sink, layers) {
         Ok(logs) => logs,
         Err(error) => {
             let _ = writeln!(std::io::stderr(), "pg-cdc: cannot start logging: {error}");
             return (ExitCode::FAILURE, None);
         }
     };
+    warn_when_telemetry_is_degraded(&plan, &telemetry);
     let drain_timeout = config.leadership.drain_timeout;
     let signalled = Arc::new(OnceLock::new());
+    let board = Board {
+        holder,
+        status,
+        health,
+    };
     let code = runtime.block_on(async {
-        match run(config, Arc::clone(&signalled)).await {
+        match run(config, Arc::clone(&signalled), board).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 tracing::error!("pg-cdc stopped: {error:#}");
@@ -318,6 +349,9 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<PendingLog
         }
     });
     let deadline = flush_deadline(signalled.get().copied(), drain_timeout);
+    if !telemetry.shutdown(flush_window(deadline, Instant::now())) {
+        tracing::warn!("telemetry did not finish exporting within the shutdown budget");
+    }
     (
         code,
         Some(PendingLogs {
@@ -327,7 +361,22 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<PendingLog
     )
 }
 
-fn init_logging(sink: &SinkConfig) -> std::io::Result<LogFlush> {
+fn warn_when_telemetry_is_degraded(plan: &TelemetryPlan, telemetry: &Telemetry) {
+    if matches!(plan, TelemetryPlan::Enabled { .. }) && !telemetry.is_enabled() {
+        tracing::warn!("telemetry is configured, but this build has no otel feature");
+    }
+    if telemetry.is_enabled()
+        && let Ok(protocol) = std::env::var(OTLP_PROTOCOL_VARIABLE)
+        && protocol != "grpc"
+    {
+        tracing::warn!(
+            %protocol,
+            "{OTLP_PROTOCOL_VARIABLE} is not grpc; only OTLP over gRPC is supported, so grpc is used"
+        );
+    }
+}
+
+fn init_logging(sink: &SinkConfig, layers: Option<TelemetryLayers>) -> std::io::Result<LogFlush> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let (writer, flush) = match sink {
         SinkConfig::Stdout(_) => logs::non_blocking(std::io::stderr(), LOG_BUFFER_LINES)?,
@@ -335,15 +384,24 @@ fn init_logging(sink: &SinkConfig) -> std::io::Result<LogFlush> {
             logs::non_blocking(std::io::stdout(), LOG_BUFFER_LINES)?
         }
     };
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .with_writer(writer)
-        .init();
+    subscriber(writer, filter, layers)
+        .try_init()
+        .map_err(std::io::Error::other)?;
     Ok(flush)
 }
 
-async fn run(config: Config, signalled: Arc<OnceLock<Instant>>) -> anyhow::Result<()> {
+#[derive(Debug)]
+struct Board {
+    holder: String,
+    status: Status,
+    health: Health,
+}
+
+async fn run(
+    config: Config,
+    signalled: Arc<OnceLock<Instant>>,
+    board: Board,
+) -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
     let interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
@@ -353,10 +411,12 @@ async fn run(config: Config, signalled: Arc<OnceLock<Instant>>) -> anyhow::Resul
         signalled,
         shutdown.clone(),
     ));
-    let holder = holder_id();
+    let Board {
+        holder,
+        status,
+        health,
+    } = board;
     tracing::info!(pipeline = %config.pipeline, slot = %config.source.slot, %holder, "pg-cdc starting");
-    let health = Health::new();
-    let status = Status::new();
     let admin = Admin::new(
         health.clone(),
         status.clone(),
