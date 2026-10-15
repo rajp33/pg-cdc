@@ -575,7 +575,16 @@ async fn health_exits_zero_only_when_healthz_returns_200() -> TestResult {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let health = pg_cdc::health::Health::new();
-    let server = tokio::spawn(pg_cdc::admin::serve(listener, health.clone()));
+    let admin = pg_cdc::admin::Admin::new(
+        health.clone(),
+        pg_cdc::status::Status::new(),
+        pg_cdc::admin::Identity {
+            pipeline: "cli".to_owned(),
+            slot: "cli_slot".to_owned(),
+            holder: "cli-host".to_owned(),
+        },
+    );
+    let server = tokio::spawn(pg_cdc::admin::serve(listener, admin));
     let flag = addr.to_string();
 
     let unhealthy = health_command(&["--addr", &flag], None).await?;

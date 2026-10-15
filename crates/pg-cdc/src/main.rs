@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use pg_cdc::admin::{self, HEALTH_TIMEOUT};
+use pg_cdc::admin::{self, Admin, HEALTH_TIMEOUT, Identity};
 use pg_cdc::config::{
     Config, Credentials, DEFAULT_ADMIN_LISTEN, PayloadStoreConfig, SinkConfig, SourceConfig,
     StateStoreConfig,
@@ -200,7 +200,18 @@ async fn run(config: Config, signalled: Arc<OnceLock<Instant>>) -> anyhow::Resul
     ));
     let holder = holder_id();
     tracing::info!(pipeline = %config.pipeline, slot = %config.source.slot, %holder, "pg-cdc starting");
-    let health = start_admin(config.admin.listen).await?;
+    let health = Health::new();
+    let status = Status::new();
+    let admin = Admin::new(
+        health.clone(),
+        status.clone(),
+        Identity {
+            pipeline: config.pipeline.clone(),
+            slot: config.source.slot.clone(),
+            holder: holder.clone(),
+        },
+    );
+    start_admin(config.admin.listen, admin.clone()).await?;
     let Some(provider) = shutdown
         .run_until_cancelled(Box::pin(provider(&config.source)))
         .await
@@ -222,6 +233,7 @@ async fn run(config: Config, signalled: Arc<OnceLock<Instant>>) -> anyhow::Resul
         tracing::info!("pg-cdc stopped cleanly");
         return Ok(());
     };
+    admin.set_state_store(Arc::clone(&stores.state));
     if !preflight(sink.as_ref(), &shutdown).await {
         tracing::info!("pg-cdc stopped cleanly");
         return Ok(());
@@ -251,7 +263,7 @@ async fn run(config: Config, signalled: Arc<OnceLock<Instant>>) -> anyhow::Resul
     let context = SessionContext {
         holder,
         health,
-        status: Status::new(),
+        status,
     };
     let mut live = LiveSession {
         config: &session,
@@ -268,7 +280,7 @@ async fn run(config: Config, signalled: Arc<OnceLock<Instant>>) -> anyhow::Resul
     Ok(())
 }
 
-async fn start_admin(listen: SocketAddr) -> anyhow::Result<Health> {
+async fn start_admin(listen: SocketAddr, admin: Admin) -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot bind admin.listen {listen}"))?;
@@ -276,9 +288,8 @@ async fn start_admin(listen: SocketAddr) -> anyhow::Result<Health> {
         .local_addr()
         .context("cannot read the admin address")?;
     tracing::info!(%addr, "admin listening");
-    let health = Health::new();
-    tokio::spawn(admin::serve(listener, health.clone()));
-    Ok(health)
+    tokio::spawn(admin::serve(listener, admin));
+    Ok(())
 }
 
 async fn sink(config: &SinkConfig) -> Arc<dyn Sink> {
