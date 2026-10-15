@@ -155,6 +155,15 @@ impl StateStore for UnparkableStore {
         self.0.load_parked_heads(partition).await
     }
 
+    async fn list_parked_queues(
+        &self,
+        after: Option<&OrderKeyId>,
+        limit: usize,
+        length_cap: usize,
+    ) -> Result<Vec<ParkedHead>, StoreError> {
+        self.0.list_parked_queues(after, limit, length_cap).await
+    }
+
     async fn read_parked(
         &self,
         key: &OrderKeyId,
@@ -297,6 +306,18 @@ impl StateStore for RecordingStore {
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
         self.record("load_parked_heads");
         self.inner.load_parked_heads(partition).await
+    }
+
+    async fn list_parked_queues(
+        &self,
+        after: Option<&OrderKeyId>,
+        limit: usize,
+        length_cap: usize,
+    ) -> Result<Vec<ParkedHead>, StoreError> {
+        self.record("list_parked_queues");
+        self.inner
+            .list_parked_queues(after, limit, length_cap)
+            .await
     }
 
     async fn read_parked(

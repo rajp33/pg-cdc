@@ -284,6 +284,52 @@ fn load_heads(root: &Path, partition: u8) -> Result<Vec<ParkedHead>, StoreError>
     Ok(heads)
 }
 
+fn list_queues(
+    root: &Path,
+    after: Option<OrderKeyId>,
+    limit: usize,
+    length_cap: usize,
+    cancelled: Cancelled<'_>,
+) -> Result<Vec<ParkedHead>, StoreError> {
+    let parked = root.join(PARKED_DIR);
+    let entries = match fs::read_dir(&parked) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(unavailable(&parked, &error)),
+    };
+    let mut keys = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| unavailable(&parked, &error))?;
+        let Some(order_key) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<OrderKeyId>().ok())
+        else {
+            continue;
+        };
+        if after.is_none_or(|after| order_key > after) {
+            keys.push(order_key);
+        }
+    }
+    keys.sort_unstable();
+    let mut queues = Vec::new();
+    for order_key in keys {
+        if queues.len() >= limit {
+            break;
+        }
+        check(cancelled)?;
+        let ids = event_ids(&key_dir(root, &order_key))?;
+        if let Some(head) = ids.first() {
+            queues.push(ParkedHead {
+                order_key,
+                head: *head,
+                length: u64::try_from(ids.len().min(length_cap.max(1))).unwrap_or(u64::MAX),
+            });
+        }
+    }
+    Ok(queues)
+}
+
 fn read(
     root: &Path,
     key: OrderKeyId,
@@ -432,6 +478,20 @@ impl StateStore for FilesystemStateStore {
 
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
         self.blocking(move |root, _| load_heads(root, partition))
+            .await
+    }
+
+    async fn list_parked_queues(
+        &self,
+        after: Option<&OrderKeyId>,
+        limit: usize,
+        length_cap: usize,
+    ) -> Result<Vec<ParkedHead>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let after = after.copied();
+        self.blocking(move |root, cancelled| list_queues(root, after, limit, length_cap, cancelled))
             .await
     }
 

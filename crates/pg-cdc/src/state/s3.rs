@@ -46,6 +46,18 @@ pub struct S3StateStore {
     permits: Arc<Semaphore>,
 }
 
+struct Page {
+    objects: Vec<String>,
+    prefixes: Vec<String>,
+    next: Option<String>,
+}
+
+fn page_size(wanted: usize) -> i32 {
+    i32::try_from(wanted)
+        .unwrap_or(S3_LIST_PAGE)
+        .min(S3_LIST_PAGE)
+}
+
 fn status<E>(error: &SdkError<E>) -> Option<u16> {
     error
         .raw_response()
@@ -182,29 +194,113 @@ impl S3StateStore {
         token: Option<String>,
         max_keys: i32,
     ) -> Result<(Vec<String>, Option<String>), StoreError> {
+        let page = self
+            .list_page(prefix, None, start_after, token, max_keys)
+            .await?;
+        Ok((page.objects, page.next))
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        delimiter: Option<&str>,
+        start_after: Option<String>,
+        token: Option<String>,
+        max_keys: i32,
+    ) -> Result<Page, StoreError> {
         let _permit = self.permit().await?;
         let output = self
             .client
             .list_objects_v2()
             .bucket(&self.bucket)
             .prefix(prefix)
+            .set_delimiter(delimiter.map(str::to_owned))
             .set_start_after(start_after)
             .set_continuation_token(token)
             .max_keys(max_keys)
             .send()
             .await
             .map_err(|error| unavailable(&error))?;
-        let keys = output
+        let objects = output
             .contents()
             .iter()
             .filter_map(|object| object.key().map(str::to_owned))
+            .collect();
+        let prefixes = output
+            .common_prefixes()
+            .iter()
+            .filter_map(|prefix| prefix.prefix().map(str::to_owned))
             .collect();
         let next = output
             .is_truncated()
             .unwrap_or(false)
             .then(|| output.next_continuation_token().map(str::to_owned))
             .flatten();
-        Ok((keys, next))
+        Ok(Page {
+            objects,
+            prefixes,
+            next,
+        })
+    }
+
+    async fn queue_keys(
+        &self,
+        after: Option<&OrderKeyId>,
+        limit: usize,
+    ) -> Result<Vec<OrderKeyId>, StoreError> {
+        let prefix = self.parked_prefix();
+        let mut start_after = after.map(|after| format!("{prefix}{after}0"));
+        let mut token = None;
+        let mut keys = Vec::new();
+        while keys.len() < limit {
+            let wanted = page_size(limit - keys.len());
+            let page = self
+                .list_page(&prefix, Some("/"), start_after.take(), token.take(), wanted)
+                .await?;
+            keys.extend(page.prefixes.iter().filter_map(|common| {
+                common
+                    .strip_prefix(&prefix)?
+                    .strip_suffix('/')?
+                    .parse::<OrderKeyId>()
+                    .ok()
+            }));
+            match page.next {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        keys.truncate(limit);
+        Ok(keys)
+    }
+
+    async fn queue_head(
+        &self,
+        key: OrderKeyId,
+        length_cap: usize,
+    ) -> Result<Option<ParkedHead>, StoreError> {
+        let prefix = format!("{}{key}/", self.parked_prefix());
+        let mut token = None;
+        let mut head = None;
+        let mut length = 0_usize;
+        while length < length_cap {
+            let wanted = page_size(length_cap - length);
+            let page = self
+                .list_page(&prefix, None, None, token.take(), wanted)
+                .await?;
+            for (_, id) in page.objects.iter().filter_map(|object| self.parse(object)) {
+                head.get_or_insert(id);
+                length += 1;
+            }
+            match page.next {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        Ok(head.map(|head| ParkedHead {
+            order_key: key,
+            head,
+            length: u64::try_from(length).unwrap_or(u64::MAX),
+        }))
     }
 
     fn parse(&self, object: &str) -> Option<(OrderKeyId, EventId)> {
@@ -281,6 +377,26 @@ impl StateStore for S3StateStore {
                 None => return Ok(heads),
             }
         }
+    }
+
+    async fn list_parked_queues(
+        &self,
+        after: Option<&OrderKeyId>,
+        limit: usize,
+        length_cap: usize,
+    ) -> Result<Vec<ParkedHead>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let length_cap = length_cap.max(1);
+        let mut tasks = JoinSet::new();
+        for key in self.queue_keys(after, limit).await? {
+            let store = self.clone();
+            tasks.spawn(async move { store.queue_head(key, length_cap).await });
+        }
+        let mut queues: Vec<ParkedHead> = Self::join(tasks).await?.into_iter().flatten().collect();
+        queues.sort_unstable_by_key(|queue| queue.order_key);
+        Ok(queues)
     }
 
     async fn read_parked(

@@ -196,6 +196,19 @@ impl StateStore for GatedStateStore {
         )
     }
 
+    async fn list_parked_queues(
+        &self,
+        after: Option<&OrderKeyId>,
+        limit: usize,
+        length_cap: usize,
+    ) -> Result<Vec<ParkedHead>, StoreError> {
+        or_unavailable(
+            self.gate
+                .read(self.inner.list_parked_queues(after, limit, length_cap))
+                .await,
+        )
+    }
+
     async fn read_parked(
         &self,
         key: &OrderKeyId,
@@ -400,6 +413,20 @@ mod tests {
 
         async fn load_parked_heads(&self, _partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
             self.run("load_parked_heads").await;
+            Ok(vec![ParkedHead {
+                order_key: key(),
+                head: id(),
+                length: 3,
+            }])
+        }
+
+        async fn list_parked_queues(
+            &self,
+            _after: Option<&OrderKeyId>,
+            _limit: usize,
+            _length_cap: usize,
+        ) -> Result<Vec<ParkedHead>, StoreError> {
+            self.run("list_parked_queues").await;
             Ok(vec![ParkedHead {
                 order_key: key(),
                 head: id(),
@@ -766,6 +793,10 @@ mod tests {
         );
         assert_eq!(state.load_parked_heads(0).await, Err(unavailable_error()));
         assert_eq!(
+            state.list_parked_queues(None, 10, 5).await,
+            Err(unavailable_error())
+        );
+        assert_eq!(
             state.read_parked(&key(), None, 1).await,
             Err(unavailable_error())
         );
@@ -799,6 +830,14 @@ mod tests {
         let record = leader();
 
         assert_eq!(
+            state.list_parked_queues(Some(&key()), 10, 5).await,
+            Ok(vec![ParkedHead {
+                order_key: key(),
+                head: id(),
+                length: 3,
+            }])
+        );
+        assert_eq!(
             state.read_parked(&key(), None, 1).await,
             Ok(vec![parked_event()])
         );
@@ -822,6 +861,7 @@ mod tests {
         assert_eq!(
             recorder.names(),
             [
+                "list_parked_queues",
                 "read_leader",
                 "read_parked",
                 "set_parked_status",

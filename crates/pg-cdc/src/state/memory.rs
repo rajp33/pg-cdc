@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
@@ -67,6 +68,32 @@ impl StateStore for MemoryStateStore {
                     length: u64::try_from(queue.len()).unwrap_or(u64::MAX),
                 })
             })
+            .collect())
+    }
+
+    async fn list_parked_queues(
+        &self,
+        after: Option<&OrderKeyId>,
+        limit: usize,
+        length_cap: usize,
+    ) -> Result<Vec<ParkedHead>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let inner = self.lock()?;
+        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+        Ok(inner
+            .parked
+            .range((lower, Bound::Unbounded))
+            .filter_map(|(key, queue)| {
+                let head = *queue.keys().next()?;
+                Some(ParkedHead {
+                    order_key: *key,
+                    head,
+                    length: u64::try_from(queue.len().min(length_cap.max(1))).unwrap_or(u64::MAX),
+                })
+            })
+            .take(limit)
             .collect())
     }
 

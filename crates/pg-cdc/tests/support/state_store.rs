@@ -20,6 +20,7 @@ where
 {
     let store = open().await?;
     empty_calls_succeed(store.as_ref()).await?;
+    queues_list_in_key_order_from_a_cursor_with_capped_lengths(store.as_ref()).await?;
     reads_return_ascending_ids_and_respect_after_and_limit(store.as_ref()).await?;
     appends_are_create_only(store.as_ref()).await?;
     an_append_with_a_malformed_event_is_all_or_nothing(store.as_ref()).await?;
@@ -84,6 +85,57 @@ async fn empty_calls_succeed(store: &dyn StateStore) -> TestResult {
     store.remove_parked(&[]).await?;
     assert_eq!(store.read_parked(&key(0x10, 1)?, None, 10).await?, vec![]);
     assert_eq!(store.load_parked_heads(0x10).await?, vec![]);
+    Ok(())
+}
+
+async fn queues_list_in_key_order_from_a_cursor_with_capped_lengths(
+    store: &dyn StateStore,
+) -> TestResult {
+    assert_eq!(store.list_parked_queues(None, 10, 10).await?, vec![]);
+    let (k1, k2, k3, k4) = (key(0x10, 1)?, key(0x10, 2)?, key(0x11, 1)?, key(0x12, 1)?);
+    let mut events = vec![
+        event(k1, id(4, 0), ParkStatus::Retrying),
+        event(k1, id(2, 1), ParkStatus::Dead),
+        event(k1, id(3, 0), ParkStatus::Retrying),
+        event(k3, id(7, 0), ParkStatus::Retrying),
+        event(k4, id(5, 0), ParkStatus::Retrying),
+        event(k4, id(6, 0), ParkStatus::Retrying),
+    ];
+    events.extend((0..25).map(|n| event(k2, id(1, n), ParkStatus::Retrying)));
+    store.append_parked(&events).await?;
+    let head = |order_key, head, length| ParkedHead {
+        order_key,
+        head,
+        length,
+    };
+    assert_eq!(
+        store.list_parked_queues(None, 2, 10).await?,
+        vec![head(k1, id(2, 1), 3), head(k2, id(1, 0), 10)]
+    );
+    assert_eq!(
+        store.list_parked_queues(Some(&k2), 10, 10).await?,
+        vec![head(k3, id(7, 0), 1), head(k4, id(5, 0), 2)]
+    );
+    assert_eq!(
+        store.list_parked_queues(Some(&k1), 1, 100).await?,
+        vec![head(k2, id(1, 0), 25)]
+    );
+    assert_eq!(store.list_parked_queues(Some(&k4), 10, 10).await?, vec![]);
+    assert_eq!(store.list_parked_queues(None, 0, 10).await?, vec![]);
+    store.remove_parked(&[(k3, id(7, 0))]).await?;
+    let listed: Vec<OrderKeyId> = store
+        .list_parked_queues(None, 10, 10)
+        .await?
+        .iter()
+        .map(|queue| queue.order_key)
+        .collect();
+    assert_eq!(listed, vec![k1, k2, k4]);
+    let all: Vec<_> = events
+        .iter()
+        .map(|event| (event.order_key, event.id))
+        .collect();
+    store.remove_parked(&all).await?;
+    assert_eq!(store.list_parked_queues(None, 10, 10).await?, vec![]);
     Ok(())
 }
 

@@ -103,6 +103,12 @@ pub enum StoreError {
 pub trait StateStore: Send + Sync + fmt::Debug {
     async fn append_parked(&self, events: &[ParkedEvent]) -> Result<(), StoreError>;
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError>;
+    async fn list_parked_queues(
+        &self,
+        after: Option<&OrderKeyId>,
+        limit: usize,
+        length_cap: usize,
+    ) -> Result<Vec<ParkedHead>, StoreError>;
     async fn read_parked(
         &self,
         key: &OrderKeyId,

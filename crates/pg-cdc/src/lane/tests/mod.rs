@@ -229,6 +229,17 @@ impl StateStore for TestStore {
         self.inner.load_parked_heads(partition).await
     }
 
+    async fn list_parked_queues(
+        &self,
+        after: Option<&OrderKeyId>,
+        limit: usize,
+        length_cap: usize,
+    ) -> Result<Vec<ParkedHead>, StoreError> {
+        self.inner
+            .list_parked_queues(after, limit, length_cap)
+            .await
+    }
+
     async fn read_parked(
         &self,
         key: &OrderKeyId,

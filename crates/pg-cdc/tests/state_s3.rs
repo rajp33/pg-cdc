@@ -6,14 +6,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
 use aws_sdk_s3::config::retry::RetryConfig;
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::config::{
+    BehaviorVersion, ConfigBag, Credentials, Intercept, Region, RuntimeComponents,
+};
+use aws_sdk_s3::error::BoxError;
 use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use pg_cdc::event::EventId;
 use pg_cdc::order::OrderKeyId;
 use pg_cdc::state::s3::S3StateStore;
 use pg_cdc::state::{
-    LeaderRecord, LeaderState, ParkStatus, ParkedEvent, StateStore, StoreError, SwapOutcome,
+    LeaderRecord, LeaderState, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError,
+    SwapOutcome,
 };
 use pg_cdc_decoder::Lsn;
 use pg_cdc_testkit::AwsEmulator;
@@ -113,6 +118,96 @@ async fn heads_load_across_listing_pages() -> TestResult {
     let tail = store.read_parked(&busy, Some(&id(7, 1015)), 10).await?;
     let ids: Vec<_> = tail.iter().map(|event| event.id).collect();
     assert_eq!(ids, (1016..1020).map(|n| id(7, n)).collect::<Vec<_>>());
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct Requests {
+    listings: AtomicUsize,
+    gets: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct CountRequests(Arc<Requests>);
+
+impl Intercept for CountRequests {
+    fn name(&self) -> &'static str {
+        "CountRequests"
+    }
+
+    fn read_before_transmit(
+        &self,
+        context: &BeforeTransmitInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let request = context.request();
+        if request.method() == "GET" {
+            let counter = if request.uri().contains("list-type=2") {
+                &self.0.listings
+            } else {
+                &self.0.gets
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn listing_queues_costs_one_page_per_queue_whatever_the_backlog() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let seeding = S3StateStore::new(s3.clone(), BUCKET.to_owned(), "", "orders", 32);
+    let busy = key(0x42, 1)?;
+    let quiet: Vec<OrderKeyId> = (2..=5).map(|n| key(0x42, n)).collect::<TestResult<_>>()?;
+    let elsewhere = key(0x43, 1)?;
+    let mut events: Vec<ParkedEvent> = (0..2500)
+        .map(|n| event(busy, id(7, n), ParkStatus::Retrying))
+        .collect();
+    events.extend(
+        quiet
+            .iter()
+            .chain([&elsewhere])
+            .map(|queue| event(*queue, id(9, 0), ParkStatus::Retrying)),
+    );
+    seeding.append_parked(&events).await?;
+
+    let requests = Arc::new(Requests::default());
+    let counting = aws_sdk_s3::Client::from_conf(
+        s3.config()
+            .to_builder()
+            .interceptor(CountRequests(Arc::clone(&requests)))
+            .build(),
+    );
+    let store = S3StateStore::new(counting, BUCKET.to_owned(), "", "orders", 32);
+
+    let first = store.list_parked_queues(None, 3, 1000).await?;
+    let head = |order_key, head, length| ParkedHead {
+        order_key,
+        head,
+        length,
+    };
+    assert_eq!(
+        first,
+        vec![
+            head(busy, id(7, 0), 1000),
+            head(quiet[0], id(9, 0), 1),
+            head(quiet[1], id(9, 0), 1),
+        ]
+    );
+    assert!(requests.listings.load(Ordering::SeqCst) <= 4);
+    assert_eq!(requests.gets.load(Ordering::SeqCst), 0);
+
+    let rest = store.list_parked_queues(Some(&quiet[1]), 3, 1000).await?;
+    assert_eq!(
+        rest,
+        vec![
+            head(quiet[2], id(9, 0), 1),
+            head(quiet[3], id(9, 0), 1),
+            head(elsewhere, id(9, 0), 1),
+        ]
+    );
+    assert_eq!(requests.gets.load(Ordering::SeqCst), 0);
     Ok(())
 }
 
