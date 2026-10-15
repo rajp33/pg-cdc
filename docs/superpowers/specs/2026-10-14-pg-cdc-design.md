@@ -291,7 +291,7 @@ A truncate produces one event per truncated relation, with `key`, `before` and `
 
 When the encoded message (body plus attributes) exceeds the sink's `max_message_bytes`:
 
-- **With a PayloadStore,** the full envelope is stored there, and the sink receives a pointer event instead. The pointer is the same envelope without `before`, `after` and `unchanged_toast`, plus `"payload_ref": { "uri": "s3://bucket/prefix/payloads/<id>.json", "bytes": 912345 }`.
+- **With a PayloadStore,** the full envelope is stored there, and the sink receives a pointer event instead. The pointer is the same envelope without `before`, `after` and `unchanged_toast`, plus `"payload_ref": { "uri": "s3://<bucket>/<prefix>/<pipeline>/payloads/<id>.json", "bytes": 912345 }`.
 - **Without a PayloadStore,** the event is terminal and is parked as `dead` (§10.4).
 
 ## 8. Ordering and lanes
@@ -378,7 +378,7 @@ Short of a halt (§10.7) or a lost slot (§13.3), only two conditions stall the 
 - **Heads load per partition.** Parked queue heads load one partition at a time, with 256 partitions keyed by the first byte of the order key id. Store calls are bounded by `state_store.max_concurrency`.
 - **Delivery waits for its partition.** Delivery for an order key starts only once its partition has loaded, so no live event can overtake a parked one.
 - **Replayed events for parked keys.**
-  - A replayed event with an id below its queue's head settled before the restart, so it is skipped.
+  - A replayed event with an id below its queue's head settled before the restart, so it is skipped. This relies on appends never leaving a gap below a queue's head (§11.3, item 8).
   - Any other event for a parked key is appended. Appends are create-only, so an event already in the queue is not duplicated.
 
 ### 10.7 Decode faults are never parked
@@ -487,10 +487,11 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 5. `remove_parked` of a missing event succeeds.
 6. `swap_leader` is an atomic compare-and-swap, and `expected: None` means create-if-absent.
 7. Concurrent calls are safe. pg-cdc bounds them with `state_store.max_concurrency` (default 32) and backs off on throttling.
+8. `append_parked` lands each order key's events in id order. If it fails or is cancelled, the events it stored for each key are a prefix of that key's events in the call, so a queue never has a gap below its head. An event that cannot be encoded fails the call before anything is written. The suite checks the encoding rule; each adapter's own tests check the prefix rule by injecting a fault in the middle of a key's events.
 
 ### 11.4 S3 StateStore
 
-- **Parked events** live at `<prefix>/<pipeline>/parked/<order key id>/<event id>.json`. They are written with `If-None-Match: *`, so a 412 means the object already exists and counts as success.
+- **Parked events** live at `<prefix>/<pipeline>/parked/<order key id>/<event id>.json`. They are written with `If-None-Match: *`, so a 412 means the object already exists and counts as success. One append writes each order key's events one at a time in id order and stops that key at its first failure; different keys are written in parallel.
 - **`load_parked_heads(p)`** lists the `parked/<pp>` prefix, where `pp` is the partition as two hex digits. The first object under each key is its head.
 - **`read_parked`** lists with `StartAfter`, then fetches each object.
 - **A status change** rewrites the object; only the owning lane writes it.
@@ -669,7 +670,7 @@ Each invariant has an enforcement mechanism listed in §14.6. A runtime violatio
 
 ### 14.3 Acknowledgement
 
-- **A1. Only delivery or parking settles an event.** The type that marks an event settled can only be built from those two results, so no code path can skip an event and still acknowledge it.
+- **A1. Only delivery or parking settles an event.** The type that marks an event settled can only be built from those two results, so no code path can skip an event and still acknowledge it. The one skip is a replayed event below its parked queue's head (§10.6), which delivery or parking already settled before the restart; it settles only with proof that its id is below the stored head.
 - **A2. The confirmed LSN is safe.** It never decreases, and never passes the end LSN of a transaction with an unsettled event.
 - **A3. Keepalive positions are acknowledged only when idle,** meaning no event is unsettled and no transaction is open.
 - **A4. Status updates are independent.** One is sent at least every `status_interval`, whatever the reader, sink and store are doing.
@@ -691,7 +692,7 @@ Each invariant has an enforcement mechanism listed in §14.6. A runtime violatio
 | Mechanism | Covers |
 |---|---|
 | Property tests on the ack tracker with random settle orders | A2, A3 |
-| Model-based property tests of lanes and parking, with random failures, restarts and operator actions | O2, O3, A1 |
+| Model-based property tests of lanes and parking, with random failures, appends that store only a prefix, clean restarts, crashes in the middle of a park, and operator actions | O2, O3, A1 |
 | Fuzzing the decoder, which must never panic | D1–D3 |
 | `to_jsonb` reference tests over every built-in type | D2 |
 | Chaos integration tests: SIGKILL at random points, sink and store faults, dropped connections and takeovers. A checker verifies every change was delivered at least once and per-key order held. | O1–O3, A1–A4, L1–L3 |
