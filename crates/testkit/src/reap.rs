@@ -73,7 +73,7 @@ pub async fn lock_reaper() -> Result<ReaperLock, TestkitError> {
 pub(crate) async fn reap_once() {
     REAPED
         .get_or_init(|| async {
-            if let Some(_claim) = claim_stamp(&stamp_path(), SystemTime::now()).await {
+            if let Some(_claim) = claim_stamp(&stamp_path(), SystemTime::now).await {
                 let _ = reap(REAP_AGE).await;
             }
         })
@@ -84,23 +84,26 @@ fn stamp_path() -> PathBuf {
     std::env::temp_dir().join(STAMP_FILE)
 }
 
-async fn claim_stamp(stamp: &Path, now: SystemTime) -> Option<ReaperLock> {
+async fn claim_stamp(
+    stamp: &Path,
+    clock: impl FnOnce() -> SystemTime + Send + 'static,
+) -> Option<ReaperLock> {
     let stamp = stamp.to_path_buf();
-    tokio::task::spawn_blocking(move || claim_stamp_blocking(&stamp, now))
+    tokio::task::spawn_blocking(move || claim_stamp_blocking(&stamp, clock))
         .await
         .ok()
         .flatten()
 }
 
-fn claim_stamp_blocking(stamp: &Path, now: SystemTime) -> Option<ReaperLock> {
+fn claim_stamp_blocking(stamp: &Path, clock: impl FnOnce() -> SystemTime) -> Option<ReaperLock> {
     let mut file = open_stamp(stamp).ok()?;
     file.try_lock().ok()?;
+    let now = clock();
     let metadata = file.metadata().ok()?;
     let fresh = metadata.len() > 0
-        && metadata.modified().is_ok_and(|modified| {
-            now.duration_since(modified)
-                .is_ok_and(|elapsed| elapsed < STAMP_INTERVAL)
-        });
+        && metadata
+            .modified()
+            .is_ok_and(|modified| stamped_within_interval(modified, now));
     if fresh {
         return None;
     }
@@ -109,6 +112,13 @@ fn claim_stamp_blocking(stamp: &Path, now: SystemTime) -> Option<ReaperLock> {
         .ok()?;
     file.set_modified(now).ok()?;
     Some(ReaperLock { _stamp: file })
+}
+
+fn stamped_within_interval(modified: SystemTime, now: SystemTime) -> bool {
+    let distance = now
+        .duration_since(modified)
+        .unwrap_or_else(|ahead| ahead.duration());
+    distance < STAMP_INTERVAL
 }
 
 fn lock_stamp(stamp: &Path) -> Result<ReaperLock, TestkitError> {
@@ -148,9 +158,20 @@ fn unix_seconds(time: SystemTime) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::{Command, Stdio};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    const CHILD_DIR_ENV: &str = "PG_CDC_TESTKIT_CLAIM_DIR";
+    const CHILD_TEST: &str = "reap::tests::claim_the_stamp_as_a_child_process";
+    const CHILDREN: usize = 8;
+    const CLAIMED: i32 = 0;
+    const REFUSED: i32 = 3;
+
+    fn at(time: SystemTime) -> impl FnOnce() -> SystemTime + Send + 'static {
+        move || time
+    }
 
     #[test]
     fn stale_containers_are_older_than_the_age() {
@@ -201,17 +222,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stamp = dir.path().join("reap");
         let now = SystemTime::now();
-        assert!(claim_stamp(&stamp, now).await.is_some());
+        assert!(claim_stamp(&stamp, at(now)).await.is_some());
         assert!(
-            claim_stamp(&stamp, now + Duration::from_secs(599))
+            claim_stamp(&stamp, at(now + Duration::from_secs(599)))
                 .await
                 .is_none()
         );
         assert!(
-            claim_stamp(&stamp, now + Duration::from_secs(601))
+            claim_stamp(&stamp, at(now + Duration::from_secs(601)))
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn a_stamp_newer_than_the_callers_clock_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("reap");
+        let now = SystemTime::now();
+        assert!(
+            claim_stamp(&stamp, at(now + Duration::from_secs(1)))
+                .await
+                .is_some()
+        );
+        assert!(claim_stamp(&stamp, at(now)).await.is_none());
     }
 
     async fn concurrent_claims(stamp: &Path, now: SystemTime) -> usize {
@@ -222,7 +256,7 @@ mod tests {
                 let stamp = stamp.to_path_buf();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    claim_stamp(&stamp, now).await.is_some()
+                    claim_stamp(&stamp, at(now)).await.is_some()
                 })
             })
             .collect();
@@ -247,9 +281,102 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stamp = dir.path().join("reap");
         let now = SystemTime::now();
-        assert!(claim_stamp(&stamp, now).await.is_some());
+        assert!(claim_stamp(&stamp, at(now)).await.is_some());
         let later = now + STAMP_INTERVAL + Duration::from_secs(1);
         assert_eq!(concurrent_claims(&stamp, later).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stamp_more_than_ten_minutes_ahead_of_the_clock_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("reap");
+        let now = SystemTime::now();
+        let ahead = now + STAMP_INTERVAL + Duration::from_secs(1);
+        assert!(claim_stamp(&stamp, at(ahead)).await.is_some());
+        assert!(claim_stamp(&stamp, at(now)).await.is_some());
+    }
+
+    #[test]
+    fn the_clock_is_read_only_once_the_stamp_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("reap");
+        let lock = lock_stamp(&stamp).unwrap();
+        assert!(claim_stamp_blocking(&stamp, || panic!("clock read without the lock")).is_none());
+        drop(lock);
+    }
+
+    #[test]
+    #[ignore = "child process entry for the cross-process claim tests"]
+    fn claim_the_stamp_as_a_child_process() {
+        let Some(dir) = std::env::var_os(CHILD_DIR_ENV).map(PathBuf::from) else {
+            return;
+        };
+        std::fs::write(dir.join(format!("ready-{}", std::process::id())), b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !dir.join("go").exists() {
+            assert!(Instant::now() < deadline, "no go signal");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let claim = claim_stamp_blocking(&dir.join("reap"), SystemTime::now);
+        std::process::exit(if claim.is_some() { CLAIMED } else { REFUSED });
+    }
+
+    fn ready_children(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("ready-")
+            })
+            .count()
+    }
+
+    fn claims_across_processes(dir: &Path) -> usize {
+        let exe = std::env::current_exe().unwrap();
+        let children: Vec<_> = (0..CHILDREN)
+            .map(|_| {
+                Command::new(&exe)
+                    .args([CHILD_TEST, "--exact", "--ignored"])
+                    .env(CHILD_DIR_ENV, dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while ready_children(dir) < CHILDREN {
+            assert!(Instant::now() < deadline, "children never became ready");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::write(dir.join("go"), b"").unwrap();
+        children
+            .into_iter()
+            .map(|mut child| match child.wait().unwrap().code() {
+                Some(CLAIMED) => 1,
+                Some(REFUSED) => 0,
+                other => panic!("claiming child exited with {other:?}"),
+            })
+            .sum()
+    }
+
+    #[test]
+    fn exactly_one_process_claims_an_absent_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(claims_across_processes(dir.path()), 1);
+    }
+
+    #[test]
+    fn exactly_one_process_claims_an_expired_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let expired = SystemTime::now() - STAMP_INTERVAL - Duration::from_secs(1);
+        drop(claim_stamp_blocking(&dir.path().join("reap"), at(expired)).unwrap());
+        assert_eq!(claims_across_processes(dir.path()), 1);
     }
 
     #[test]
@@ -257,15 +384,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stamp = dir.path().join("reap");
         let lock = lock_stamp(&stamp).unwrap();
-        assert!(claim_stamp_blocking(&stamp, SystemTime::now()).is_none());
+        assert!(claim_stamp_blocking(&stamp, SystemTime::now).is_none());
         drop(lock);
-        assert!(claim_stamp_blocking(&stamp, SystemTime::now()).is_some());
+        assert!(claim_stamp_blocking(&stamp, SystemTime::now).is_some());
     }
 
     #[tokio::test]
     async fn an_unwritable_stamp_location_does_not_claim() {
         let dir = tempfile::tempdir().unwrap();
         let stamp = dir.path().join("missing").join("reap");
-        assert!(claim_stamp(&stamp, SystemTime::now()).await.is_none());
+        assert!(claim_stamp(&stamp, SystemTime::now).await.is_none());
     }
 }
