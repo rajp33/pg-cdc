@@ -1,6 +1,9 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct Scratch(PathBuf);
 
@@ -10,8 +13,11 @@ impl Scratch {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("pg-cdc-loadgen-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "pg-cdc-loadgen-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }
