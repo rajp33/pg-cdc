@@ -1,6 +1,7 @@
 mod gauges;
 mod model;
 mod offload;
+mod operate;
 mod park;
 mod stored;
 
@@ -148,6 +149,8 @@ struct TestStore {
     land_on_failure: AtomicUsize,
     fail_reads: AtomicU32,
     fail_removes: AtomicU32,
+    fail_status_changes: AtomicU32,
+    status_changes: AtomicUsize,
     outstanding: Mutex<HashSet<OrderKeyId>>,
     peak_outstanding: AtomicUsize,
 }
@@ -180,6 +183,26 @@ impl TestStore {
         let mut event = parked(key, ordinal, ParkStatus::Retrying);
         event.body = Bytes::from(vec![b'x'; body]);
         self.inner.append_parked(&[event]).await.unwrap();
+    }
+
+    async fn dead_heads(&self) -> Vec<(OrderKeyId, EventId)> {
+        let mut dead = Vec::new();
+        for partition in 0..=u8::MAX {
+            for head in self.inner.load_parked_heads(partition).await.unwrap() {
+                let first = self
+                    .inner
+                    .read_parked(&head.order_key, None, 1)
+                    .await
+                    .unwrap();
+                if first
+                    .iter()
+                    .any(|event| event.id == head.head && event.status == ParkStatus::Dead)
+                {
+                    dead.push((head.order_key, head.head));
+                }
+            }
+        }
+        dead
     }
 
     async fn queue(&self, key: &[u8]) -> Vec<(u32, ParkStatus)> {
@@ -267,6 +290,10 @@ impl StateStore for TestStore {
         id: &EventId,
         status: ParkStatus,
     ) -> Result<(), StoreError> {
+        self.status_changes.fetch_add(1, Ordering::SeqCst);
+        if take_failure(&self.fail_status_changes) {
+            return Err(outage());
+        }
         self.outstanding.lock().unwrap().remove(key);
         self.inner.set_parked_status(key, id, status).await
     }
@@ -421,6 +448,10 @@ impl Harness {
             sink,
             store,
         }
+    }
+
+    fn operator(&self) -> Operator {
+        self.lanes.operator()
     }
 
     fn gauges(&self) -> ParkedSnapshot {

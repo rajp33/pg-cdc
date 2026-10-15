@@ -1,5 +1,6 @@
 mod loader;
 mod offload;
+mod operate;
 mod park;
 mod stored;
 
@@ -25,6 +26,9 @@ use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 use crate::state::{PARTITIONS, ParkedHead, StateStore};
 use crate::status::{LaneCounts, ParkedGauges, STATS_INTERVAL};
 use crate::supervisor::Backoff;
+
+use operate::Operation;
+pub use operate::{OperateError, Operator};
 
 pub const LINGER: Duration = Duration::from_millis(5);
 pub const RETRY_BASE: Duration = Duration::from_millis(100);
@@ -77,6 +81,7 @@ enum Inbound {
     Head(ParkedHead),
     Loaded(u8),
     ParkAll,
+    Operate(Operation),
 }
 
 #[derive(Debug)]
@@ -132,6 +137,7 @@ impl Lanes {
                     gauges: Arc::clone(&gauges),
                     stats_dirty: false,
                     stats_due: None,
+                    operations: VecDeque::new(),
                     closing: false,
                 };
                 running.spawn(lane.run());
@@ -151,6 +157,15 @@ impl Lanes {
             loader,
             gauges,
         }
+    }
+
+    pub fn operator(&self) -> Operator {
+        Operator::new(
+            self.inboxes
+                .iter()
+                .map(mpsc::UnboundedSender::downgrade)
+                .collect(),
+        )
     }
 
     pub fn gauges(&self) -> Arc<ParkedGauges> {
@@ -260,6 +275,7 @@ struct Lane {
     gauges: Arc<ParkedGauges>,
     stats_dirty: bool,
     stats_due: Option<Instant>,
+    operations: VecDeque<Operation>,
     closing: bool,
 }
 
@@ -271,6 +287,7 @@ impl Lane {
                     return;
                 }
             }
+            self.perform_operations().await;
             let now = Instant::now();
             self.publish_stats(now);
             self.promote_due_retries(now);
@@ -351,6 +368,10 @@ impl Lane {
             }
             Inbound::ParkAll => {
                 self.park_all();
+                true
+            }
+            Inbound::Operate(operation) => {
+                self.operations.push_back(operation);
                 true
             }
         }
