@@ -2,12 +2,21 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use pg_cdc_testkit::{AwsEmulator, Postgres, parse_lsn};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command};
+use tokio::task::JoinHandle;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -670,5 +679,196 @@ async fn run_exits_when_the_admin_address_is_taken() -> TestResult {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot bind admin.listen"), "{stderr}");
+    Ok(())
+}
+
+const KEY: &str = "0123456789abcdef0123456789abcdef";
+const EVENT: &str = "000000001a2b3c4d-00000003";
+
+struct Stub {
+    addr: SocketAddr,
+    seen: Arc<Mutex<Vec<String>>>,
+    server: JoinHandle<()>,
+}
+
+impl Stub {
+    async fn start(status: StatusCode, body: &'static str) -> TestResult<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let recorded = Arc::clone(&recorded);
+                    async move {
+                        let target = request
+                            .uri()
+                            .path_and_query()
+                            .map_or_else(String::new, |target| target.as_str().to_owned());
+                        if let Ok(mut seen) = recorded.lock() {
+                            seen.push(format!("{} {target}", request.method()));
+                        }
+                        let mut response =
+                            Response::new(Full::new(Bytes::from_static(body.as_bytes())));
+                        *response.status_mut() = status;
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Ok(Self { addr, seen, server })
+    }
+
+    fn requests(&self) -> TestResult<Vec<String>> {
+        Ok(self.seen.lock().map_err(|error| error.to_string())?.clone())
+    }
+}
+
+impl Drop for Stub {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn parked_command(args: &[&str], env: Option<&str>) -> TestResult<Output> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pg-cdc"));
+    command
+        .arg("parked")
+        .args(args)
+        .env_remove("PGCDC__ADMIN__LISTEN")
+        .kill_on_drop(true);
+    if let Some(listen) = env {
+        command.env("PGCDC__ADMIN__LISTEN", listen);
+    }
+    Ok(tokio::time::timeout(WAIT, command.output()).await??)
+}
+
+#[tokio::test]
+async fn parked_commands_print_the_reply_and_exit_zero() -> TestResult {
+    let stub = Stub::start(StatusCode::OK, r#"{"queues": [], "next": null}"#).await?;
+    let flag = stub.addr.to_string();
+    let expected = serde_json::json!({"queues": [], "next": null});
+
+    let listed = parked_command(&["list", "--addr", &flag], None).await?;
+    assert_eq!(listed.status.code(), Some(0), "{listed:?}");
+    assert_eq!(serde_json::from_slice::<Value>(&listed.stdout)?, expected);
+    assert_eq!(listed.stderr, Vec::<u8>::new());
+
+    let discarded = parked_command(&["discard", KEY, "--id", EVENT, "--addr", &flag], None).await?;
+    assert_eq!(discarded.status.code(), Some(0), "{discarded:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&discarded.stdout)?,
+        expected
+    );
+
+    let from_environment = parked_command(&["list"], Some(&flag)).await?;
+    assert_eq!(
+        from_environment.status.code(),
+        Some(0),
+        "{from_environment:?}"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&from_environment.stdout)?,
+        expected
+    );
+
+    assert_eq!(
+        stub.requests()?,
+        [
+            "GET /parked".to_owned(),
+            format!("{} /parked/{KEY}/discard?id={EVENT}", Method::POST),
+            "GET /parked".to_owned(),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn parked_commands_report_refusals_and_exit_one() -> TestResult {
+    let stub = Stub::start(
+        StatusCode::CONFLICT,
+        r#"{"error": "this task is not the active holder", "holder": "other-1"}"#,
+    )
+    .await?;
+    let refused = parked_command(&["redrive", KEY, "--addr", &stub.addr.to_string()], None).await?;
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert_eq!(refused.stdout, Vec::<u8>::new());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("409"), "{stderr}");
+    assert!(
+        stderr.contains("this task is not the active holder"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("active holder: other-1"), "{stderr}");
+    assert_eq!(stub.requests()?, [format!("POST /parked/{KEY}/redrive")]);
+
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = closed.local_addr()?.to_string();
+    drop(closed);
+    let started = std::time::Instant::now();
+    let unreachable = parked_command(&["list", "--addr", &address], None).await?;
+    assert_eq!(unreachable.status.code(), Some(1), "{unreachable:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let stderr = String::from_utf8_lossy(&unreachable.stderr);
+    assert!(stderr.contains("cannot connect"), "{stderr}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn parked_commands_reject_malformed_ids_before_sending() -> TestResult {
+    let stub = Stub::start(StatusCode::OK, "{}").await?;
+    let flag = stub.addr.to_string();
+    for args in [
+        vec!["show", "nothex", "--addr", &flag],
+        vec!["discard", KEY, "--id", "bad", "--addr", &flag],
+    ] {
+        let output = parked_command(&args, None).await?;
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert_eq!(output.stdout, Vec::<u8>::new());
+    }
+    assert_eq!(stub.requests()?, Vec::<String>::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_task_that_cannot_reach_postgres_serves_status_and_refuses_parked_operations()
+-> TestResult {
+    let state = tempfile::tempdir()?;
+    let mut file = tempfile::NamedTempFile::new()?;
+    write!(
+        file,
+        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  port: 1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: {}\n{LEADERSHIP}{ADMIN_ANY_PORT}",
+        state.path().display()
+    )?;
+    let mut child = spawn(file.path(), "unused", Stdio::piped())?;
+    let mut stderr = BufReader::new(child.stderr.take().ok_or("no stderr")?).lines();
+    let addr = admin_addr(&mut stderr).await?;
+
+    let status = pg_cdc::admin::request(addr, Method::GET, "/status", WAIT).await?;
+    assert_eq!(status.status, 200);
+    let body: Value = serde_json::from_slice(&status.body)?;
+    assert_eq!(body["pipeline"], "cli");
+    assert_eq!(body["role"], "standby");
+    assert_eq!(body["healthy"], false);
+    assert_eq!(body["epoch"], Value::Null);
+
+    let refused = parked_command(&["list", "--addr", &addr.to_string()], None).await?;
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("409"), "{message}");
+
+    sigterm(&child).await?;
+    assert!(tokio::time::timeout(WAIT, child.wait()).await??.success());
     Ok(())
 }

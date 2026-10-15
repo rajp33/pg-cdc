@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use pg_cdc::admin::{self, Admin, HEALTH_TIMEOUT, Identity};
+use hyper::{Method, StatusCode};
+use pg_cdc::admin::{self, Admin, HEALTH_TIMEOUT, Identity, PARKED_TIMEOUT, Reply};
 use pg_cdc::config::{
     Config, Credentials, DEFAULT_ADMIN_LISTEN, PayloadStoreConfig, SinkConfig, SourceConfig,
     StateStoreConfig,
@@ -15,10 +16,12 @@ use pg_cdc::config::{
 use pg_cdc::connection::{
     ConnectParams, ConnectionProvider, PasswordProvider, RdsIamProvider, TlsConfig,
 };
+use pg_cdc::event::EventId;
 use pg_cdc::health::Health;
 use pg_cdc::lane::Stores;
 use pg_cdc::leader::record::holder_id;
 use pg_cdc::logs::{self, LOG_BUFFER_LINES, LogFlush};
+use pg_cdc::order::OrderKeyId;
 use pg_cdc::payload::{PayloadStore, S3PayloadStore};
 use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig, SessionContext, shutdown_budget};
 use pg_cdc::sink::Sink;
@@ -57,6 +60,45 @@ enum Command {
         #[arg(long)]
         addr: Option<SocketAddr>,
     },
+    Parked {
+        #[arg(long, global = true)]
+        addr: Option<SocketAddr>,
+        #[command(subcommand)]
+        action: ParkedCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ParkedCommand {
+    List {
+        #[arg(long)]
+        status: Option<ParkedStatusArg>,
+        #[arg(long)]
+        limit: Option<u16>,
+        #[arg(long)]
+        after: Option<OrderKeyId>,
+    },
+    Show {
+        order_key: OrderKeyId,
+        #[arg(long)]
+        after: Option<EventId>,
+        #[arg(long)]
+        limit: Option<u16>,
+    },
+    Redrive {
+        order_key: OrderKeyId,
+    },
+    Discard {
+        order_key: OrderKeyId,
+        #[arg(long)]
+        id: EventId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ParkedStatusArg {
+    Dead,
+    Retrying,
 }
 
 const ADMIN_LISTEN_VARIABLE: &str = "PGCDC__ADMIN__LISTEN";
@@ -80,6 +122,7 @@ fn main() -> ExitCode {
     let (code, logs) = match cli.command {
         Command::Run { config } => run_command(&runtime, &config),
         Command::Health { addr } => (runtime.block_on(health_command(addr)), None),
+        Command::Parked { addr, action } => (runtime.block_on(parked_command(addr, &action)), None),
     };
     // Dropping the runtime waits for blocking-pool work, and a write to a full stdout pipe never returns.
     runtime.shutdown_background();
@@ -110,7 +153,7 @@ fn flush_window(deadline: Option<Instant>, now: Instant) -> Duration {
 
 async fn health_command(flag: Option<SocketAddr>) -> ExitCode {
     let env = std::env::var(ADMIN_LISTEN_VARIABLE).ok();
-    let failure = match health_addr(flag, env.as_deref()) {
+    let failure = match admin_addr(flag, env.as_deref()) {
         Err(error) => format!("health check failed: {error}"),
         Ok(addr) => match admin::check_health(addr, HEALTH_TIMEOUT).await {
             Ok(200) => return ExitCode::SUCCESS,
@@ -122,7 +165,119 @@ async fn health_command(flag: Option<SocketAddr>) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn health_addr(flag: Option<SocketAddr>, env: Option<&str>) -> Result<SocketAddr, String> {
+fn parked_request(action: &ParkedCommand) -> (Method, String) {
+    match action {
+        ParkedCommand::List {
+            status,
+            limit,
+            after,
+        } => {
+            let status = status.map(|status| match status {
+                ParkedStatusArg::Dead => "dead".to_owned(),
+                ParkedStatusArg::Retrying => "retrying".to_owned(),
+            });
+            let query = [
+                ("status", status),
+                ("limit", limit.map(|limit| limit.to_string())),
+                ("after", after.map(|after| after.to_string())),
+            ];
+            (Method::GET, with_query("/parked".to_owned(), &query))
+        }
+        ParkedCommand::Show {
+            order_key,
+            after,
+            limit,
+        } => {
+            let query = [
+                ("after", after.map(|after| after.to_string())),
+                ("limit", limit.map(|limit| limit.to_string())),
+            ];
+            (
+                Method::GET,
+                with_query(format!("/parked/{order_key}"), &query),
+            )
+        }
+        ParkedCommand::Redrive { order_key } => {
+            (Method::POST, format!("/parked/{order_key}/redrive"))
+        }
+        ParkedCommand::Discard { order_key, id } => {
+            (Method::POST, format!("/parked/{order_key}/discard?id={id}"))
+        }
+    }
+}
+
+fn with_query(path: String, query: &[(&str, Option<String>)]) -> String {
+    let pairs: Vec<String> = query
+        .iter()
+        .filter_map(|(name, value)| Some(format!("{name}={}", value.as_ref()?)))
+        .collect();
+    if pairs.is_empty() {
+        path
+    } else {
+        format!("{path}?{}", pairs.join("&"))
+    }
+}
+
+fn parked_output(reply: &Reply) -> Result<Vec<u8>, String> {
+    let json = serde_json::from_slice::<serde_json::Value>(&reply.body).ok();
+    if (200..300).contains(&reply.status) {
+        return Ok(
+            match json.and_then(|json| serde_json::to_string_pretty(&json).ok()) {
+                Some(mut pretty) => {
+                    pretty.push('\n');
+                    pretty.into_bytes()
+                }
+                None => reply.body.to_vec(),
+            },
+        );
+    }
+    let field = |name: &str| {
+        json.as_ref()
+            .and_then(|json| json.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let detail = field("error")
+        .unwrap_or_else(|| String::from_utf8_lossy(&reply.body).trim_end().to_owned());
+    let holder = field("holder")
+        .filter(|_| reply.status == StatusCode::CONFLICT.as_u16())
+        .map(|holder| format!(" (active holder: {holder})"))
+        .unwrap_or_default();
+    Err(
+        match StatusCode::from_u16(reply.status)
+            .ok()
+            .and_then(|status| status.canonical_reason())
+        {
+            Some(reason) => format!("{} {reason}: {detail}{holder}", reply.status),
+            None => format!("{}: {detail}{holder}", reply.status),
+        },
+    )
+}
+
+async fn parked_command(flag: Option<SocketAddr>, action: &ParkedCommand) -> ExitCode {
+    let env = std::env::var(ADMIN_LISTEN_VARIABLE).ok();
+    let (method, target) = parked_request(action);
+    let reply = match admin_addr(flag, env.as_deref()) {
+        Err(error) => Err(error),
+        Ok(addr) => admin::request(addr, method, &target, PARKED_TIMEOUT)
+            .await
+            .map_err(|error| error.to_string()),
+    };
+    let failure = match reply {
+        Err(error) => format!("parked request failed: {error}"),
+        Ok(reply) => match parked_output(&reply) {
+            Ok(output) => match std::io::stdout().write_all(&output) {
+                Ok(()) => return ExitCode::SUCCESS,
+                Err(error) => format!("cannot write the reply: {error}"),
+            },
+            Err(refusal) => refusal,
+        },
+    };
+    let _ = writeln!(std::io::stderr(), "pg-cdc: {failure}");
+    ExitCode::FAILURE
+}
+
+fn admin_addr(flag: Option<SocketAddr>, env: Option<&str>) -> Result<SocketAddr, String> {
     if let Some(addr) = flag {
         return Ok(addr);
     }
@@ -375,6 +530,7 @@ async fn watch_signals(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn logs_flush_for_a_second_unless_the_sigterm_budget_has_less_left() {
@@ -408,15 +564,134 @@ mod tests {
     }
 
     #[test]
-    fn health_address_comes_from_the_flag_then_the_environment_then_the_default() {
+    fn admin_address_comes_from_the_flag_then_the_environment_then_the_default() {
         let flag: SocketAddr = "10.0.0.1:1".parse().unwrap();
         let env: SocketAddr = "10.0.0.2:2".parse().unwrap();
-        assert_eq!(health_addr(Some(flag), Some("10.0.0.2:2")), Ok(flag));
-        assert_eq!(health_addr(None, Some("10.0.0.2:2")), Ok(env));
-        assert_eq!(health_addr(None, None), Ok(DEFAULT_ADMIN_LISTEN));
-        assert_eq!(health_addr(None, Some("")), Ok(DEFAULT_ADMIN_LISTEN));
-        let error = health_addr(None, Some("not-an-address")).unwrap_err();
+        assert_eq!(admin_addr(Some(flag), Some("10.0.0.2:2")), Ok(flag));
+        assert_eq!(admin_addr(None, Some("10.0.0.2:2")), Ok(env));
+        assert_eq!(admin_addr(None, None), Ok(DEFAULT_ADMIN_LISTEN));
+        assert_eq!(admin_addr(None, Some("")), Ok(DEFAULT_ADMIN_LISTEN));
+        let error = admin_addr(None, Some("not-an-address")).unwrap_err();
         assert!(error.contains("PGCDC__ADMIN__LISTEN"), "{error}");
-        assert_eq!(health_addr(Some(flag), Some("not-an-address")), Ok(flag));
+        assert_eq!(admin_addr(Some(flag), Some("not-an-address")), Ok(flag));
+    }
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+    const EVENT: &str = "000000001a2b3c4d-00000003";
+
+    fn mapped(arguments: &[&str]) -> (Method, String) {
+        let cli = Cli::try_parse_from(
+            ["pg-cdc", "parked"]
+                .into_iter()
+                .chain(arguments.iter().copied()),
+        )
+        .unwrap();
+        let Command::Parked { action, .. } = cli.command else {
+            panic!("not a parked command");
+        };
+        parked_request(&action)
+    }
+
+    #[test]
+    fn parked_commands_map_to_their_admin_requests() {
+        assert_eq!(mapped(&["list"]), (Method::GET, "/parked".to_owned()));
+        assert_eq!(
+            mapped(&["list", "--status", "dead", "--limit", "5", "--after", KEY]),
+            (
+                Method::GET,
+                format!("/parked?status=dead&limit=5&after={KEY}")
+            )
+        );
+        assert_eq!(
+            mapped(&["list", "--status", "retrying"]),
+            (Method::GET, "/parked?status=retrying".to_owned())
+        );
+        assert_eq!(
+            mapped(&["show", KEY]),
+            (Method::GET, format!("/parked/{KEY}"))
+        );
+        assert_eq!(
+            mapped(&["show", KEY, "--after", EVENT, "--limit", "2"]),
+            (Method::GET, format!("/parked/{KEY}?after={EVENT}&limit=2"))
+        );
+        assert_eq!(
+            mapped(&["redrive", KEY]),
+            (Method::POST, format!("/parked/{KEY}/redrive"))
+        );
+        assert_eq!(
+            mapped(&["discard", KEY, "--id", EVENT]),
+            (Method::POST, format!("/parked/{KEY}/discard?id={EVENT}"))
+        );
+    }
+
+    #[test]
+    fn the_address_flag_may_follow_the_parked_action() {
+        let cli =
+            Cli::try_parse_from(["pg-cdc", "parked", "list", "--addr", "10.0.0.1:1"]).unwrap();
+        let Command::Parked { addr, .. } = cli.command else {
+            panic!("not a parked command");
+        };
+        assert_eq!(addr, Some("10.0.0.1:1".parse().unwrap()));
+    }
+
+    #[test]
+    fn malformed_ids_are_rejected_by_the_parser() {
+        for arguments in [
+            vec!["show", "nothex"],
+            vec!["redrive", "nothex"],
+            vec!["discard", KEY, "--id", "bad"],
+            vec!["list", "--after", "bad"],
+            vec!["list", "--status", "alive"],
+            vec!["show", KEY, "--after", "bad"],
+        ] {
+            let error =
+                Cli::try_parse_from(["pg-cdc", "parked"].into_iter().chain(arguments)).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{error}");
+        }
+    }
+
+    fn reply(status: u16, body: &str) -> Reply {
+        Reply {
+            status,
+            body: Bytes::copy_from_slice(body.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn a_successful_reply_is_pretty_printed_and_a_non_json_body_is_kept() {
+        assert_eq!(
+            parked_output(&reply(200, r#"{"queues":[],"next":null}"#)),
+            Ok(b"{\n  \"queues\": [],\n  \"next\": null\n}\n".to_vec())
+        );
+        assert_eq!(
+            parked_output(&reply(202, "accepted\n")),
+            Ok(b"accepted\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_status_the_error_and_the_active_holder() {
+        assert_eq!(
+            parked_output(&reply(
+                409,
+                r#"{"error":"this task is not the active holder","holder":"other-1"}"#
+            )),
+            Err(
+                "409 Conflict: this task is not the active holder (active holder: other-1)"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            parked_output(&reply(400, r#"{"error":"limit must be a number"}"#)),
+            Err("400 Bad Request: limit must be a number".to_owned())
+        );
+        assert_eq!(
+            parked_output(&reply(503, "unavailable\n")),
+            Err("503 Service Unavailable: unavailable".to_owned())
+        );
+        assert_eq!(
+            parked_output(&reply(500, r#"{"holder":"other-1"}"#)),
+            Err(r#"500 Internal Server Error: {"holder":"other-1"}"#.to_owned())
+        );
     }
 }
