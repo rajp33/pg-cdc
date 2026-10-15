@@ -25,6 +25,7 @@ pub const MAX_CONCURRENCY: usize = 4096;
 pub const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(6);
 pub const DEFAULT_FENCE_DELAY: Duration = Duration::from_secs(10);
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_TRACE_SAMPLE_RATIO: f64 = 0.01;
 pub const DEFAULT_ADMIN_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9187);
 const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
 
@@ -44,6 +45,8 @@ pub struct Config {
     pub leadership: LeadershipConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -158,6 +161,24 @@ impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             listen: DEFAULT_ADMIN_LISTEN,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    #[serde(default, deserialize_with = "de_opt_string")]
+    pub otlp_endpoint: Option<String>,
+    #[serde(default = "default_trace_sample_ratio", deserialize_with = "de_ratio")]
+    pub trace_sample_ratio: f64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            trace_sample_ratio: DEFAULT_TRACE_SAMPLE_RATIO,
         }
     }
 }
@@ -528,6 +549,7 @@ impl Config {
         self.delivery.validate()?;
         self.leadership.validate()?;
         self.state_store.validate()?;
+        self.telemetry.validate()?;
         if let Some(PayloadStoreConfig::S3(payload)) = &self.payload_store {
             validate_bucket("payload_store.bucket", &payload.bucket)?;
         }
@@ -591,6 +613,45 @@ impl LeadershipConfig {
         }
         Ok(())
     }
+}
+
+impl TelemetryConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(0.0..=1.0).contains(&self.trace_sample_ratio) {
+            return Err(ConfigError::InvalidValue {
+                field: "telemetry.trace_sample_ratio",
+                value: self.trace_sample_ratio.to_string(),
+                reason: "must be a number from 0 to 1",
+            });
+        }
+        match self.otlp_endpoint.as_deref() {
+            Some(endpoint) if !endpoint.is_empty() && !is_http_url(endpoint) => {
+                Err(ConfigError::InvalidValue {
+                    field: "telemetry.otlp_endpoint",
+                    value: endpoint.to_owned(),
+                    reason: "must be an http:// or https:// URL",
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn is_http_url(text: &str) -> bool {
+    let Some(rest) = text
+        .strip_prefix("http://")
+        .or_else(|| text.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = if host_port.starts_with('[') {
+        host_port
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    !host.is_empty()
 }
 
 fn invalid_duration(field: &'static str, value: Duration, reason: &'static str) -> ConfigError {
@@ -659,6 +720,10 @@ fn default_drain_timeout() -> Duration {
 
 fn default_admin_listen() -> SocketAddr {
     DEFAULT_ADMIN_LISTEN
+}
+
+fn default_trace_sample_ratio() -> f64 {
+    DEFAULT_TRACE_SAMPLE_RATIO
 }
 
 fn default_store_concurrency() -> usize {
@@ -731,6 +796,48 @@ fn de_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D
             "invalid duration {text:?}; use an integer with ms, s, m or h"
         ))
     })
+}
+
+fn de_ratio<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    struct RatioVisitor;
+
+    impl RatioVisitor {
+        fn not_a_number<E: de::Error>(text: &str) -> E {
+            E::custom(format!(
+                "telemetry.trace_sample_ratio {text:?} must be a number from 0 to 1"
+            ))
+        }
+    }
+
+    impl Visitor<'_> for RatioVisitor {
+        type Value = f64;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a number from 0 to 1")
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<f64, E> {
+            Ok(value)
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<f64, E> {
+            u32::try_from(value)
+                .map(f64::from)
+                .map_err(|_| Self::not_a_number(&value.to_string()))
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<f64, E> {
+            i32::try_from(value)
+                .map(f64::from)
+                .map_err(|_| Self::not_a_number(&value.to_string()))
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<f64, E> {
+            value.trim().parse().map_err(|_| Self::not_a_number(value))
+        }
+    }
+
+    deserializer.deserialize_any(RatioVisitor)
 }
 
 fn de_socket_addr<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SocketAddr, D::Error> {
@@ -1704,5 +1811,93 @@ state_store:
             load(&dir.path().join("missing.yaml"), with_password()),
             Err(ConfigError::Read { .. })
         ));
+    }
+
+    fn telemetry(body: &str) -> String {
+        format!("{MINIMAL}telemetry:\n{body}\n")
+    }
+
+    #[test]
+    fn telemetry_defaults_to_disabled_with_a_one_percent_sample() {
+        let config = parse(MINIMAL, with_password()).unwrap();
+        assert_eq!(config.telemetry, TelemetryConfig::default());
+        assert_eq!(config.telemetry.otlp_endpoint, None);
+        assert_eq!(config.telemetry.trace_sample_ratio, 0.01);
+        assert_eq!(DEFAULT_TRACE_SAMPLE_RATIO, 0.01);
+    }
+
+    #[test]
+    fn telemetry_parses_from_yaml_and_environment() {
+        let yaml = telemetry("  otlp_endpoint: http://collector:4317\n  trace_sample_ratio: 1.0");
+        let config = parse(&yaml, with_password()).unwrap();
+        assert_eq!(
+            config.telemetry,
+            TelemetryConfig {
+                otlp_endpoint: Some("http://collector:4317".to_owned()),
+                trace_sample_ratio: 1.0,
+            }
+        );
+        let mut overrides = with_password();
+        overrides.extend(env(&[
+            ("PGCDC__TELEMETRY__TRACE_SAMPLE_RATIO", "0.5"),
+            (
+                "PGCDC__TELEMETRY__OTLP_ENDPOINT",
+                "https://otel.internal:4317",
+            ),
+        ]));
+        let config = parse(&yaml, overrides).unwrap();
+        assert_eq!(
+            config.telemetry,
+            TelemetryConfig {
+                otlp_endpoint: Some("https://otel.internal:4317".to_owned()),
+                trace_sample_ratio: 0.5,
+            }
+        );
+        let integer = parse(&telemetry("  trace_sample_ratio: 1"), with_password()).unwrap();
+        assert_eq!(integer.telemetry.trace_sample_ratio, 1.0);
+        let from_environment = parse(
+            MINIMAL,
+            [
+                with_password(),
+                env(&[("PGCDC__TELEMETRY__OTLP_ENDPOINT", "http://env:4317")]),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            from_environment.telemetry.otlp_endpoint.as_deref(),
+            Some("http://env:4317")
+        );
+    }
+
+    #[test]
+    fn invalid_telemetry_settings_are_rejected() {
+        for (body, field) in [
+            ("  trace_sample_ratio: 1.5", "telemetry.trace_sample_ratio"),
+            ("  trace_sample_ratio: -0.1", "telemetry.trace_sample_ratio"),
+            ("  trace_sample_ratio: NaN", "telemetry.trace_sample_ratio"),
+            ("  otlp_endpoint: collector:4317", "telemetry.otlp_endpoint"),
+            ("  otlp_endpoint: ftp://x", "telemetry.otlp_endpoint"),
+            ("  otlp_endpoint: http://", "telemetry.otlp_endpoint"),
+            (
+                "  otlp_endpoint: \"https://:4317\"",
+                "telemetry.otlp_endpoint",
+            ),
+        ] {
+            assert_eq!(invalid_field(&telemetry(body)), field, "{body}");
+        }
+        let text = parse(&telemetry("  trace_sample_ratio: abc"), with_password())
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("telemetry.trace_sample_ratio"), "{text}");
+        assert!(matches!(
+            parse(&telemetry("  endpoint: x"), with_password()),
+            Err(ConfigError::Invalid(_))
+        ));
+        let empty = parse(&telemetry("  otlp_endpoint: \"\""), with_password()).unwrap();
+        assert_eq!(
+            crate::telemetry::plan(&empty.telemetry, None),
+            crate::telemetry::TelemetryPlan::Disabled
+        );
     }
 }
