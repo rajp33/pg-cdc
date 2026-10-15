@@ -398,7 +398,7 @@ impl Harness {
                 if pending > 0 {
                     writeln!(
                         std::io::stdout(),
-                        "chaos settle limit {limit:?} reached with {pending} changes neither delivered nor discarded; the checker looks for them in the state store"
+                        "chaos settle limit {limit:?} reached with {pending} changes neither delivered nor discarded; the checker looks for them in the state store and the slot"
                     )?;
                 }
                 return Ok(());
@@ -413,6 +413,9 @@ impl Harness {
     ) -> anyhow::Result<Outcome> {
         self.fleet.stop_all().await?;
         let stored = read_stored(&self.s3, BUCKET, &parked_prefix()).await?;
+        let retained_from = slot_confirmed(&self.postgres.client().await?)
+            .await?
+            .and_then(|confirmed| workload::retained_from(&ledger.marks, confirmed));
         let mut problems: Vec<String> = self.fleet.failures().to_vec();
         let takeover_kinds = self.fleet.takeover_kinds();
         problems.extend(missing_takeovers(&takeover_kinds));
@@ -441,6 +444,7 @@ impl Harness {
             observed,
             stored,
             discards: discards.clone(),
+            retained_from,
         });
         let report = ChaosReport {
             seed: options.seed,
@@ -458,6 +462,18 @@ impl Harness {
         };
         Ok(Outcome { report, problems })
     }
+}
+
+async fn slot_confirmed(client: &tokio_postgres::Client) -> anyhow::Result<Option<u64>> {
+    let row = client
+        .query_opt(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&SLOT],
+        )
+        .await?;
+    Ok(row
+        .and_then(|row| row.get::<_, Option<String>>(0))
+        .and_then(|lsn| workload::parse_lsn(&lsn)))
 }
 
 #[cfg(test)]

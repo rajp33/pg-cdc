@@ -32,10 +32,17 @@ pub struct Change {
     pub key: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Mark {
+    pub first_seq: i64,
+    pub before_commit: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Ledger {
     pub committed: Vec<Change>,
     pub uncertain: Vec<Change>,
+    pub marks: Vec<Mark>,
     pub transactions: u64,
     pub oversize: u64,
     pub last_lsn: Option<String>,
@@ -233,11 +240,25 @@ where
     .await
 }
 
+pub fn parse_lsn(text: &str) -> Option<u64> {
+    let (high, low) = text.split_once('/')?;
+    let high = u64::from_str_radix(high, 16).ok()?;
+    let low = u64::from_str_radix(low, 16).ok()?;
+    Some((high << 32) | low)
+}
+
+pub fn retained_from(marks: &[Mark], confirmed: u64) -> Option<i64> {
+    marks
+        .iter()
+        .find(|mark| mark.before_commit >= confirmed)
+        .map(|mark| mark.first_seq)
+}
+
 async fn run_transaction(
     client: &Client,
     upsert: &Statement,
     rows: &[Row],
-) -> Result<(), tokio_postgres::Error> {
+) -> Result<u64, tokio_postgres::Error> {
     client.batch_execute("BEGIN").await?;
     for window in rows.chunks(PIPELINE_WINDOW) {
         let parameters: Vec<[&(dyn ToSql + Sync); 4]> = window
@@ -260,7 +281,18 @@ async fn run_transaction(
             return Err(error);
         }
     }
-    client.batch_execute("COMMIT").await
+    let before_commit = match client
+        .query_one("SELECT pg_current_wal_insert_lsn()::text", &[])
+        .await
+    {
+        Ok(row) => row.get::<_, String>(0),
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(error);
+        }
+    };
+    client.batch_execute("COMMIT").await?;
+    Ok(parse_lsn(&before_commit).unwrap_or(0))
 }
 
 fn limit_reached(max_events: Option<u64>, written: usize) -> bool {
@@ -296,8 +328,14 @@ pub async fn write_events(
         let plan = planner.next_transaction();
         let changes: Vec<Change> = plan.rows.iter().map(|row| row.change).collect();
         match run_transaction(client, &upsert, &plan.rows).await {
-            Ok(()) => {
+            Ok(before_commit) => {
                 failures = 0;
+                if let Some(first) = changes.first() {
+                    ledger.marks.push(Mark {
+                        first_seq: first.seq,
+                        before_commit,
+                    });
+                }
                 ledger.transactions += 1;
                 ledger.oversize += u64::from(plan.oversize);
                 ledger.committed.extend(&changes);
@@ -495,5 +533,36 @@ mod tests {
             setup_statements("odd\"name")[2],
             "CREATE PUBLICATION \"odd\"\"name\" FOR TABLE loadgen_items"
         );
+    }
+
+    #[test]
+    fn the_slot_retains_every_transaction_written_at_or_after_its_confirmed_position() {
+        let marks = [
+            Mark {
+                first_seq: 1,
+                before_commit: 100,
+            },
+            Mark {
+                first_seq: 5,
+                before_commit: 200,
+            },
+            Mark {
+                first_seq: 9,
+                before_commit: 300,
+            },
+        ];
+        assert_eq!(retained_from(&marks, 50), Some(1));
+        assert_eq!(retained_from(&marks, 150), Some(5));
+        assert_eq!(retained_from(&marks, 300), Some(9));
+        assert_eq!(retained_from(&marks, 301), None);
+        assert_eq!(retained_from(&[], 0), None);
+    }
+
+    #[test]
+    fn lsns_parse_from_postgres_notation() {
+        assert_eq!(parse_lsn("0/1720E50"), Some(0x0172_0E50));
+        assert_eq!(parse_lsn("1/FF"), Some(0x1_0000_00FF));
+        assert_eq!(parse_lsn("1FF"), None);
+        assert_eq!(parse_lsn("x/1"), None);
     }
 }

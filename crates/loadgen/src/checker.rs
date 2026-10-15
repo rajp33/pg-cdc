@@ -25,6 +25,7 @@ pub struct Evidence {
     pub observed: Vec<Observed>,
     pub stored: Vec<i64>,
     pub discards: BTreeSet<u64>,
+    pub retained_from: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -41,6 +42,7 @@ pub struct Verdict {
     pub duplicates: usize,
     pub stored: usize,
     pub discarded: usize,
+    pub retained: usize,
     pub missing: Vec<i64>,
     pub phantoms: Vec<i64>,
     pub out_of_order: Vec<OrderViolation>,
@@ -78,13 +80,13 @@ pub fn check(evidence: &Evidence) -> Verdict {
     }
 
     let stored: HashSet<i64> = evidence.stored.iter().copied().collect();
-    let missing: BTreeSet<i64> = committed
+    let (retained, missing): (BTreeSet<i64>, BTreeSet<i64>) = committed
         .iter()
         .copied()
         .filter(|seq| {
             !deliveries.contains_key(seq) && !stored.contains(seq) && !discarded_seqs.contains(seq)
         })
-        .collect();
+        .partition(|seq| evidence.retained_from.is_some_and(|from| *seq >= from));
 
     Verdict {
         committed: committed.len(),
@@ -92,6 +94,7 @@ pub fn check(evidence: &Evidence) -> Verdict {
         duplicates: deliveries.values().map(|count| count - 1).sum(),
         stored: stored.len(),
         discarded,
+        retained: retained.len(),
         missing: missing.into_iter().collect(),
         phantoms: misrouted.into_iter().collect(),
         out_of_order: order_violations(evidence, &written),
@@ -292,6 +295,49 @@ mod tests {
         });
         assert!(discarded.passed(), "{discarded:?}");
         assert_eq!(discarded.discarded, 1);
+    }
+
+    #[test]
+    fn a_change_the_slot_still_retains_is_not_missing() {
+        let committed = [(1, 1), (2, 2), (3, 1), (4, 2)];
+        let observed = vec![delivered(1, 1)];
+        let retained = check(&Evidence {
+            stored: vec![2],
+            retained_from: Some(3),
+            ..evidence(&committed, observed.clone())
+        });
+        assert!(retained.passed(), "{retained:?}");
+        assert_eq!((retained.stored, retained.retained), (1, 2));
+
+        let confirmed = check(&Evidence {
+            retained_from: Some(4),
+            ..evidence(&committed, observed)
+        });
+        assert_eq!(confirmed.missing, vec![2, 3]);
+        assert_eq!(confirmed.retained, 1);
+
+        let overtaken = check(&Evidence {
+            retained_from: Some(3),
+            ..evidence(
+                &committed,
+                vec![
+                    delivered(1, 1),
+                    delivered(2, 2),
+                    delivered(4, 2),
+                    delivered(3, 1),
+                ],
+            )
+        });
+        assert!(overtaken.passed(), "{overtaken:?}");
+        assert_eq!(overtaken.retained, 0);
+        let skipped = check(&Evidence {
+            retained_from: Some(3),
+            ..evidence(
+                &[(1, 1), (3, 1), (5, 1)],
+                vec![delivered(1, 1), delivered(5, 1)],
+            )
+        });
+        assert_eq!(skipped.out_of_order.len(), 1, "{skipped:?}");
     }
 
     #[test]

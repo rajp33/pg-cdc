@@ -419,6 +419,7 @@ pub(super) async fn run(options: &LoadOptions) -> anyhow::Result<()> {
         observed: harness.deliveries.observations.snapshot(),
         stored,
         discards: BTreeSet::new(),
+        retained_from: None,
     });
     let checker_passed = checker.passed();
     let criterion_5 = criterion_five(&rounds, checker_passed, &problems);

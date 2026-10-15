@@ -142,7 +142,7 @@ pub fn missing_takeovers(kinds: &BTreeMap<String, u64>) -> Vec<String> {
 fn summary(report: &ChaosReport) -> String {
     let verdict = &report.verdict;
     format!(
-        "chaos seed={} duration={}s verdict={} committed={} delivered={} duplicates={} stored={} discarded={} takeovers={} clean={} unclean={} redrives={} discards={} missing={} phantoms={} out_of_order={}",
+        "chaos seed={} duration={}s verdict={} committed={} delivered={} duplicates={} stored={} retained={} discarded={} takeovers={} clean={} unclean={} redrives={} discards={} missing={} phantoms={} out_of_order={}",
         report.seed,
         report.duration_s,
         if verdict.passed() { "pass" } else { "fail" },
@@ -150,6 +150,7 @@ fn summary(report: &ChaosReport) -> String {
         verdict.delivered,
         verdict.duplicates,
         verdict.stored,
+        verdict.retained,
         verdict.discarded,
         report.takeovers,
         report.takeover_kinds.get("clean").copied().unwrap_or(0),
