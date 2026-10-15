@@ -268,8 +268,8 @@ async fn shutdown_during_a_wide_event_write_leaves_only_whole_lines() -> TestRes
 }
 
 #[tokio::test]
-async fn shutdown_with_a_failing_sink_stops_cleanly_and_replays_the_undelivered_event() -> TestResult
-{
+async fn shutdown_with_a_failing_sink_and_store_stops_cleanly_and_replays_the_undelivered_event()
+-> TestResult {
     let pg = Postgres::start().await?;
     support::prepare(
         &pg,
@@ -277,7 +277,11 @@ async fn shutdown_with_a_failing_sink_stops_cleanly_and_replays_the_undelivered_
         &["orders"],
     )
     .await?;
-    let mut first = support::spawn_session(support::params(&pg), Duration::from_secs(3600), BUFFER);
+    let mut first = support::spawn_with_stores(
+        support::params(&pg),
+        support::config(Duration::from_secs(3600), BUFFER),
+        support::unparkable_stores(),
+    );
     pg.execute("INSERT INTO orders VALUES (1)").await?;
     let delivered = first.next_event().await?;
     let first_commit = support::commit_lsn(&delivered)?;
@@ -287,7 +291,7 @@ async fn shutdown_with_a_failing_sink_stops_cleanly_and_replays_the_undelivered_
     let stopping = tokio::time::Instant::now();
     first.stop().await?;
     assert!(
-        stopping.elapsed() < DRAIN_TIMEOUT + Duration::from_secs(5),
+        stopping.elapsed() < DRAIN_TIMEOUT * 2 + Duration::from_secs(5),
         "shutdown took {:?}",
         stopping.elapsed()
     );

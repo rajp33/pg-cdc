@@ -1,5 +1,5 @@
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -14,12 +14,45 @@ const WAIT: Duration = Duration::from_secs(30);
 
 struct ConfigFile {
     file: tempfile::NamedTempFile,
-    _state: tempfile::TempDir,
+    state: tempfile::TempDir,
 }
 
 impl ConfigFile {
     fn path(&self) -> &Path {
         self.file.path()
+    }
+
+    fn parked_files(&self) -> TestResult<Vec<PathBuf>> {
+        let parked = self.state.path().join("cli").join("parked");
+        let mut files = Vec::new();
+        let Ok(keys) = std::fs::read_dir(&parked) else {
+            return Ok(files);
+        };
+        for key in keys {
+            for event in std::fs::read_dir(key?.path())? {
+                let path = event?.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    files.push(path);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    async fn wait_for_parked(&self, count: usize) -> TestResult<Vec<PathBuf>> {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let files = self.parked_files()?;
+                if files.len() >= count {
+                    return Ok(files);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await?
     }
 }
 
@@ -56,10 +89,7 @@ fn write_config_with_sink(
         database = pg.database(),
         user = pg.user(),
     )?;
-    Ok(ConfigFile {
-        file,
-        _state: state,
-    })
+    Ok(ConfigFile { file, state })
 }
 
 fn spawn(config: &Path, password: &str, stderr: Stdio) -> TestResult<Child> {
@@ -301,8 +331,7 @@ async fn password_in_config_file_is_rejected() -> TestResult {
 }
 
 #[tokio::test]
-async fn sigterm_after_stdout_closes_exits_cleanly_and_confirms_only_what_was_delivered()
--> TestResult {
+async fn sigterm_after_stdout_closes_parks_the_undelivered_event_and_exits_cleanly() -> TestResult {
     let pg = Postgres::start().await?;
     prepare(&pg, true).await?;
     let config = write_config(&pg, "cli_slot", "1h")?;
@@ -318,9 +347,9 @@ async fn sigterm_after_stdout_closes_exits_cleanly_and_confirms_only_what_was_de
             .ok_or("no commit_lsn")?,
     )?;
     drop(stdout);
-    let before_second = pg.current_wal_lsn().await?;
     pg.execute("INSERT INTO orders VALUES (2, 'undeliverable')")
         .await?;
+    let written = pg.current_wal_lsn().await?;
     wait_for_line(&mut stderr, "delivery failed").await?;
     sigterm(&child).await?;
     let status = tokio::time::timeout(WAIT, child.wait()).await??;
@@ -334,9 +363,14 @@ async fn sigterm_after_stdout_closes_exits_cleanly_and_confirms_only_what_was_de
         "the final status update did not confirm the delivered insert"
     );
     assert!(
-        confirmed <= before_second,
-        "confirmed {confirmed:X} past the undelivered insert after {before_second:X}"
+        confirmed >= written,
+        "confirmed {confirmed:X} before the parked insert ending at {written:X}"
     );
+    let parked = config.parked_files()?;
+    assert_eq!(parked.len(), 1, "{parked:?}");
+    let event: Value = serde_json::from_slice(&std::fs::read(&parked[0])?)?;
+    assert_eq!(event["envelope"]["after"]["status"], "undeliverable");
+    assert_eq!(event["status"], "retrying");
     Ok(())
 }
 
@@ -470,6 +504,40 @@ async fn a_missing_state_bucket_keeps_the_store_check_retrying_without_taking_th
         child.try_wait()?.is_none(),
         "pg-cdc must keep retrying, not exit"
     );
+    sigterm(&child).await?;
+    assert!(tokio::time::timeout(WAIT, child.wait()).await??.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_deleted_topic_parks_events_on_disk_and_the_slot_advances() -> TestResult {
+    let pg = Postgres::start().await?;
+    prepare(&pg, true).await?;
+    let aws = AwsEmulator::start().await?;
+    let route = aws.topic_with_queue("cli", false).await?;
+    let sink = format!("sink:\n  type: sns\n  topic_arn: {}\n", route.topic_arn);
+    let config = write_config_with_sink(&pg, "cli_slot", "200ms", &sink)?;
+    let mut env = moto_env(&aws);
+    env.push(("PGCDC__DELIVERY__PARK_AFTER", "1s"));
+    let mut child = spawn_with_env(config.path(), pg.password(), Stdio::null(), &env)?;
+    let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
+    wait_for_line(&mut stdout, "SNS topic ready").await?;
+    aws.sns()
+        .await
+        .delete_topic()
+        .topic_arn(&route.topic_arn)
+        .send()
+        .await?;
+    pg.execute("INSERT INTO orders VALUES (1, 'parked')")
+        .await?;
+    let written = pg.current_wal_lsn().await?;
+    let parked = config.wait_for_parked(1).await?;
+    let event: Value = serde_json::from_slice(&std::fs::read(&parked[0])?)?;
+    assert_eq!(event["envelope"]["after"]["status"], "parked");
+    pg.wait_for_slot("cli_slot", WAIT, |state| {
+        state.confirmed_flush_lsn.is_some_and(|lsn| lsn >= written)
+    })
+    .await?;
     sigterm(&child).await?;
     assert!(tokio::time::timeout(WAIT, child.wait()).await??.success());
     Ok(())

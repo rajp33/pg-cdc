@@ -6,7 +6,7 @@ use pg_cdc::event::EventId;
 use pg_cdc::lane::Stores;
 use pg_cdc::order::{OrderBy, OrderKeyId};
 use pg_cdc::payload::S3PayloadStore;
-use pg_cdc::session::SessionConfig;
+use pg_cdc::session::{DRAIN_TIMEOUT, SessionConfig};
 use pg_cdc::sink::SinkCapabilities;
 use pg_cdc::state::memory::MemoryStateStore;
 use pg_cdc::state::{ParkStatus, ParkedEvent, StateStore};
@@ -254,4 +254,46 @@ async fn without_a_payload_store_an_oversize_row_is_parked_dead() -> TestResult 
     .await?;
     assert!(session.no_event_within(Duration::from_secs(1)).await?);
     session.stop().await
+}
+
+#[tokio::test]
+async fn shutdown_parks_what_the_sink_did_not_take_and_the_next_session_drains_it() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let dir = tempfile::tempdir()?;
+    let stores = support::filesystem_stores(dir.path());
+    let mut first = support::spawn_with_stores(
+        support::params(&pg),
+        keyed(Duration::from_secs(3600)),
+        stores.clone(),
+    );
+    first.set_mode(Mode::Fail);
+    pg.execute("INSERT INTO orders VALUES (1, 'undelivered')")
+        .await?;
+    let written = pg.current_wal_lsn().await?;
+    first.wait_for_failures(1).await?;
+    let stopping = tokio::time::Instant::now();
+    first.stop().await?;
+    assert!(
+        stopping.elapsed() < DRAIN_TIMEOUT * 2 + Duration::from_secs(5),
+        "shutdown took {:?}",
+        stopping.elapsed()
+    );
+    let parked = support::parked(&stores, &support::order_key(1)).await?;
+    assert_eq!(parked.len(), 1);
+    let state = pg.wait_for_slot(SLOT, WAIT, |state| !state.active).await?;
+    assert!(
+        state.confirmed_flush_lsn.is_some_and(|lsn| lsn >= written),
+        "the parked transaction was not confirmed"
+    );
+    let mut second = support::spawn_with_stores(
+        support::params(&pg),
+        keyed(Duration::from_secs(3600)),
+        stores.clone(),
+    );
+    let drained = second.next_event().await?;
+    assert_eq!(drained["after"]["status"], "undelivered");
+    assert!(second.no_event_within(Duration::from_secs(1)).await?);
+    wait_for_queue(&stores, 1, <[ParkedEvent]>::is_empty).await?;
+    second.stop().await
 }

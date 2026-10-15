@@ -240,21 +240,40 @@ impl Session<'_> {
         stream: &ReplicationStream,
         settled: &mut mpsc::UnboundedReceiver<Report>,
     ) -> Result<(), SessionError> {
+        if self.settle_within(stream, settled).await? {
+            return Ok(());
+        }
+        tracing::warn!(
+            unsettled = self.ack.inflight_events(),
+            timeout_ms = DRAIN_TIMEOUT.as_millis(),
+            "parking the events still in flight after the drain timeout"
+        );
+        self.lanes.park_all();
+        if self.settle_within(stream, settled).await? {
+            return Ok(());
+        }
+        tracing::warn!(
+            unsettled = self.ack.inflight_events(),
+            "events neither delivered nor parked will replay"
+        );
+        Ok(())
+    }
+
+    async fn settle_within(
+        &mut self,
+        stream: &ReplicationStream,
+        settled: &mut mpsc::UnboundedReceiver<Report>,
+    ) -> Result<bool, SessionError> {
         let settle_all = async {
             while self.ack.inflight_events() > 0 {
                 self.report(settled.recv().await, stream)?;
             }
             Ok(())
         };
-        if let Ok(result) = tokio::time::timeout(DRAIN_TIMEOUT, settle_all).await {
-            return result;
+        match tokio::time::timeout(DRAIN_TIMEOUT, settle_all).await {
+            Ok(result) => result.map(|()| true),
+            Err(_) => Ok(false),
         }
-        tracing::warn!(
-            unsettled = self.ack.inflight_events(),
-            timeout_ms = DRAIN_TIMEOUT.as_millis(),
-            "events still in flight after the drain timeout will replay"
-        );
-        Ok(())
     }
 
     fn report(

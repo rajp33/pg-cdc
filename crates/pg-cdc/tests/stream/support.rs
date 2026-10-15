@@ -7,14 +7,18 @@ use pg_cdc::config::{
     DEFAULT_MAX_INFLIGHT_BYTES, DEFAULT_MAX_PARKED_EVENTS, DEFAULT_PARK_AFTER, TlsMode,
 };
 use pg_cdc::connection::{ConnectParams, PasswordProvider, TlsConfig};
+use pg_cdc::event::EventId;
 use pg_cdc::lane::Stores;
 use pg_cdc::order::{OrderBy, OrderKeyId};
 use pg_cdc::session::{SessionConfig, SessionError, run_session};
 use pg_cdc::sink::stdout::StdoutSink;
 use pg_cdc::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
-use pg_cdc::state::ParkedEvent;
 use pg_cdc::state::filesystem::FilesystemStateStore;
 use pg_cdc::state::memory::MemoryStateStore;
+use pg_cdc::state::{
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError, SwapOutcome,
+    Version, Versioned,
+};
 use pg_cdc_testkit::Postgres;
 use secrecy::SecretString;
 use serde_json::Value;
@@ -98,6 +102,63 @@ pub(crate) const LIMITS: SinkCapabilities = SinkCapabilities {
 pub(crate) fn memory_stores() -> Stores {
     Stores {
         state: Arc::new(MemoryStateStore::new()),
+        payload: None,
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct UnparkableStore(MemoryStateStore);
+
+#[async_trait]
+impl StateStore for UnparkableStore {
+    async fn append_parked(&self, _events: &[ParkedEvent]) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "the test store refuses to park".to_owned(),
+        ))
+    }
+
+    async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
+        self.0.load_parked_heads(partition).await
+    }
+
+    async fn read_parked(
+        &self,
+        key: &OrderKeyId,
+        after: Option<&EventId>,
+        limit: usize,
+    ) -> Result<Vec<ParkedEvent>, StoreError> {
+        self.0.read_parked(key, after, limit).await
+    }
+
+    async fn set_parked_status(
+        &self,
+        key: &OrderKeyId,
+        id: &EventId,
+        status: ParkStatus,
+    ) -> Result<(), StoreError> {
+        self.0.set_parked_status(key, id, status).await
+    }
+
+    async fn remove_parked(&self, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError> {
+        self.0.remove_parked(events).await
+    }
+
+    async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
+        self.0.read_leader().await
+    }
+
+    async fn swap_leader(
+        &self,
+        next: &LeaderRecord,
+        expected: Option<&Version>,
+    ) -> Result<SwapOutcome, StoreError> {
+        self.0.swap_leader(next, expected).await
+    }
+}
+
+pub(crate) fn unparkable_stores() -> Stores {
+    Stores {
+        state: Arc::new(UnparkableStore::default()),
         payload: None,
     }
 }
