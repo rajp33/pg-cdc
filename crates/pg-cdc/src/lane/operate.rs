@@ -123,7 +123,7 @@ impl Lane {
             state.failure = None;
             state.backoff.reset();
         }
-        self.to_kill.retain(|entry| *entry != (key, head));
+        self.to_kill.retain(|kill| !kill.is(key, head));
         self.to_load.push_back(key);
         self.stats_dirty = true;
         tracing::info!(order_key = %key, id = %head, "redrove a dead event");
@@ -169,7 +169,7 @@ impl Lane {
             }
         }
         self.ready.retain(|ready| *ready != key);
-        self.to_kill.retain(|entry| *entry != (key, id));
+        self.to_kill.retain(|kill| !kill.is(key, id));
         self.to_remove.retain(|entry| *entry != (key, id));
         self.retries.retain(|Reverse((_, due))| *due != key);
         self.to_load.push_back(key);

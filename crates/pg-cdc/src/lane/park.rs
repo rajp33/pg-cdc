@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 
 use tokio::time::Instant;
 
-use super::{Failure, Key, Lane, Stored};
+use super::{Failure, Key, Kill, Lane, Stored};
 use crate::order::OrderKeyId;
 use crate::sink::SinkError;
 use crate::state::now_ms;
@@ -103,7 +103,7 @@ impl Lane {
             if let Some(head) = stored.head.take() {
                 self.heads_in_memory = self.heads_in_memory.saturating_sub(1);
                 tracing::error!(order_key = %key, id = %head.id, %error, "a parked event cannot be sent; marking it dead");
-                self.to_kill.push((key, head.id));
+                self.to_kill.push(Kill::of(key, &head));
             }
         } else {
             tracing::error!(order_key = %key, %error, "an event cannot be sent; parking it dead");

@@ -221,3 +221,85 @@ async fn hot_path_spans_are_debug_and_disabled_at_info() {
         ]
     );
 }
+
+fn labelled(key: &[u8], ordinal: u32, body: usize) -> ParkedEvent {
+    let mut event = parked(key, ordinal, ParkStatus::Retrying);
+    event.attributes = vec![label("table", "orders"), label("op", "update")];
+    event.body = Bytes::from(vec![b'x'; body]);
+    event
+}
+
+async fn wait_for_dead(store: &TestStore, count: usize) {
+    for _ in 0..10_000 {
+        if store.dead_heads().await.len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{count} heads never turned dead");
+}
+
+fn dead_events(seen: &Mutex<Vec<Seen>>) -> Vec<(String, String, u64)> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| match entry {
+            Seen::Event {
+                table,
+                op,
+                outcome: EventOutcome::Dead,
+                count,
+            } => Some((table.clone(), op.clone(), *count)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_head_rejected_for_good_counts_as_dead_under_its_labels() {
+    let seen = recording();
+    let store = TestStore::default();
+    store
+        .inner
+        .append_parked(&[labelled(b"k", 0, 1)])
+        .await
+        .unwrap();
+    store.fail_status_changes.store(2, Ordering::SeqCst);
+    let terminal: Script = Box::new(|_, _| Outcome::Terminal(SinkError("rejected".to_owned())));
+    let harness =
+        Harness::start(Setup::default(), ScriptedSink::new(LIMITS, terminal), store).await;
+    wait_for_dead(&harness.store, 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(harness.store.status_changes.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        dead_events(&seen),
+        vec![("orders".to_owned(), "update".to_owned(), 1)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_oversized_parked_head_counts_as_dead_under_its_labels() {
+    let seen = recording();
+    let store = TestStore::default();
+    store
+        .inner
+        .append_parked(&[labelled(b"k", 0, 500)])
+        .await
+        .unwrap();
+    let limits = SinkCapabilities {
+        max_message_bytes: 100,
+        ..LIMITS
+    };
+    let harness = Harness::start(
+        Setup::default(),
+        ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered)),
+        store,
+    )
+    .await;
+    wait_for_dead(&harness.store, 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        dead_events(&seen),
+        vec![("orders".to_owned(), "update".to_owned(), 1)]
+    );
+}

@@ -7,11 +7,11 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::Instrument;
 
-use super::{Key, Lane, Report, Stored, record_delivered};
+use super::{Key, Kill, Lane, Report, Stored, record_delivered};
 use crate::event::EventId;
 use crate::metrics::{self, EventOutcome, Measurement};
 use crate::order::OrderKeyId;
-use crate::sink::{Outcome, UNKNOWN_LABEL, metric_labels};
+use crate::sink::{Outcome, metric_labels};
 use crate::state::{ParkStatus, ParkedEvent, ParkedHead, StoreError, now_ms};
 
 pub(super) const QUEUED_BEHIND: &str = "queued behind a parked event";
@@ -340,7 +340,7 @@ impl Lane {
             }
             Outcome::Terminal(error) => {
                 tracing::error!(order_key = %key, id = %head.id, %error, "the sink rejected a parked event for good; marking it dead");
-                self.to_kill.push((key, head.id));
+                self.to_kill.push(Kill::of(key, &head));
             }
         }
     }
@@ -384,24 +384,26 @@ impl Lane {
 
     async fn flush_kills(&mut self) {
         let store = Arc::clone(&self.store);
-        while let Some((key, id)) = self.to_kill.pop() {
+        while let Some(kill) = self.to_kill.pop() {
             if let Err(error) = self
-                .publishing(store.set_parked_status(&key, &id, ParkStatus::Dead))
+                .publishing(store.set_parked_status(&kill.key, &kill.id, ParkStatus::Dead))
                 .await
             {
                 self.store_failed("mark dead", &error);
-                self.to_kill.push((key, id));
+                self.to_kill.push(kill);
                 return;
             }
-            metrics::record(Measurement::Event {
-                table: UNKNOWN_LABEL,
-                op: UNKNOWN_LABEL,
-                outcome: EventOutcome::Dead,
-                count: 1,
-            });
+            if let Some((table, op)) = &kill.labels {
+                metrics::record(Measurement::Event {
+                    table,
+                    op,
+                    outcome: EventOutcome::Dead,
+                    count: 1,
+                });
+            }
             if let Some(stored) = self
                 .keys
-                .get_mut(&key)
+                .get_mut(&kill.key)
                 .and_then(|state| state.stored.as_mut())
             {
                 stored.dead = true;

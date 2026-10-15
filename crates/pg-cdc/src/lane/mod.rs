@@ -240,6 +240,31 @@ struct Failure {
     error: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Kill {
+    key: OrderKeyId,
+    id: EventId,
+    labels: Option<(String, String)>,
+}
+
+impl Kill {
+    fn of(key: OrderKeyId, head: &Outbound) -> Self {
+        let labels = metrics::enabled().then(|| {
+            let (table, op) = metric_labels(&head.attributes);
+            (table.to_owned(), op.to_owned())
+        });
+        Self {
+            key,
+            id: head.id,
+            labels,
+        }
+    }
+
+    fn is(&self, key: OrderKeyId, id: EventId) -> bool {
+        self.key == key && self.id == id
+    }
+}
+
 #[derive(Debug, Default)]
 struct Stored {
     floor: Option<EventId>,
@@ -268,7 +293,7 @@ struct Lane {
     to_append: BTreeSet<OrderKeyId>,
     to_load: VecDeque<OrderKeyId>,
     to_remove: Vec<(OrderKeyId, EventId)>,
-    to_kill: Vec<(OrderKeyId, EventId)>,
+    to_kill: Vec<Kill>,
     heads_in_memory: usize,
     store_turn: usize,
     store_backoff: Backoff,
