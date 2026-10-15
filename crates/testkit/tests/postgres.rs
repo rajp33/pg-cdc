@@ -85,6 +85,23 @@ async fn slot_state_and_capture_follow_the_slot() -> TestResult {
 }
 
 #[tokio::test]
+async fn max_wal_senders_option_sets_the_server_limit() -> TestResult {
+    let pg = Postgres::start_with(PostgresOptions {
+        max_wal_senders: Some(1),
+        ..PostgresOptions::default()
+    })
+    .await?;
+    let senders: String = pg
+        .client()
+        .await?
+        .query_one("SHOW max_wal_senders", &[])
+        .await?
+        .try_get(0)?;
+    assert_eq!(senders, "1");
+    Ok(())
+}
+
+#[tokio::test]
 async fn tls_option_enables_ssl_with_generated_ca() -> TestResult {
     let pg = Postgres::start_with(PostgresOptions {
         tls: true,
