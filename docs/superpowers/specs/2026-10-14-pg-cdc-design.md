@@ -490,7 +490,7 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 4. `read_parked` returns events in ascending id order, and `load_parked_heads` returns each queue's lowest id.
 5. `remove_parked` of a missing event succeeds.
 6. `swap_leader` is an atomic compare-and-swap, and `expected: None` means create-if-absent.
-7. Concurrent calls are safe. pg-cdc bounds them with `state_store.max_concurrency` (default 32) and backs off on throttling.
+7. Concurrent calls are safe. pg-cdc bounds them with `state_store.max_concurrency` (default 256) and backs off on throttling.
 8. `append_parked` lands each order key's events in id order. If it fails or is cancelled, the events it stored for each key are a prefix of that key's events in the call, so a queue never has a gap below its head. An event that cannot be encoded fails the call before anything is written. The suite checks the encoding rule; each adapter's own tests check the prefix rule by injecting a fault in the middle of a key's events.
 9. `list_parked_queues` returns the queues whose order key id is above `after`, in ascending order key id order, at most `limit` of them, each with its lowest id as the head and its length capped at `length_cap`; a key with no events is not listed. Its work is bounded by the page, `limit` queues of at most `length_cap` events each, whatever other queues hold. Startup keeps using `load_parked_heads` (§10.6); `list_parked_queues` serves the admin API (§16.2).
 
@@ -748,7 +748,7 @@ state_store:
   type: s3
   bucket: pgcdc-state
   prefix: orders/
-  max_concurrency: 32
+  max_concurrency: 256
 
 payload_store:
   type: s3
@@ -781,7 +781,7 @@ With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDE
 | `delivery.max_parked_events` | `10000000` (`0` = unlimited) |
 | `delivery.max_inflight_bytes` | `256MiB` |
 | `sink.max_concurrency` | `32` |
-| `state_store.max_concurrency` | `32` |
+| `state_store.max_concurrency` | `256` |
 | `leadership.lease_timeout` | `6s` |
 | `leadership.fence_delay` | `10s` |
 | `leadership.drain_timeout` | `5s` |

@@ -1,3 +1,4 @@
+mod drain;
 mod gauges;
 mod metrics;
 mod model;

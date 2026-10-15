@@ -20,7 +20,7 @@ pub const DEFAULT_SINK_CONCURRENCY: usize = 32;
 pub const MAX_ATTRIBUTE_COLUMNS: usize = 7;
 pub const DEFAULT_PARK_AFTER: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_PARKED_EVENTS: u64 = 10_000_000;
-pub const DEFAULT_STORE_CONCURRENCY: usize = 32;
+pub const DEFAULT_STORE_CONCURRENCY: usize = 256;
 pub const MAX_CONCURRENCY: usize = 4096;
 pub const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(6);
 pub const DEFAULT_FENCE_DELAY: Duration = Duration::from_secs(10);
@@ -1520,10 +1520,10 @@ state_store:
             config.state_store,
             StateStoreConfig::Filesystem(FilesystemStoreConfig {
                 path: PathBuf::from("/var/lib/pg-cdc"),
-                max_concurrency: 32,
+                max_concurrency: 256,
             })
         );
-        assert_eq!(config.state_store.max_concurrency(), 32);
+        assert_eq!(config.state_store.max_concurrency(), 256);
         assert_eq!(config.payload_store, None);
     }
 

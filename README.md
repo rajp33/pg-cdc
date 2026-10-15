@@ -48,7 +48,7 @@ state_store:
   type: s3
   bucket: pgcdc-state
   prefix: orders/
-  max_concurrency: 32
+  max_concurrency: 256
 payload_store:
   type: s3
   bucket: pgcdc-payloads
@@ -69,7 +69,7 @@ The SNS message limit comes from the topic's `MaximumMessageSize` attribute when
 - **Parked keys stay in order.** While an order key has parked events, its new events are appended behind them and never sent ahead. pg-cdc redelivers the queue from the store, oldest first, and the key returns to the live path once its queue is empty. Other keys keep flowing throughout.
 - **Dead events block their key** until an operator redrives or discards them with `pg-cdc parked` (see [Admin API and parked events](#admin-api-and-parked-events)).
 - **Oversize events.** An event larger than the sink's message limit is stored in the payload store, and the sink receives a pointer instead: the same envelope without `before`, `after` and `unchanged_toast`, plus `"payload_ref": {"uri": "s3://bucket/prefix/pipeline/payloads/<event id>.json", "bytes": 912345}`. Without a `payload_store`, such an event is parked as dead. A lifecycle rule should expire payloads after your consumers' retention period.
-- **Startup.** Reading starts at once; delivery for an order key waits until the parked queue heads of its partition (the first byte of the order key id, 256 partitions) have loaded. Replayed events below a queue's head are skipped. Store calls are bounded by `state_store.max_concurrency` (default 32, from 1 to 4096), including listing during head loading.
+- **Startup.** Reading starts at once; delivery for an order key waits until the parked queue heads of its partition (the first byte of the order key id, 256 partitions) have loaded. Replayed events below a queue's head are skipped. Store calls are bounded by `state_store.max_concurrency` (default 256, from 1 to 4096), including listing during head loading.
 - **Shutdown.** On SIGTERM, pg-cdc stops reading, gives in-flight events `leadership.drain_timeout` (default 5 s) to deliver, parks whatever remains (another `drain_timeout` at most), sends a final status update and exits 0. Events that could neither deliver nor park replay on the next start. See [Leadership and deploys](#leadership-and-deploys) for the full handover.
 - **Limits.** At `delivery.max_parked_events` (default 10,000,000; `0` is unlimited), or while the state store is unavailable, events stay in flight and the reader stops at `delivery.max_inflight_bytes`. pg-cdc checks that the state store answers before it opens the replication connection.
 - **State stores.** `state_store: { type: s3, bucket, prefix, region }` uses conditional writes and suits active/standby across hosts; the bucket should use default encryption, because parked objects hold row data. `state_store: { type: filesystem, path: /var/lib/pg-cdc }` keeps the same tree on local disk and suits a single host.
