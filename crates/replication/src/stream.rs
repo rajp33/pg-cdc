@@ -19,11 +19,13 @@ use crate::protocol::{
 use crate::startup::{self, Conn, Io};
 
 type Delivery = Result<ReplicationEvent, ReplicationError>;
+type StatusReply = oneshot::Sender<Result<(), ReplicationError>>;
 
 pub struct ReplicationStream {
     events: mpsc::Receiver<Delivery>,
     confirmed: Arc<AtomicU64>,
     stop: Option<oneshot::Sender<()>>,
+    status: mpsc::Sender<StatusReply>,
     task: JoinHandle<Result<(), ReplicationError>>,
     backend_pid: u32,
     connect_timeout: Duration,
@@ -59,16 +61,19 @@ impl ReplicationStream {
         let confirmed = Arc::new(AtomicU64::new(config.start_lsn.0));
         let (sender, events) = mpsc::channel(config.buffer);
         let (stop, stop_requested) = oneshot::channel();
+        let (status, status_requests) = mpsc::channel(1);
         let worker = Worker {
             conn,
             confirmed: Arc::clone(&confirmed),
             status_interval: config.status_interval,
+            status_requests,
         };
         let task = tokio::spawn(worker.run(sender, stop_requested));
         Ok(Self {
             events,
             confirmed,
             stop: Some(stop),
+            status,
             task,
             backend_pid,
             connect_timeout: config.connect_timeout,
@@ -85,6 +90,15 @@ impl ReplicationStream {
 
     pub fn confirm(&self, lsn: Lsn) {
         self.confirmed.fetch_max(lsn.0, Ordering::AcqRel);
+    }
+
+    pub async fn send_status(&self) -> Result<(), ReplicationError> {
+        let (reply, sent) = oneshot::channel();
+        self.status
+            .send(reply)
+            .await
+            .map_err(|_| ReplicationError::Closed)?;
+        sent.await.map_err(|_| ReplicationError::Closed)?
     }
 
     pub async fn stop(mut self) -> Result<(), ReplicationError> {
@@ -118,6 +132,7 @@ struct Worker {
     conn: Conn,
     confirmed: Arc<AtomicU64>,
     status_interval: Duration,
+    status_requests: mpsc::Receiver<StatusReply>,
 }
 
 enum Ending {
@@ -145,6 +160,10 @@ impl Worker {
             }
             Err(error) => {
                 tracing::debug!(%error, "replication stream failed");
+                self.status_requests.close();
+                while let Ok(reply) = self.status_requests.try_recv() {
+                    let _ = reply.send(Err(ReplicationError::Worker(error.to_string())));
+                }
                 let failure = ReplicationError::Worker(error.to_string());
                 tokio::select! {
                     biased;
@@ -176,6 +195,13 @@ impl Worker {
                 biased;
                 _ = &mut *stop => return Ok(Ending::Stop),
                 _ = ticker.tick() => self.send_status().await?,
+                Some(reply) = self.status_requests.recv() => {
+                    if let Err(error) = self.send_status().await {
+                        let _ = reply.send(Err(ReplicationError::Worker(error.to_string())));
+                        return Err(error);
+                    }
+                    let _ = reply.send(Ok(()));
+                }
                 permit = events.reserve(), if pending.is_some() => {
                     let Ok(permit) = permit else {
                         return Ok(Ending::Done);
@@ -316,6 +342,50 @@ mod tests {
         server.send(b'c', b"").await;
         assert_eq!(server.read().await.tag, b'X');
         stopping.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_status_writes_the_confirmed_lsn_without_waiting_for_the_timer() {
+        let (mut stream, mut server) = fake::started(fake::config()).await;
+        server.read_status().await;
+        stream.confirm(Lsn(0x40));
+        let sent = Instant::now();
+        stream.send_status().await.unwrap();
+        let status = server.read_status().await;
+        assert_eq!(
+            (status.write, status.flush, status.apply),
+            (0x40, 0x40, 0x40)
+        );
+        assert_eq!(sent.elapsed(), Duration::ZERO);
+        server.xlog(0x100, 0x110, b"B").await;
+        assert!(matches!(
+            stream.recv().await,
+            Ok(Some(ReplicationEvent::XLogData { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_status_fails_once_the_stream_has_failed() {
+        let (mut stream, mut server) = fake::started(fake::config()).await;
+        server.read_status().await;
+        drop(server);
+        assert!(matches!(stream.recv().await, Err(ReplicationError::Closed)));
+        assert!(stream.send_status().await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_status_fails_at_once_when_a_failure_waits_behind_a_full_channel() {
+        let mut config = fake::config();
+        config.buffer = 1;
+        let (stream, mut server) = fake::started(config).await;
+        for n in 1..=2_u64 {
+            server.xlog(n * 0x100, n * 0x100 + 0x10, b"B").await;
+        }
+        drop(server);
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let started = Instant::now();
+        assert!(stream.send_status().await.is_err());
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test]
