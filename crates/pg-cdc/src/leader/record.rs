@@ -5,7 +5,7 @@ use pg_cdc_decoder::Lsn;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-use crate::leader::POLL_INTERVAL;
+use crate::leader::{POLL_INTERVAL, unless_cancelled};
 use crate::state::{
     LeaderRecord, LeaderState, StateStore, StoreError, SwapOutcome, Version, Versioned, now_ms,
 };
@@ -79,12 +79,13 @@ where
 {
     let mut backoff = Backoff::new(LEADER_RETRY_BASE, LEADER_RETRY_CAP);
     loop {
-        let error = match call().await {
-            Ok(value) => return Ok(value),
-            Err(error) => error,
+        let error = match unless_cancelled(cancel, call()).await {
+            None => return Err(TakeoverError::Cancelled),
+            Some(Ok(value)) => return Ok(value),
+            Some(Err(error)) => error,
         };
         let delay = retry_delay(&mut backoff, action, &error);
-        if cancel.run_until_cancelled(sleep(delay)).await.is_none() {
+        if unless_cancelled(cancel, sleep(delay)).await.is_none() {
             return Err(TakeoverError::Cancelled);
         }
     }
@@ -102,8 +103,7 @@ async fn wait_out_previous_holder(
         wait_ms,
         "the previous holder did not release the slot cleanly; waiting fence_delay before writing"
     );
-    cancel
-        .run_until_cancelled(sleep(fence_delay))
+    unless_cancelled(cancel, sleep(fence_delay))
         .await
         .ok_or(TakeoverError::Cancelled)
 }
@@ -173,13 +173,13 @@ pub async fn release(store: &dyn StateStore, claim: &Claim, confirmed: Lsn) -> R
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use proptest::prelude::*;
     use tokio::task::{JoinHandle, JoinSet, yield_now};
-    use tokio::time::{Instant, advance, sleep};
+    use tokio::time::{Instant, advance, sleep, timeout};
 
     use super::*;
     use crate::event::EventId;
@@ -206,6 +206,8 @@ mod tests {
         inner: MemoryStateStore,
         read_failures: AtomicU32,
         swap_failures: AtomicU32,
+        hang_reads: AtomicBool,
+        hang_swaps: AtomicBool,
         attempts: Mutex<Vec<LeaderRecord>>,
         landed: Mutex<Vec<LeaderRecord>>,
     }
@@ -216,6 +218,8 @@ mod tests {
                 inner: MemoryStateStore::new(),
                 read_failures: AtomicU32::new(read_failures),
                 swap_failures: AtomicU32::new(swap_failures),
+                hang_reads: AtomicBool::new(false),
+                hang_swaps: AtomicBool::new(false),
                 attempts: Mutex::default(),
                 landed: Mutex::default(),
             })
@@ -282,6 +286,9 @@ mod tests {
         }
 
         async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
+            if self.hang_reads.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             if Self::consume(&self.read_failures) {
                 return Err(StoreError::Unavailable("read failed".to_owned()));
             }
@@ -294,6 +301,9 @@ mod tests {
             expected: Option<&Version>,
         ) -> Result<SwapOutcome, StoreError> {
             self.attempts.lock().unwrap().push(next.clone());
+            if self.hang_swaps.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             if Self::consume(&self.swap_failures) {
                 std::thread::sleep(Duration::from_millis(2));
                 return Err(StoreError::Unavailable("swap failed".to_owned()));
@@ -442,6 +452,64 @@ mod tests {
         cancel.cancel();
         assert_eq!(handle.await.unwrap(), Err(TakeoverError::Cancelled));
         assert_eq!(store.attempts(), Vec::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_takeover_reads_and_claims_nothing() {
+        let store = FlakyLeader::new(0, 0);
+        store.hang_reads.store(true, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = timeout(
+            Duration::from_secs(60),
+            take_over(&*store, "me", Lsn(0x20), FENCE, &cancel),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Err(TakeoverError::Cancelled));
+        assert_eq!(store.attempts(), Vec::new());
+        assert_eq!(store.stored().await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_takeover_of_an_absent_record_claims_nothing() {
+        let store = FlakyLeader::new(0, 0);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = take_over(&*store, "me", Lsn(0x20), FENCE, &cancel).await;
+        assert_eq!(result, Err(TakeoverError::Cancelled));
+        assert_eq!(store.attempts(), Vec::new());
+        assert_eq!(store.stored().await, None);
+    }
+
+    async fn assert_cancel_during_a_hang(store: &Arc<FlakyLeader>) {
+        let cancel = CancellationToken::new();
+        let handle = spawn_take_over(store, FENCE, &cancel);
+        settle().await;
+        advance(Duration::from_secs(3)).await;
+        settle().await;
+        assert!(!handle.is_finished());
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(60), handle).await.unwrap();
+        assert_eq!(result.unwrap(), Err(TakeoverError::Cancelled));
+        assert_eq!(store.landed(), Vec::new());
+        assert_eq!(store.stored().await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_a_hanging_read_cancels_without_claiming() {
+        let store = FlakyLeader::new(0, 0);
+        store.hang_reads.store(true, Ordering::SeqCst);
+        assert_cancel_during_a_hang(&store).await;
+        assert_eq!(store.attempts(), Vec::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_a_hanging_claim_cancels_without_another_attempt() {
+        let store = FlakyLeader::new(0, 0);
+        store.hang_swaps.store(true, Ordering::SeqCst);
+        assert_cancel_during_a_hang(&store).await;
+        assert_eq!(store.attempts().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
