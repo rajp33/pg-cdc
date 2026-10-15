@@ -66,12 +66,12 @@ fn largest_gap(deliveries: &[Instant], term: Instant, until: Instant, now: Insta
         .unwrap_or(Duration::ZERO)
 }
 
-fn criterion_five(rounds: &[Round], checker_passed: bool) -> Verdict {
+fn criterion_five(rounds: &[Round], checker_passed: bool, problems: &[String]) -> Verdict {
     let within = |seconds: f64| seconds < HANDOVER_LIMIT_S;
     let quick = rounds
         .iter()
         .all(|round| within(round.ready) && within(round.gap));
-    if checker_passed && !rounds.is_empty() && quick {
+    if checker_passed && problems.is_empty() && !rounds.is_empty() && quick {
         Verdict::Pass
     } else {
         Verdict::Fail
@@ -417,7 +417,7 @@ pub(super) async fn run(options: &LoadOptions) -> anyhow::Result<()> {
         discards: BTreeSet::new(),
     });
     let checker_passed = checker.passed();
-    let criterion_5 = criterion_five(&rounds, checker_passed);
+    let criterion_5 = criterion_five(&rounds, checker_passed, &problems);
     print_outcome(&rounds, &checker, &problems, criterion_5)?;
     let report = Report {
         scenario: "handover",
@@ -553,20 +553,29 @@ mod tests {
     #[test]
     fn criterion_five_needs_every_handover_under_ten_seconds_and_intact_evidence() {
         let good = [round(1.0, 6.5, 6.75), round(0.5, 9.9, 9.99)];
-        assert_eq!(criterion_five(&good, true), Verdict::Pass);
-        assert_eq!(criterion_five(&good, false), Verdict::Fail);
+        assert_eq!(criterion_five(&good, true, &[]), Verdict::Pass);
+        assert_eq!(criterion_five(&good, false, &[]), Verdict::Fail);
         assert_eq!(
-            criterion_five(&[round(1.0, 10.0, 6.0)], true),
+            criterion_five(&[round(1.0, 10.0, 6.0)], true, &[]),
             Verdict::Fail
         );
         assert_eq!(
-            criterion_five(&[round(1.0, 6.0, 10.0)], true),
+            criterion_five(&[round(1.0, 6.0, 10.0)], true, &[]),
             Verdict::Fail
         );
         assert_eq!(
-            criterion_five(&[round(30.0, 6.0, 6.0)], true),
+            criterion_five(&[round(30.0, 6.0, 6.0)], true, &[]),
             Verdict::Pass
         );
-        assert_eq!(criterion_five(&[], true), Verdict::Fail);
+        assert_eq!(criterion_five(&[], true, &[]), Verdict::Fail);
+    }
+
+    #[test]
+    fn a_failed_exit_or_an_unreadable_message_fails_criterion_five() {
+        let good = [round(1.0, 6.5, 6.75)];
+        let unreadable = ["3 published messages were not understood".to_owned()];
+        assert_eq!(criterion_five(&good, true, &unreadable), Verdict::Fail);
+        let crashed = ["the old instance exited with exit status: 3".to_owned()];
+        assert_eq!(criterion_five(&good, true, &crashed), Verdict::Fail);
     }
 }
