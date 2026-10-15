@@ -207,6 +207,9 @@ mod tests {
     use crate::ack::AckError;
     use crate::event::EventId;
     use crate::lane::{LaneError, LaneStopped};
+    use crate::leader::lease::FenceReason;
+    use crate::leader::record::TakeoverError;
+    use crate::leader::standby::ProbeError;
     use crate::order::OrderKeyId;
     use crate::sink::{Outbound, Outcome, SinkCapabilities, SinkError};
     use crate::state::memory::MemoryStateStore;
@@ -408,6 +411,42 @@ mod tests {
         ] {
             assert!(!error.is_fatal(), "{error}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fenced_invalid_and_conflicting_sessions_retry_instead_of_stopping() {
+        let errors = || {
+            [
+                SessionError::Fenced(FenceReason::Expired),
+                SessionError::Invalid(Invalid::SlotMissing("s".to_owned())),
+                SessionError::Probe(ProbeError("closed".to_owned())),
+                SessionError::Takeover(TakeoverError::Conflict),
+            ]
+        };
+        for error in errors() {
+            assert!(!error.is_fatal(), "{error}");
+        }
+        for error in errors() {
+            let mut attempt = Scripted::new(vec![Err(error), Ok(())]);
+            let result = supervise(&mut attempt, &CancellationToken::new()).await;
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(attempt.runs, 2);
+        }
+        let mut attempt = Scripted::new(vec![
+            Err(SessionError::Takeover(TakeoverError::EpochExhausted)),
+            Ok(()),
+        ]);
+        let result = supervise(&mut attempt, &CancellationToken::new()).await;
+        assert!(
+            matches!(
+                result,
+                Err(SupervisorError::Fatal(SessionError::Takeover(
+                    TakeoverError::EpochExhausted
+                )))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(attempt.runs, 1);
     }
 
     #[tokio::test(start_paused = true)]

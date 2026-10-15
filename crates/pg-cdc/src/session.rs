@@ -25,6 +25,7 @@ use crate::event::{BuildError, Builder, Built, ColumnInfo, RelationInfo};
 use crate::health::{Health, Role};
 use crate::lane::{LaneError, LaneSettings, LaneStopped, Lanes, Pending, Report, Stores};
 use crate::leader::gate::{WriteGate, gated_sink, gated_stores};
+use crate::leader::lease::{FenceReason, hold_lease};
 use crate::leader::record::{Claim, TakeoverError, take_over};
 use crate::leader::standby::{
     AcquireError, OBJECT_IN_USE, ProbeError, SlotHolder, SlotProbe, StartError, acquire,
@@ -84,6 +85,8 @@ pub enum SessionError {
     Probe(#[from] ProbeError),
     #[error("cannot take over the slot: {0}")]
     Takeover(#[from] TakeoverError),
+    #[error("lost the slot and fenced: {0}")]
+    Fenced(FenceReason),
     #[error("replication stream failed: {0}")]
     Replication(#[from] ReplicationError),
     #[error("replication stream ended")]
@@ -163,15 +166,16 @@ async fn attempt(
         control: Arc::clone(&control),
         slot: config.slot.clone(),
     });
-    let Some((stream, start, _acquired)) =
+    let Some((stream, start, acquired)) =
         acquire_slot(probe.as_ref(), &control, &params, config, context, shutdown).await?
     else {
         return Ok(());
     };
+    let gate = WriteGate::new();
+    let lease = spawn_lease(&probe, &stream, config, acquired, &gate, &context.health);
     context.health.set_role(Role::Active);
     context.health.set_lease_valid(true);
     tracing::info!(backend_pid = stream.backend_pid(), start_lsn = %start, "acquired the slot");
-    let gate = WriteGate::new();
     let takeover = spawn_takeover(config, stores, context, start);
     let (reports, mut settled) = mpsc::unbounded_channel();
     let permits = Arc::new(Semaphore::new(
@@ -202,12 +206,34 @@ async fn attempt(
         },
     };
     drop(reports);
-    let result = session.run(stream, &mut settled, shutdown, start).await;
+    let result = session
+        .run(stream, &mut settled, shutdown, start, lease)
+        .await;
     gate.fence();
     result
 }
 
 type PendingClaim = AbortOnDropHandle<Result<Claim, TakeoverError>>;
+type Lease = AbortOnDropHandle<FenceReason>;
+
+fn spawn_lease(
+    probe: &Arc<ControlProbe>,
+    stream: &ReplicationStream,
+    config: &SessionConfig,
+    acquired: Instant,
+    gate: &Arc<WriteGate>,
+    health: &Health,
+) -> Lease {
+    let probe: Arc<dyn SlotProbe> = Arc::clone(probe) as Arc<dyn SlotProbe>;
+    AbortOnDropHandle::new(tokio::spawn(hold_lease(
+        probe,
+        stream.backend_pid(),
+        config.leadership.lease_timeout,
+        acquired,
+        Arc::clone(gate),
+        health.clone(),
+    )))
+}
 
 fn spawn_takeover(
     config: &SessionConfig,
@@ -393,6 +419,11 @@ struct Session<'a> {
     leadership: Leadership,
 }
 
+enum Ended {
+    Fenced(FenceReason),
+    Body(Result<(), SessionError>),
+}
+
 impl Session<'_> {
     async fn run(
         mut self,
@@ -400,8 +431,19 @@ impl Session<'_> {
         settled: &mut mpsc::UnboundedReceiver<Report>,
         shutdown: &CancellationToken,
         start: Lsn,
+        mut lease: Lease,
     ) -> Result<(), SessionError> {
-        match self.stream(&mut stream, settled, shutdown, start).await {
+        let ended = tokio::select! {
+            biased;
+            joined = &mut lease => Ended::Fenced(joined.unwrap_or(FenceReason::Expired)),
+            result = self.body(&mut stream, settled, shutdown, start) => Ended::Body(result),
+        };
+        let result = match ended {
+            Ended::Fenced(reason) => return self.fenced(stream, reason).await,
+            Ended::Body(result) => result,
+        };
+        drop(lease);
+        match result {
             Err(error @ SessionError::Takeover(_)) => {
                 tracing::error!(slot = self.slot, %error, "cannot take over the slot; releasing it");
                 self.leadership.gate.fence();
@@ -421,7 +463,6 @@ impl Session<'_> {
                 Ok(())
             }
             Ok(()) => {
-                self.drain(&stream, settled).await?;
                 self.lanes.stop(Duration::ZERO).await;
                 if let Err(error) = stream.stop().await {
                     tracing::warn!(%error, "replication stream did not stop cleanly");
@@ -430,6 +471,32 @@ impl Session<'_> {
                 Ok(())
             }
         }
+    }
+
+    async fn body(
+        &mut self,
+        stream: &mut ReplicationStream,
+        settled: &mut mpsc::UnboundedReceiver<Report>,
+        shutdown: &CancellationToken,
+        start: Lsn,
+    ) -> Result<(), SessionError> {
+        self.stream(stream, settled, shutdown, start).await?;
+        if self.leadership.claim.is_some() {
+            self.drain(stream, settled).await?;
+        }
+        Ok(())
+    }
+
+    async fn fenced(
+        mut self,
+        stream: ReplicationStream,
+        reason: FenceReason,
+    ) -> Result<(), SessionError> {
+        self.leadership.pending = None;
+        self.leadership.gate.fence();
+        self.lanes.stop(Duration::ZERO).await;
+        drop(stream);
+        Err(SessionError::Fenced(reason))
     }
 
     fn claimed(

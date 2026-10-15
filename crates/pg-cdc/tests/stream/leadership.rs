@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use pg_cdc::config::DEFAULT_MAX_PARKED_EVENTS;
 use pg_cdc::health::{Health, Role};
+use pg_cdc::leader::lease::FenceReason;
 use pg_cdc::leader::record::TakeoverError;
 use pg_cdc::order::{OrderBy, OrderKeyId};
 use pg_cdc::session::{SessionConfig, SessionError};
@@ -14,7 +15,7 @@ use pg_cdc_decoder::Lsn;
 use pg_cdc_testkit::Postgres;
 use serde_json::Value;
 
-use crate::support::{self, LIMITS, Mode, RecordingStore, SLOT, TestResult, WAIT};
+use crate::support::{self, ControlProxy, LIMITS, Mode, RecordingStore, SLOT, TestResult, WAIT};
 
 const FAST: Duration = Duration::from_millis(200);
 const BUFFER: usize = 64;
@@ -517,4 +518,115 @@ async fn a_shutdown_during_the_fence_wait_leaves_the_record_untouched() -> TestR
     assert_eq!(leader(&shared).await?, before);
     pg.wait_for_slot(SLOT, WAIT, |state| !state.active).await?;
     Ok(())
+}
+
+const LEASE_BOUND: Duration = Duration::from_millis(6500);
+
+#[tokio::test]
+async fn l1_a_session_whose_control_connection_dies_fences_within_lease_timeout() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let shared = memory();
+    let mut session = support::spawn_in_context(
+        support::params(&pg),
+        support::config(FAST, BUFFER),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    let health = session.health();
+    pg.execute("INSERT INTO orders VALUES (1, 'a')").await?;
+    assert_eq!(session.next_event().await?["after"]["id"], 1);
+    assert_eq!(leader(&shared).await?.value.epoch, 1);
+
+    pg.execute(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE application_name = 'pg-cdc' AND backend_type = 'client backend'",
+    )
+    .await?;
+    let t_kill = Instant::now();
+    let result = session.finished(LEASE_BOUND).await?;
+
+    assert!(
+        matches!(result, Err(SessionError::Fenced(FenceReason::Expired))),
+        "{result:?}"
+    );
+    assert!(t_kill.elapsed() <= LEASE_BOUND, "{:?}", t_kill.elapsed());
+    pg.wait_for_slot(SLOT, Duration::from_secs(2), |state| !state.active)
+        .await?;
+    let record = leader(&shared).await?.value;
+    assert_eq!((record.epoch, record.state), (1, LeaderState::Active));
+    let snapshot = health.snapshot();
+    assert!(!snapshot.lease_valid, "{snapshot:?}");
+    assert_eq!(snapshot.role, Role::Standby);
+    Ok(())
+}
+
+#[tokio::test]
+async fn l1_a_session_stuck_in_a_catalog_lookup_fences_and_frees_the_slot() -> TestResult {
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &["CREATE TABLE stuck (id int PRIMARY KEY)"],
+        &["stuck"],
+    )
+    .await?;
+    let proxy = ControlProxy::start(&pg).await?;
+    let shared = memory();
+    let mut a = support::spawn_in_context(
+        support::params_via(&proxy, &pg),
+        support::config(FAST, BUFFER),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    pg.execute("INSERT INTO stuck VALUES (1)").await?;
+    assert_eq!(a.next_event().await?["after"]["id"], 1);
+    assert_eq!(leader(&shared).await?.value.epoch, 1);
+    let walsender = pg
+        .slot_state(SLOT)
+        .await?
+        .and_then(|state| state.active_pid)
+        .ok_or("the slot has no walsender")?;
+
+    let mut b = support::spawn_in_context(
+        support::params(&pg),
+        support::config(FAST, BUFFER),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-b"),
+    );
+    let health_b = b.health();
+    standby_ready(&health_b).await?;
+
+    proxy.freeze(0)?;
+    let t_freeze = Instant::now();
+    pg.execute("ALTER TABLE stuck ADD COLUMN note text").await?;
+    pg.execute("INSERT INTO stuck VALUES (2, 'two')").await?;
+
+    let (result, delivered_after_freeze) = a.finished_with_output(LEASE_BOUND).await?;
+    assert!(
+        matches!(result, Err(SessionError::Fenced(FenceReason::Expired))),
+        "{result:?}"
+    );
+    assert!(
+        t_freeze.elapsed() <= LEASE_BOUND,
+        "{:?}",
+        t_freeze.elapsed()
+    );
+    assert_eq!(delivered_after_freeze, 0);
+    pg.wait_for_slot(SLOT, Duration::from_secs(2), |state| {
+        state.active_pid != Some(walsender)
+    })
+    .await?;
+
+    active(&health_b, Duration::from_secs(2)).await?;
+    let budget = LEASE_BOUND + Duration::from_secs(2) + TWO_POLLS + Duration::from_secs(3);
+    let remaining = budget.saturating_sub(t_freeze.elapsed());
+    let event = tokio::time::timeout(remaining, b.next_event()).await??;
+    assert_eq!(event["after"]["id"], 2);
+    let record = leader(&shared).await?.value;
+    assert_eq!(record.epoch, 2);
+    assert_eq!(record.holder, "holder-b");
+    b.stop().await
 }

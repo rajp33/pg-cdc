@@ -25,10 +25,12 @@ use pg_cdc::state::{
 use pg_cdc_testkit::Postgres;
 use secrecy::SecretString;
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, DuplexStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -63,6 +65,14 @@ pub(crate) fn params(pg: &Postgres) -> ConnectParams {
             mode: TlsMode::Disable,
             ca_file: None,
         },
+    }
+}
+
+pub(crate) fn params_via(proxy: &ControlProxy, pg: &Postgres) -> ConnectParams {
+    ConnectParams {
+        host: "127.0.0.1".to_owned(),
+        port: proxy.port(),
+        ..params(pg)
     }
 }
 
@@ -589,4 +599,90 @@ pub(crate) fn commit_lsn(event: &Value) -> TestResult<u64> {
         .and_then(Value::as_str)
         .ok_or("missing commit_lsn")?;
     Ok(pg_cdc_testkit::parse_lsn(text)?)
+}
+
+type Registry = Arc<Mutex<Vec<watch::Sender<bool>>>>;
+
+#[derive(Debug)]
+pub(crate) struct ControlProxy {
+    port: u16,
+    connections: Registry,
+    _accepting: AbortOnDropHandle<()>,
+}
+
+impl ControlProxy {
+    pub(crate) async fn start(pg: &Postgres) -> TestResult<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let upstream = (pg.host().to_owned(), pg.port());
+        let connections = Registry::default();
+        let registry = Arc::clone(&connections);
+        let accepting = tokio::spawn(async move {
+            let mut forwarders = JoinSet::new();
+            while let Ok((client, _)) = listener.accept().await {
+                let (freeze, frozen) = watch::channel(false);
+                registry
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(freeze);
+                forwarders.spawn(forward(client, upstream.clone(), frozen));
+            }
+        });
+        Ok(Self {
+            port,
+            connections,
+            _accepting: AbortOnDropHandle::new(accepting),
+        })
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) fn freeze(&self, connection: usize) -> TestResult {
+        self.connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(connection)
+            .ok_or("the proxy has not accepted that connection")?
+            .send_replace(true);
+        Ok(())
+    }
+}
+
+async fn forward(client: TcpStream, upstream: (String, u16), frozen: watch::Receiver<bool>) {
+    let Ok(server) = TcpStream::connect(upstream).await else {
+        return;
+    };
+    let (client_read, client_write) = client.into_split();
+    let (server_read, server_write) = server.into_split();
+    tokio::select! {
+        () = pump(client_read, server_write, frozen.clone()) => {}
+        () = pump(server_read, client_write, frozen) => {}
+    }
+}
+
+async fn pump(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    mut frozen: watch::Receiver<bool>,
+) {
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        let Ok(read) = from.read(&mut buffer).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        if frozen.wait_for(|frozen| !*frozen).await.is_err() {
+            return;
+        }
+        let Some(chunk) = buffer.get(..read) else {
+            return;
+        };
+        if to.write_all(chunk).await.is_err() {
+            return;
+        }
+    }
 }
