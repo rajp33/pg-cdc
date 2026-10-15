@@ -1,8 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use pg_cdc_decoder::Lsn;
+use pg_cdc_replication::StatusClock;
+
+use crate::lane::Operator;
+use crate::state::StateStore;
 
 pub const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -82,6 +86,12 @@ impl ParkedGauges {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ParkedAccess {
+    pub operator: Operator,
+    pub store: Arc<dyn StateStore>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatusSnapshot {
     pub epoch: Option<u64>,
@@ -91,6 +101,7 @@ pub struct StatusSnapshot {
     pub parked: Option<ParkedSnapshot>,
     pub slot_retained_bytes: Option<u64>,
     pub tables_without_full_identity: u64,
+    pub status_update_age: Option<Duration>,
 }
 
 #[derive(Debug, Default)]
@@ -103,6 +114,8 @@ struct Board {
     parked: Mutex<Option<Arc<ParkedGauges>>>,
     slot_retained_bytes: Mutex<Option<u64>>,
     tables_without_full_identity: AtomicU64,
+    status_clock: Mutex<Option<StatusClock>>,
+    parked_access: Mutex<Option<ParkedAccess>>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -153,8 +166,24 @@ impl Status {
             .store(count, Ordering::Relaxed);
     }
 
+    pub fn set_status_clock(&self, clock: Option<StatusClock>) {
+        *locked(&self.board.status_clock) = clock;
+    }
+
+    pub fn set_parked_access(&self, access: Option<ParkedAccess>) {
+        *locked(&self.board.parked_access) = access;
+    }
+
+    pub fn parked_access(&self) -> Option<ParkedAccess> {
+        locked(&self.board.parked_access).clone()
+    }
+
     pub fn snapshot(&self) -> StatusSnapshot {
         let board = &self.board;
+        let clock = locked(&board.status_clock).clone();
+        let status_update_age = clock
+            .and_then(|clock| clock.last_sent())
+            .map(|sent| SystemTime::now().duration_since(sent).unwrap_or_default());
         let epoch = board.epoch.load(Ordering::Relaxed);
         let parked = locked(&board.parked)
             .as_ref()
@@ -172,13 +201,20 @@ impl Status {
             tables_without_full_identity: board
                 .tables_without_full_identity
                 .load(Ordering::Relaxed),
+            status_update_age,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::{Semaphore, mpsc};
+
     use super::*;
+    use crate::lane::{LaneSettings, Lanes, Stores};
+    use crate::sink::Sink;
+    use crate::sink::discard::DiscardSink;
+    use crate::state::memory::MemoryStateStore;
 
     #[test]
     fn parked_snapshots_sum_lanes_and_take_the_oldest_known_failure() {
@@ -315,5 +351,55 @@ mod tests {
         assert_eq!(clone.snapshot().tables_without_full_identity, 2);
         status.set_tables_without_full_identity(0);
         assert_eq!(clone.snapshot(), StatusSnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn status_update_age_comes_from_the_clock_and_access_round_trips() {
+        let status = Status::new();
+        assert_eq!(status.snapshot().status_update_age, None);
+
+        let clock = StatusClock::default();
+        status.set_status_clock(Some(clock.clone()));
+        assert_eq!(status.snapshot().status_update_age, None);
+        clock.record(SystemTime::now() - Duration::from_secs(3));
+        let age = status.snapshot().status_update_age.unwrap();
+        assert!(
+            age >= Duration::from_secs(3) && age < Duration::from_secs(4),
+            "{age:?}"
+        );
+        clock.record(SystemTime::now() + Duration::from_secs(60));
+        assert_eq!(status.snapshot().status_update_age, Some(Duration::ZERO));
+        status.set_status_clock(None);
+        assert_eq!(status.snapshot().status_update_age, None);
+
+        assert!(status.parked_access().is_none());
+        let state: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let stores = Stores {
+            state: Arc::clone(&state),
+            payload: None,
+        };
+        let sink: Arc<dyn Sink> = Arc::new(DiscardSink::new());
+        let (reports, _settled) = mpsc::unbounded_channel();
+        let lanes = Lanes::spawn(
+            LaneSettings {
+                lanes: 2,
+                park_after: Duration::from_secs(1),
+                max_parked_events: 10,
+                store_concurrency: 2,
+            },
+            &sink,
+            &stores,
+            &Arc::new(Semaphore::new(1)),
+            &reports,
+        );
+        let clone = status.clone();
+        status.set_parked_access(Some(ParkedAccess {
+            operator: lanes.operator(),
+            store: state,
+        }));
+        assert!(clone.parked_access().is_some());
+        status.set_parked_access(None);
+        assert!(clone.parked_access().is_none());
+        lanes.stop(Duration::from_secs(1)).await;
     }
 }
