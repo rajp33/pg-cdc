@@ -11,7 +11,9 @@ use tokio::time::{Instant, timeout};
 use super::evidence::{Observations, read_stored};
 use super::fleet::{Fleet, Seen, artifact_path};
 use super::operator::Operator;
-use super::{Action, ChaosOptions, ChaosReport, choose, outstanding, resolve_unresolved};
+use super::{
+    Action, ChaosOptions, ChaosReport, choose, missing_takeovers, outstanding, resolve_unresolved,
+};
 use crate::checker::{Evidence, check};
 use crate::proxy::{FaultProxy, Faults, Mode, Tap, Upstream};
 use crate::workload::{self, Ledger, WorkloadConfig};
@@ -28,6 +30,14 @@ const SKIPPED: &str = "Skipped";
 const STALL_CAP_FACTOR: u32 = 10;
 const CHAOS_OPERATOR_BUDGET: Duration = Duration::from_secs(5);
 const SETTLE_OPERATOR_BUDGET: Duration = Duration::from_secs(45);
+const OPENING_TIMEOUT: Duration = Duration::from_secs(60);
+const OPENING_RESTART: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy)]
+enum Opening {
+    Clean,
+    Crash,
+}
 
 #[derive(Debug, Default)]
 struct Windows {
@@ -206,6 +216,48 @@ impl Harness {
         Ok(self.postgres.client().await?)
     }
 
+    pub(super) async fn opening(
+        &mut self,
+        writer: &mut JoinHandle<anyhow::Result<Ledger>>,
+    ) -> anyhow::Result<()> {
+        self.opening_takeover(writer, Opening::Clean).await?;
+        self.opening_takeover(writer, Opening::Crash).await
+    }
+
+    async fn opening_takeover(
+        &mut self,
+        writer: &mut JoinHandle<anyhow::Result<Ledger>>,
+        opening: Opening,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + OPENING_TIMEOUT;
+        let before = self.fleet.takeovers();
+        let mut sent = false;
+        loop {
+            if writer.is_finished() {
+                anyhow::bail!("the workload ended early: {:?}", writer.await);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the opening {opening:?} takeover did not finish within {OPENING_TIMEOUT:?}"
+            );
+            tokio::time::sleep(TICK).await;
+            self.fleet.advance(true).await?;
+            let seen = self.fleet.poll().await;
+            if !sent {
+                sent = match opening {
+                    Opening::Clean => self.fleet.term_active(&seen).await?,
+                    Opening::Crash => self.fleet.kill_active(&seen, OPENING_RESTART).await?,
+                };
+            } else if self.fleet.takeovers() > before && !self.fleet.busy() {
+                *self
+                    .actions
+                    .entry(format!("Opening{opening:?}Takeover"))
+                    .or_default() += 1;
+                return Ok(());
+            }
+        }
+    }
+
     pub(super) async fn drive(
         &mut self,
         duration: Duration,
@@ -362,6 +414,8 @@ impl Harness {
         self.fleet.stop_all().await?;
         let stored = read_stored(&self.s3, BUCKET, &parked_prefix()).await?;
         let mut problems: Vec<String> = self.fleet.failures().to_vec();
+        let takeover_kinds = self.fleet.takeover_kinds();
+        problems.extend(missing_takeovers(&takeover_kinds));
         let unrecognized = self.observations.unrecognized_count();
         if unrecognized > 0 {
             problems.push(format!(
@@ -393,6 +447,7 @@ impl Harness {
             duration_s: options.duration.as_secs_f64(),
             actions: self.actions,
             takeovers: self.fleet.takeovers(),
+            takeover_kinds,
             redrives: self.operator.redrives,
             discards: u64::try_from(discards.len()).unwrap_or(u64::MAX),
             discards_refused: self.operator.refused + resolution.dropped,

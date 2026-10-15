@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::replace;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,6 +13,7 @@ const EXIT_POLL: Duration = Duration::from_millis(1);
 const POLL: Duration = Duration::from_millis(50);
 const ACTIVE_TIMEOUT: Duration = Duration::from_secs(60);
 const NAMES: [&str; 2] = ["a", "b"];
+const TAKEOVER: &str = "took over the slot";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen {
@@ -51,6 +52,26 @@ impl Epochs {
     }
 }
 
+pub fn takeover_kinds(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).ok()?;
+            let fields = value.get("fields")?;
+            if fields.get("message")?.as_str()? != TAKEOVER {
+                return None;
+            }
+            Some(fields.get("kind")?.as_str()?.to_owned())
+        })
+        .collect()
+}
+
+fn tally(kinds: &mut BTreeMap<String, u64>, process: &PgCdc) {
+    for kind in takeover_kinds(&process.log_lines()) {
+        *kinds.entry(kind).or_default() += 1;
+    }
+}
+
 pub fn artifact_path(base: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}-{suffix}", base.display()))
 }
@@ -75,6 +96,7 @@ struct Instance {
     name: &'static str,
     generation: u32,
     state: State,
+    kinds: BTreeMap<String, u64>,
 }
 
 async fn dump_logs(spawner: &Spawner, name: &str, generation: u32, process: &PgCdc) {
@@ -119,6 +141,7 @@ impl Instance {
                 };
                 failures.extend(failure);
                 dump_logs(spawner, self.name, self.generation, process).await;
+                tally(&mut self.kinds, process);
                 self.state = State::Down { restart_at: now };
             }
             State::Down { restart_at } => {
@@ -147,6 +170,7 @@ impl Instance {
         if let Some(mut process) = self.take_running(placeholder) {
             process.sigkill().await?;
             dump_logs(spawner, self.name, self.generation, &process).await;
+            tally(&mut self.kinds, &process);
         }
         Ok(())
     }
@@ -211,6 +235,7 @@ impl Fleet {
                     state: State::Down {
                         restart_at: Instant::now(),
                     },
+                    kinds: BTreeMap::new(),
                 })
                 .collect(),
             failures: Vec::new(),
@@ -361,6 +386,22 @@ impl Fleet {
         self.epochs.takeovers()
     }
 
+    pub fn takeover_kinds(&self) -> BTreeMap<String, u64> {
+        let mut kinds = BTreeMap::new();
+        for instance in &self.instances {
+            for (kind, count) in &instance.kinds {
+                *kinds.entry(kind.clone()).or_default() += count;
+            }
+            match &instance.state {
+                State::Running(process) | State::Terminating { process, .. } => {
+                    tally(&mut kinds, process);
+                }
+                State::Down { .. } => {}
+            }
+        }
+        kinds
+    }
+
     pub fn failures(&self) -> &[String] {
         &self.failures
     }
@@ -372,6 +413,8 @@ mod tests {
     use std::time::Duration;
 
     use tokio::time::Instant;
+
+    use std::collections::BTreeMap;
 
     use super::*;
     use crate::testing::Scratch;
@@ -505,6 +548,37 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("admin listening"), "{text}");
         assert!(Path::new(&scratch.path().join("run-b-1.log")).exists());
+    }
+
+    const TAKES_OVER: &str = "#!/bin/sh\necho '{\"fields\":{\"message\":\"admin listening\",\"addr\":\"127.0.0.1:9\"}}'\necho '{\"fields\":{\"message\":\"took over the slot\",\"epoch\":2,\"kind\":\"clean\",\"holder\":\"h\"}}'\ntrap 'exit 0' TERM\nwhile true; do sleep 0.1; done\n";
+
+    #[test]
+    fn takeover_kinds_are_read_from_the_log_lines() {
+        let lines = [
+            r#"{"fields":{"message":"admin listening","addr":"127.0.0.1:9"}}"#,
+            r#"{"level":"INFO","fields":{"message":"took over the slot","epoch":1,"kind":"first","holder":"h"}}"#,
+            "not json",
+            r#"{"fields":{"message":"took over the slot","epoch":3,"kind":"unclean","holder":"h"}}"#,
+            r#"{"fields":{"message":"took over the slot","epoch":4}}"#,
+        ]
+        .map(str::to_owned);
+        assert_eq!(takeover_kinds(&lines), ["first", "unclean"]);
+    }
+
+    #[tokio::test]
+    async fn takeover_kinds_add_up_over_every_process_generation() {
+        let scratch = Scratch::new();
+        let mut fleet = fleet(&scratch, TAKES_OVER);
+        fleet.spawn_all().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let roles = [Some(seen("active", Some(2))), Some(seen("standby", None))];
+        assert!(fleet.kill_active(&roles, Duration::ZERO).await.unwrap());
+        settled(&mut fleet).await;
+        fleet.stop_all().await.unwrap();
+        assert_eq!(
+            fleet.takeover_kinds(),
+            BTreeMap::from([("clean".to_owned(), 3)])
+        );
     }
 
     #[test]

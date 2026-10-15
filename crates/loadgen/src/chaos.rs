@@ -55,6 +55,7 @@ pub struct ChaosReport {
     pub duration_s: f64,
     pub actions: BTreeMap<String, u64>,
     pub takeovers: u64,
+    pub takeover_kinds: BTreeMap<String, u64>,
     pub redrives: u64,
     pub discards: u64,
     pub discards_refused: u64,
@@ -123,10 +124,21 @@ pub fn resolve_unresolved(
     resolution
 }
 
+pub fn missing_takeovers(kinds: &BTreeMap<String, u64>) -> Vec<String> {
+    [
+        ("clean", "the run saw no clean takeover"),
+        ("unclean", "the run saw no crash (unclean) takeover"),
+    ]
+    .into_iter()
+    .filter(|(kind, _)| kinds.get(*kind).copied().unwrap_or(0) == 0)
+    .map(|(_, problem)| problem.to_owned())
+    .collect()
+}
+
 fn summary(report: &ChaosReport) -> String {
     let verdict = &report.verdict;
     format!(
-        "chaos seed={} duration={}s verdict={} committed={} delivered={} duplicates={} stored={} discarded={} takeovers={} redrives={} discards={} missing={} phantoms={} out_of_order={}",
+        "chaos seed={} duration={}s verdict={} committed={} delivered={} duplicates={} stored={} discarded={} takeovers={} clean={} unclean={} redrives={} discards={} missing={} phantoms={} out_of_order={}",
         report.seed,
         report.duration_s,
         if verdict.passed() { "pass" } else { "fail" },
@@ -136,6 +148,8 @@ fn summary(report: &ChaosReport) -> String {
         verdict.stored,
         verdict.discarded,
         report.takeovers,
+        report.takeover_kinds.get("clean").copied().unwrap_or(0),
+        report.takeover_kinds.get("unclean").copied().unwrap_or(0),
         report.redrives,
         report.discards,
         verdict.missing.len(),
@@ -162,6 +176,10 @@ pub async fn run(options: &ChaosOptions) -> anyhow::Result<ChaosReport> {
         let stop = stop.clone();
         async move { workload::write(&client, &config, stop).await }
     });
+    if let Err(error) = harness.opening(&mut writer).await {
+        stop.cancel();
+        return Err(error);
+    }
     if let Err(error) = harness.drive(options.duration, &mut writer).await {
         stop.cancel();
         return Err(error);
@@ -226,6 +244,29 @@ mod tests {
 
     fn delivered(seq: i64) -> Observed {
         Observed::Delivered(Delivery { seq, key: 1 })
+    }
+
+    #[test]
+    fn a_run_needs_both_a_clean_and_a_crash_takeover() {
+        let kinds = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
+            pairs
+                .iter()
+                .map(|(kind, count)| ((*kind).to_owned(), *count))
+                .collect()
+        };
+        assert_eq!(
+            missing_takeovers(&kinds(&[("first", 1), ("clean", 1), ("unclean", 4)])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            missing_takeovers(&kinds(&[("first", 1), ("unclean", 19)])),
+            ["the run saw no clean takeover"]
+        );
+        assert_eq!(
+            missing_takeovers(&kinds(&[("first", 1), ("clean", 2)])),
+            ["the run saw no crash (unclean) takeover"]
+        );
+        assert_eq!(missing_takeovers(&kinds(&[])).len(), 2);
     }
 
     #[test]
