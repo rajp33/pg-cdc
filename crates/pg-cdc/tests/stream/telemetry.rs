@@ -146,6 +146,36 @@ async fn delivering(session: &support::Running) -> TestResult {
     Ok(())
 }
 
+fn measured_from_commit(latencies: &[Duration]) -> bool {
+    let Some((backlogged, fresh)) = latencies.split_first() else {
+        return false;
+    };
+    let slowest_fresh = fresh.iter().max().copied().unwrap_or_default();
+    // The commit timestamp comes from the Docker VM's clock, which can drift minutes from the host's after a sleep; only differences between latencies are free of that skew.
+    backlogged.saturating_sub(slowest_fresh) >= BACKLOG / 2
+}
+
+#[test]
+fn commit_latency_is_told_from_receipt_latency_whatever_the_clock_skew() {
+    let ms = Duration::from_millis;
+    let skewed = |behind: Duration, ahead: Duration| -> Vec<Duration> {
+        [ms(3_400), ms(40), ms(35), ms(60), ms(30)]
+            .iter()
+            .map(|elapsed| (*elapsed + behind).saturating_sub(ahead))
+            .collect()
+    };
+    assert!(measured_from_commit(&skewed(
+        Duration::ZERO,
+        Duration::ZERO
+    )));
+    assert!(measured_from_commit(&skewed(ms(181_000), Duration::ZERO)));
+    assert!(measured_from_commit(&skewed(Duration::ZERO, ms(500))));
+    let from_receipt = |behind: Duration| vec![ms(50) + behind, ms(40) + behind, ms(45) + behind];
+    assert!(!measured_from_commit(&from_receipt(Duration::ZERO)));
+    assert!(!measured_from_commit(&from_receipt(ms(181_000))));
+    assert!(!measured_from_commit(&[]));
+}
+
 #[tokio::test]
 async fn a_session_records_what_it_receives_its_commit_latency_fallbacks_and_its_takeover()
 -> TestResult {
@@ -201,15 +231,8 @@ async fn a_session_records_what_it_receives_its_commit_latency_fallbacks_and_its
             _ => None,
         })
         .collect();
-    let Some((backlogged, fresh)) = latencies.split_first() else {
-        panic!("no commit latency recorded: {seen:?}");
-    };
-    assert!(*backlogged >= BACKLOG, "{latencies:?}");
-    assert_eq!(fresh.len(), 4, "{seen:?}");
-    assert!(
-        fresh.iter().all(|elapsed| *elapsed < BACKLOG),
-        "{latencies:?}"
-    );
+    assert_eq!(latencies.len(), 5, "{seen:?}");
+    assert!(measured_from_commit(&latencies), "{latencies:?}");
     let fallbacks: Vec<&Seen> = seen
         .iter()
         .filter(|entry| matches!(entry, Seen::DecodeFallback(_)))
