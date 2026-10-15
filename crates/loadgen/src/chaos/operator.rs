@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
-use crate::chaos::Unresolved;
+use crate::chaos::evidence::Observations;
 use crate::checker::change_from_envelope;
 use crate::cluster::{ParkedOutput, PgCdc};
 
@@ -28,8 +28,8 @@ pub struct Operator {
     next_token: u64,
     pub redrives: u64,
     pub refused: u64,
-    pub discards: BTreeSet<u64>,
-    pub unresolved: Vec<Unresolved>,
+    pub answered: BTreeSet<u64>,
+    pub unresolved: BTreeSet<u64>,
 }
 
 pub fn classify_discard(output: &ParkedOutput) -> DiscardOutcome {
@@ -89,12 +89,12 @@ impl Operator {
             next_token: 1,
             redrives: 0,
             refused: 0,
-            discards: BTreeSet::new(),
-            unresolved: Vec::new(),
+            answered: BTreeSet::new(),
+            unresolved: BTreeSet::new(),
         }
     }
 
-    pub async fn pass(&mut self, active: &PgCdc, record_marker: impl Fn(u64, i32, i64)) {
+    pub async fn pass(&mut self, active: &PgCdc, observations: &Observations) {
         let Ok(listing) = active
             .parked_output(&self.binary, &["list", "--status", "dead"])
             .await
@@ -106,7 +106,7 @@ impl Operator {
         }
         for key in dead_queues(&listing.stdout) {
             if self.redriven.contains(&key) {
-                self.discard_head(active, &key, &record_marker).await;
+                self.discard_head(active, &key, observations).await;
             } else {
                 self.redrive(active, &key).await;
             }
@@ -121,12 +121,7 @@ impl Operator {
         }
     }
 
-    async fn discard_head(
-        &mut self,
-        active: &PgCdc,
-        key: &str,
-        record_marker: &impl Fn(u64, i32, i64),
-    ) {
+    async fn discard_head(&mut self, active: &PgCdc, key: &str, observations: &Observations) {
         let Ok(shown) = active
             .parked_output(&self.binary, &["show", key, "--limit", "1"])
             .await
@@ -141,12 +136,8 @@ impl Operator {
         };
         let token = self.next_token;
         self.next_token += 1;
-        record_marker(token, head.key, head.seq);
-        let entry = Unresolved {
-            token,
-            seq: head.seq,
-        };
-        self.unresolved.push(entry);
+        observations.expect_discard(token, &head.id, head.key, head.seq);
+        self.unresolved.insert(token);
         let discarded = active
             .parked_output(&self.binary, &["discard", key, "--id", &head.id])
             .await;
@@ -155,11 +146,12 @@ impl Operator {
             .map_or(DiscardOutcome::Unresolved, classify_discard)
         {
             DiscardOutcome::Discarded => {
-                self.unresolved.pop();
-                self.discards.insert(token);
+                self.unresolved.remove(&token);
+                self.answered.insert(token);
             }
             DiscardOutcome::Refused => {
-                self.unresolved.pop();
+                self.unresolved.remove(&token);
+                observations.abandon_discard(&head.id);
                 self.refused += 1;
             }
             DiscardOutcome::Unresolved => {}
@@ -169,11 +161,11 @@ impl Operator {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
     use std::path::Path;
     use std::time::Duration;
 
     use super::*;
+    use crate::checker::Observed;
     use crate::testing::Scratch;
 
     fn output(code: i32, stderr: &str) -> ParkedOutput {
@@ -302,86 +294,102 @@ mod tests {
         }
     }
 
-    fn recorder(log: &Path) -> impl Fn(u64, i32, i64) {
-        let log = log.to_owned();
-        move |token: u64, key: i32, seq: i64| {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log)
-                .unwrap();
-            writeln!(file, "marker {token} {key} {seq}").unwrap();
+    const PARKED: &str = "KEY1/EVT1.json";
+
+    fn marker(token: u64) -> Observed {
+        Observed::DiscardMarker {
+            token,
+            key: 7,
+            seq: 42,
         }
     }
 
     #[tokio::test]
-    async fn a_dead_queue_is_redriven_once_then_discarded_after_its_marker() {
+    async fn a_dead_queue_is_redriven_once_then_discarded_and_marked_only_at_its_removal() {
         let cli = Cli::standard("exit 0");
         let process = cli.process().await;
+        let observations = Observations::default();
         let mut operator = Operator::new(cli.binary.clone());
-        operator.pass(&process, recorder(&cli.log)).await;
+        operator.pass(&process, &observations).await;
         assert_eq!(cli.calls(), ["list --status dead", "redrive KEY1"]);
         assert_eq!(operator.redrives, 1);
-        assert_eq!(operator.discards, BTreeSet::new());
+        assert_eq!(operator.answered, BTreeSet::new());
 
-        operator.pass(&process, recorder(&cli.log)).await;
+        operator.pass(&process, &observations).await;
         assert_eq!(
             cli.calls()[2..],
             [
                 "list --status dead",
                 "show KEY1 --limit 1",
-                "marker 1 7 42",
                 "discard KEY1 --id EVT1",
             ]
         );
         assert_eq!(operator.redrives, 1);
-        assert_eq!(operator.discards, BTreeSet::from([1]));
+        assert_eq!(operator.answered, BTreeSet::from([1]));
         assert_eq!(operator.refused, 0);
-        assert_eq!(operator.unresolved, []);
+        assert_eq!(operator.unresolved, BTreeSet::new());
+        assert_eq!(observations.snapshot(), []);
+        assert_eq!(observations.discard_tokens(), BTreeSet::new());
 
-        operator.pass(&process, recorder(&cli.log)).await;
-        assert_eq!(operator.discards, BTreeSet::from([1, 2]));
+        observations.record_removal(PARKED);
+        assert_eq!(observations.snapshot(), [marker(1)]);
+        assert_eq!(observations.discard_tokens(), BTreeSet::from([1]));
+
+        operator.pass(&process, &observations).await;
+        assert_eq!(operator.answered, BTreeSet::from([1, 2]));
     }
 
     #[tokio::test]
-    async fn a_refused_discard_leaves_its_token_out() {
+    async fn a_refused_discard_leaves_no_marker_even_if_the_event_is_removed_later() {
         let cli = Cli::standard("echo 'pg-cdc: 409 Conflict: the head moved' >&2; exit 1");
         let process = cli.process().await;
+        let observations = Observations::default();
         let mut operator = Operator::new(cli.binary.clone());
-        operator.pass(&process, recorder(&cli.log)).await;
-        operator.pass(&process, recorder(&cli.log)).await;
-        assert_eq!(operator.discards, BTreeSet::new());
+        operator.pass(&process, &observations).await;
+        operator.pass(&process, &observations).await;
+        assert_eq!(operator.answered, BTreeSet::new());
         assert_eq!(operator.refused, 1);
-        assert_eq!(operator.unresolved, []);
-        assert!(cli.calls().contains(&"marker 1 7 42".to_owned()));
+        assert_eq!(operator.unresolved, BTreeSet::new());
+        observations.record_removal(PARKED);
+        assert_eq!(observations.snapshot(), []);
+        assert_eq!(observations.discard_tokens(), BTreeSet::new());
     }
 
     #[tokio::test]
-    async fn a_discard_without_an_answer_is_unresolved() {
+    async fn a_discard_without_an_answer_is_unresolved_until_its_removal_is_seen() {
         let cli = Cli::standard("echo 'pg-cdc: 504 Gateway Timeout: no answer' >&2; exit 1");
         let process = cli.process().await;
+        let observations = Observations::default();
         let mut operator = Operator::new(cli.binary.clone());
-        operator.pass(&process, recorder(&cli.log)).await;
-        operator.pass(&process, recorder(&cli.log)).await;
-        assert_eq!(operator.discards, BTreeSet::new());
+        operator.pass(&process, &observations).await;
+        operator.pass(&process, &observations).await;
+        assert_eq!(operator.answered, BTreeSet::new());
         assert_eq!(operator.refused, 0);
-        assert_eq!(operator.unresolved, [Unresolved { token: 1, seq: 42 }]);
+        assert_eq!(operator.unresolved, BTreeSet::from([1]));
+        assert_eq!(observations.discard_tokens(), BTreeSet::new());
+        observations.record_removal(PARKED);
+        assert_eq!(observations.snapshot(), [marker(1)]);
+        assert_eq!(observations.discard_tokens(), BTreeSet::from([1]));
     }
 
     #[tokio::test]
-    async fn a_pass_cut_short_inside_a_discard_leaves_its_token_unresolved() {
+    async fn a_pass_cut_short_inside_a_discard_still_awaits_its_removal() {
         let cli = Cli::standard("sleep 30");
         let process = cli.process().await;
+        let observations = Observations::default();
         let mut operator = Operator::new(cli.binary.clone());
-        operator.pass(&process, recorder(&cli.log)).await;
+        operator.pass(&process, &observations).await;
         let cut = tokio::time::timeout(
             Duration::from_millis(800),
-            operator.pass(&process, recorder(&cli.log)),
+            operator.pass(&process, &observations),
         )
         .await;
         assert!(cut.is_err());
-        assert_eq!(operator.discards, BTreeSet::new());
-        assert_eq!(operator.unresolved, [Unresolved { token: 1, seq: 42 }]);
+        assert_eq!(operator.answered, BTreeSet::new());
+        assert_eq!(operator.unresolved, BTreeSet::from([1]));
+        assert_eq!(observations.snapshot(), []);
+        observations.record_removal(PARKED);
+        assert_eq!(observations.snapshot(), [marker(1)]);
     }
 
     #[tokio::test]
@@ -392,8 +400,9 @@ mod tests {
             "exit 0",
         );
         let process = cli.process().await;
+        let observations = Observations::default();
         let mut operator = Operator::new(cli.binary.clone());
-        operator.pass(&process, recorder(&cli.log)).await;
+        operator.pass(&process, &observations).await;
         assert_eq!(cli.calls(), ["list --status dead"]);
         assert_eq!(operator.redrives, 0);
     }
@@ -403,15 +412,14 @@ mod tests {
         let retrying = SHOW.replace("\"dead\"", "\"retrying\"");
         let cli = Cli::new(&format!("echo '{LIST}'"), &retrying, "exit 0");
         let process = cli.process().await;
+        let observations = Observations::default();
         let mut operator = Operator::new(cli.binary.clone());
-        operator.pass(&process, recorder(&cli.log)).await;
-        operator.pass(&process, recorder(&cli.log)).await;
+        operator.pass(&process, &observations).await;
+        operator.pass(&process, &observations).await;
         let calls = cli.calls();
         assert!(calls.iter().any(|call| call.starts_with("show")));
-        assert!(
-            !calls
-                .iter()
-                .any(|call| call.starts_with("marker") || call.starts_with("discard"))
-        );
+        assert!(!calls.iter().any(|call| call.starts_with("discard")));
+        observations.record_removal(PARKED);
+        assert_eq!(observations.snapshot(), []);
     }
 }

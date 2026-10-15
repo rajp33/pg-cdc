@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,8 +13,8 @@ use super::evidence::{Observations, message_groups, read_stored};
 use super::fleet::{Fleet, Seen, artifact_path};
 use super::operator::Operator;
 use super::{
-    Action, ChaosOptions, ChaosReport, choose, missing_takeovers, outstanding, resolve_unresolved,
-    settle_over,
+    Action, ChaosOptions, ChaosReport, choose, missing_takeovers, outstanding, settle_over,
+    tally_discards,
 };
 use crate::checker::{Evidence, check};
 use crate::proxy::{FaultProxy, Faults, Mode, Tap, Upstream};
@@ -177,6 +177,10 @@ impl Harness {
         .await?;
         let s3_proxy =
             FaultProxy::start(upstream, Upstream::S3, options.seed.wrapping_add(2)).await?;
+        s3_proxy.on_parked_removed({
+            let observations = Arc::clone(&observations);
+            move |parked| observations.record_removal(parked)
+        });
 
         let artifacts = options.report.with_extension("");
         let config = artifact_path(&artifacts, "config.yaml");
@@ -369,13 +373,7 @@ impl Harness {
         let Some(active) = self.fleet.active(seen) else {
             return;
         };
-        let observations = &self.observations;
-        let pass = self
-            .operator
-            .pass(active, |token: u64, key: i32, seq: i64| {
-                observations.record_marker(token, key, seq);
-            });
-        let _ = timeout(budget, pass).await;
+        let _ = timeout(budget, self.operator.pass(active, &self.observations)).await;
     }
 
     pub(super) async fn settle(&mut self, ledger: &Ledger, limit: Duration) -> anyhow::Result<()> {
@@ -392,7 +390,7 @@ impl Harness {
             let pending = outstanding(
                 &ledger.committed,
                 &self.observations.snapshot(),
-                &self.operator.discards,
+                &self.observations.discard_tokens(),
             );
             if settle_over(pending, started.elapsed(), limit) {
                 if pending > 0 {
@@ -434,16 +432,18 @@ impl Harness {
             ));
         }
         let observed = self.observations.snapshot();
-        let stored_seqs: HashSet<i64> = stored.iter().copied().collect();
-        let resolution = resolve_unresolved(&self.operator.unresolved, &stored_seqs, &observed);
-        let mut discards: BTreeSet<u64> = self.operator.discards.clone();
-        discards.extend(&resolution.joined);
+        let discards = self.observations.discard_tokens();
+        let tally = tally_discards(
+            &self.operator.answered,
+            &self.operator.unresolved,
+            &discards,
+        );
         let verdict = check(&Evidence {
             committed: ledger.committed,
             uncertain: ledger.uncertain,
             observed,
             stored,
-            discards: discards.clone(),
+            discards,
             retained_from,
         });
         let report = ChaosReport {
@@ -453,9 +453,10 @@ impl Harness {
             takeovers: self.fleet.takeovers(),
             takeover_kinds,
             redrives: self.operator.redrives,
-            discards: u64::try_from(discards.len()).unwrap_or(u64::MAX),
-            discards_refused: self.operator.refused + resolution.dropped,
-            discards_resolved_late: u64::try_from(resolution.joined.len()).unwrap_or(u64::MAX),
+            discards: tally.confirmed,
+            discards_refused: self.operator.refused,
+            discards_resolved_late: tally.resolved_late,
+            discards_inconclusive: tally.inconclusive,
             proxy: [self.sns_proxy.counts(), self.s3_proxy.counts()],
             ledger_transactions: ledger.transactions,
             verdict,

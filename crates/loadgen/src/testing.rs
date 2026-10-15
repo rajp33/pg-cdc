@@ -39,3 +39,49 @@ impl Drop for Scratch {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+pub(crate) async fn answering_upstream() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(|_request| async {
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(hyper::StatusCode::NO_CONTENT)
+                            .body(http_body_util::Full::new(bytes::Bytes::new()))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+pub(crate) async fn send(endpoint: &str, method: hyper::Method, path: &str) -> u16 {
+    let address = endpoint.trim_start_matches("http://").to_owned();
+    let stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .unwrap();
+    tokio::spawn(connection);
+    let request = hyper::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", address)
+        .body(http_body_util::Full::new(bytes::Bytes::new()))
+        .unwrap();
+    sender
+        .send_request(request)
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}

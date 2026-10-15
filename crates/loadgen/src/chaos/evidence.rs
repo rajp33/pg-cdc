@@ -10,9 +10,23 @@ use crate::checker::{Observed, change_from_envelope, observed_from_message};
 pub const SAMPLE_LIMIT: usize = 5;
 pub const SAMPLE_BYTES: usize = 200;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pending {
+    token: u64,
+    key: i32,
+    seq: i64,
+}
+
+#[derive(Debug, Default)]
+struct Discards {
+    pending: HashMap<String, Pending>,
+    removed: HashMap<String, u64>,
+}
+
 #[derive(Debug, Default)]
 pub struct Observations {
     observed: Mutex<Vec<Observed>>,
+    discards: Mutex<Discards>,
     samples: Mutex<Vec<String>>,
     unrecognized: AtomicU64,
     groups: Mutex<HashMap<i32, String>>,
@@ -207,11 +221,49 @@ impl Observations {
             .clone()
     }
 
-    pub fn record_marker(&self, token: u64, key: i32, seq: i64) {
+    pub fn expect_discard(&self, token: u64, id: &str, key: i32, seq: i64) {
+        let mut discards = self.discards.lock().unwrap_or_else(PoisonError::into_inner);
+        if !discards.removed.contains_key(id) {
+            discards
+                .pending
+                .insert(id.to_owned(), Pending { token, key, seq });
+        }
+    }
+
+    pub fn abandon_discard(&self, id: &str) {
+        self.discards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .remove(id);
+    }
+
+    pub fn record_removal(&self, parked: &str) {
+        let Some(id) = parked
+            .split_once('/')
+            .and_then(|(_, file)| file.strip_suffix(".json"))
+        else {
+            return;
+        };
+        let mut discards = self.discards.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(Pending { token, key, seq }) = discards.pending.remove(id) else {
+            return;
+        };
+        discards.removed.insert(id.to_owned(), token);
         self.observed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(Observed::DiscardMarker { token, key, seq });
+    }
+
+    pub fn discard_tokens(&self) -> BTreeSet<u64> {
+        self.discards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .removed
+            .values()
+            .copied()
+            .collect()
     }
 
     pub fn snapshot(&self) -> Vec<Observed> {
@@ -275,7 +327,15 @@ pub async fn read_stored(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checker::{Delivery, EventId};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use hyper::Method;
+
+    use crate::checker::{Delivery, EventId, Evidence, OrderViolation, Verdict, check};
+    use crate::proxy::{FaultProxy, Faults, Mode, Upstream};
+    use crate::testing::{answering_upstream, send};
+    use crate::workload::Change;
 
     fn delivery(seq: i64, key: i32) -> Observed {
         Observed::Delivered(Delivery {
@@ -462,7 +522,8 @@ mod tests {
             batch.as_bytes(),
             batch_response(&["a", "b"], &["c"]).as_bytes(),
         );
-        observations.record_marker(5, 7, 2);
+        observations.expect_discard(5, ID2, 7, 2);
+        observations.record_removal(&format!("{KEY}/{ID2}.json"));
         observations.record_publish(
             format!("Action=Publish&Message={}", envelope(7, 3)).as_bytes(),
             OK,
@@ -482,6 +543,91 @@ mod tests {
         );
         assert_eq!(observations.unrecognized_count(), 0);
         assert_eq!(observations.misgrouped_count(), 0);
+    }
+
+    const KEY: &str = "0000000000000000000000000000000a";
+    const ID1: &str = "0000000000000001-00000000";
+    const ID2: &str = "0000000000000002-00000000";
+
+    async fn discard_then_publish(stall: Duration, publish_after: Duration) -> Verdict {
+        let observations = Arc::new(Observations::default());
+        let proxy = FaultProxy::start(answering_upstream().await, Upstream::S3, 1)
+            .await
+            .unwrap();
+        proxy.on_parked_removed({
+            let observations = Arc::clone(&observations);
+            move |parked| observations.record_removal(parked)
+        });
+        proxy.set(Faults {
+            mode: Mode::Brownout(stall),
+            ..Faults::HEALTHY
+        });
+        observations.expect_discard(1, ID1, 7, 1);
+        let endpoint = proxy.endpoint();
+        let removal = tokio::spawn(async move {
+            send(
+                &endpoint,
+                Method::DELETE,
+                &format!("/chaos-state/chaos/chaos/parked/{KEY}/{ID1}.json"),
+            )
+            .await
+        });
+        tokio::time::sleep(publish_after).await;
+        observations.record_publish(
+            format!("Action=Publish&Message={}", envelope(7, 2)).as_bytes(),
+            OK,
+        );
+        assert_eq!(removal.await.unwrap(), 204);
+        check(&Evidence {
+            committed: vec![Change { seq: 1, key: 7 }, Change { seq: 2, key: 7 }],
+            observed: observations.snapshot(),
+            discards: observations.discard_tokens(),
+            ..Evidence::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_successor_published_before_its_predecessors_discard_took_effect_breaks_order() {
+        let early =
+            discard_then_publish(Duration::from_millis(400), Duration::from_millis(50)).await;
+        assert_eq!(
+            early.out_of_order,
+            vec![OrderViolation {
+                key: 7,
+                seq: 2,
+                missing_before: 1
+            }]
+        );
+        assert_eq!(early.discarded, 1);
+
+        let after = discard_then_publish(Duration::ZERO, Duration::from_millis(200)).await;
+        assert!(after.passed(), "{after:?}");
+        assert_eq!(after.discarded, 1);
+    }
+
+    #[test]
+    fn only_the_removal_of_an_event_awaiting_its_discard_places_a_marker() {
+        let observations = Observations::default();
+        observations.record_removal(&format!("{KEY}/{ID1}.json"));
+        observations.expect_discard(3, ID1, 7, 1);
+        observations.expect_discard(4, ID1, 7, 1);
+        observations.record_removal("garbage");
+        observations.record_removal(&format!("{KEY}/{ID2}.json"));
+        assert_eq!(observations.snapshot(), []);
+
+        observations.record_removal(&format!("{KEY}/{ID1}.json"));
+        observations.record_removal(&format!("{KEY}/{ID1}.json"));
+        observations.expect_discard(5, ID1, 7, 1);
+        observations.record_removal(&format!("{KEY}/{ID1}.json"));
+        assert_eq!(
+            observations.snapshot(),
+            [Observed::DiscardMarker {
+                token: 4,
+                key: 7,
+                seq: 1
+            }]
+        );
+        assert_eq!(observations.discard_tokens(), BTreeSet::from([4]));
     }
 
     #[test]

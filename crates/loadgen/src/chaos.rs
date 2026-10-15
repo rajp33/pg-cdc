@@ -37,16 +37,11 @@ pub enum Action {
     Nothing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Unresolved {
-    pub token: u64,
-    pub seq: i64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Resolution {
-    pub joined: BTreeSet<u64>,
-    pub dropped: u64,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscardTally {
+    pub confirmed: u64,
+    pub resolved_late: u64,
+    pub inconclusive: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +55,7 @@ pub struct ChaosReport {
     pub discards: u64,
     pub discards_refused: u64,
     pub discards_resolved_late: u64,
+    pub discards_inconclusive: u64,
     pub proxy: [ProxyCounts; 2],
     pub ledger_transactions: u64,
     pub verdict: Verdict,
@@ -105,27 +101,22 @@ pub fn settle_over(pending: usize, elapsed: Duration, limit: Duration) -> bool {
     pending == 0 || elapsed >= limit
 }
 
-pub fn resolve_unresolved(
-    unresolved: &[Unresolved],
-    stored: &HashSet<i64, impl std::hash::BuildHasher>,
-    observed: &[Observed],
-) -> Resolution {
-    let delivered: HashSet<i64> = observed
-        .iter()
-        .filter_map(|observed| match observed {
-            Observed::Delivered(delivery) => Some(delivery.seq),
-            Observed::DiscardMarker { .. } => None,
-        })
-        .collect();
-    let mut resolution = Resolution::default();
-    for entry in unresolved {
-        if stored.contains(&entry.seq) || delivered.contains(&entry.seq) {
-            resolution.dropped += 1;
-        } else {
-            resolution.joined.insert(entry.token);
-        }
+pub fn tally_discards(
+    answered: &BTreeSet<u64>,
+    unresolved: &BTreeSet<u64>,
+    confirmed: &BTreeSet<u64>,
+) -> DiscardTally {
+    let count = |tokens: usize| u64::try_from(tokens).unwrap_or(u64::MAX);
+    DiscardTally {
+        confirmed: count(confirmed.len()),
+        resolved_late: count(unresolved.intersection(confirmed).count()),
+        inconclusive: count(
+            answered
+                .union(unresolved)
+                .filter(|token| !confirmed.contains(token))
+                .count(),
+        ),
     }
-    resolution
 }
 
 pub fn missing_takeovers(kinds: &BTreeMap<String, u64>) -> Vec<String> {
@@ -142,7 +133,7 @@ pub fn missing_takeovers(kinds: &BTreeMap<String, u64>) -> Vec<String> {
 fn summary(report: &ChaosReport) -> String {
     let verdict = &report.verdict;
     format!(
-        "chaos seed={} duration={}s verdict={} committed={} delivered={} duplicates={} stored={} retained={} discarded={} takeovers={} clean={} unclean={} redrives={} discards={} missing={} phantoms={} out_of_order={} id_violations={}",
+        "chaos seed={} duration={}s verdict={} committed={} delivered={} duplicates={} stored={} retained={} discarded={} takeovers={} clean={} unclean={} redrives={} discards={} inconclusive={} missing={} phantoms={} out_of_order={} id_violations={}",
         report.seed,
         report.duration_s,
         if verdict.passed() { "pass" } else { "fail" },
@@ -157,6 +148,7 @@ fn summary(report: &ChaosReport) -> String {
         report.takeover_kinds.get("unclean").copied().unwrap_or(0),
         report.redrives,
         report.discards,
+        report.discards_inconclusive,
         verdict.missing.len(),
         verdict.phantoms.len(),
         verdict.out_of_order.len(),
@@ -289,27 +281,53 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_discards_count_only_when_the_event_is_gone() {
-        let unresolved = [
-            Unresolved { token: 1, seq: 10 },
-            Unresolved { token: 2, seq: 20 },
-            Unresolved { token: 3, seq: 30 },
-            Unresolved { token: 4, seq: 40 },
-        ];
-        let stored: HashSet<i64> = HashSet::from([20]);
-        let observed = [
-            delivered(30),
+    fn an_unanswered_discard_of_an_event_that_vanished_unseen_fails_the_run() {
+        let observations = evidence::Observations::default();
+        observations.expect_discard(1, "e1", 1, 1);
+        let committed = vec![Change { seq: 1, key: 1 }, Change { seq: 2, key: 1 }];
+        let observed = vec![
             Observed::DiscardMarker {
                 token: 1,
                 key: 1,
-                seq: 10,
+                seq: 1,
             },
+            delivered(2),
         ];
-        let resolution = resolve_unresolved(&unresolved, &stored, &observed);
-        assert_eq!(resolution.joined, BTreeSet::from([1, 4]));
-        assert_eq!(resolution.dropped, 2);
+        let confirmed = observations.discard_tokens();
+        let verdict = crate::checker::check(&crate::checker::Evidence {
+            committed,
+            observed,
+            discards: confirmed.clone(),
+            ..crate::checker::Evidence::default()
+        });
+        assert_eq!(verdict.missing, vec![1]);
+        assert!(!verdict.passed());
+        assert_eq!(
+            tally_discards(&BTreeSet::new(), &BTreeSet::from([1]), &confirmed),
+            DiscardTally {
+                confirmed: 0,
+                resolved_late: 0,
+                inconclusive: 1
+            }
+        );
+    }
 
-        let nothing = resolve_unresolved(&[], &stored, &observed);
-        assert_eq!(nothing, Resolution::default());
+    #[test]
+    fn only_discards_whose_removal_was_seen_are_confirmed() {
+        let answered = BTreeSet::from([1, 2]);
+        let unresolved = BTreeSet::from([3, 4]);
+        let confirmed = BTreeSet::from([1, 3]);
+        assert_eq!(
+            tally_discards(&answered, &unresolved, &confirmed),
+            DiscardTally {
+                confirmed: 2,
+                resolved_late: 1,
+                inconclusive: 2
+            }
+        );
+        assert_eq!(
+            tally_discards(&BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new()),
+            DiscardTally::default()
+        );
     }
 }
