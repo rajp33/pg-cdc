@@ -350,6 +350,9 @@ async fn scan(
         let listed = store
             .list_parked_queues(cursor.as_ref(), chunk, PARKED_LENGTH_CAP)
             .await?;
+        if listed.is_empty() {
+            return Ok(Page { queues, next: None });
+        }
         let heads = read_heads(store, &listed).await?;
         for (queue, head) in listed.iter().zip(heads) {
             let Some(head) = head else { continue };
@@ -358,7 +361,7 @@ async fn scan(
             }
             queues.push(QueueBody {
                 order_key: queue.order_key.to_string(),
-                head: queue.head.to_string(),
+                head: head.id.to_string(),
                 status: head.status,
                 length: queue.length,
                 length_capped: usize::try_from(queue.length)
@@ -372,11 +375,8 @@ async fn scan(
                 return Ok(Page { queues, next });
             }
         }
-        examined += listed.len();
+        examined += chunk;
         cursor = listed.last().map(|queue| queue.order_key);
-        if listed.len() < chunk {
-            return Ok(Page { queues, next: None });
-        }
     }
     Ok(Page {
         queues,
@@ -384,11 +384,31 @@ async fn scan(
     })
 }
 
+struct Head {
+    id: EventId,
+    status: ParkStatus,
+    attempts: u32,
+    first_failure_ms: u64,
+    last_error: String,
+}
+
+impl From<ParkedEvent> for Head {
+    fn from(event: ParkedEvent) -> Self {
+        Self {
+            id: event.id,
+            status: event.status,
+            attempts: event.attempts,
+            first_failure_ms: event.first_failure_ms,
+            last_error: event.last_error,
+        }
+    }
+}
+
 async fn read_heads(
     store: &Arc<dyn StateStore>,
     queues: &[crate::state::ParkedHead],
-) -> Result<Vec<Option<ParkedEvent>>, StoreError> {
-    let mut heads: Vec<Option<ParkedEvent>> = vec![None; queues.len()];
+) -> Result<Vec<Option<Head>>, StoreError> {
+    let mut heads: Vec<Option<Head>> = queues.iter().map(|_| None).collect();
     let mut pending = queues.iter().enumerate();
     let mut reading = JoinSet::new();
     loop {
@@ -397,14 +417,20 @@ async fn read_heads(
         {
             let store = Arc::clone(store);
             let key = queue.order_key;
-            reading.spawn(async move { (index, store.read_parked(&key, None, 1).await) });
+            reading.spawn(async move {
+                let head = store
+                    .read_parked(&key, None, 1)
+                    .await
+                    .map(|events| events.into_iter().next().map(Head::from));
+                (index, head)
+            });
         }
         let Some(joined) = reading.join_next().await else {
             return Ok(heads);
         };
         let (index, read) = joined.map_err(|error| StoreError::Unavailable(error.to_string()))?;
         if let Some(slot) = heads.get_mut(index) {
-            *slot = read?.into_iter().next();
+            *slot = read?;
         }
     }
 }
@@ -556,7 +582,8 @@ async fn operate_failure(admin: &Admin, error: OperateError) -> Reply {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::{Duration, SystemTime};
 
@@ -573,7 +600,8 @@ mod tests {
 
     use super::operate_failure;
     use crate::admin::{
-        Admin, Identity, OPERATION_TIMEOUT, PARKED_LENGTH_CAP, PARKED_SCAN_LIMIT, route,
+        Admin, HEAD_READ_CONCURRENCY, HOLDER_LOOKUP_TIMEOUT, Identity, OPERATION_TIMEOUT,
+        PARKED_LENGTH_CAP, PARKED_SCAN_LIMIT, route,
     };
     use crate::event::EventId;
     use crate::health::{Health, Role};
@@ -595,11 +623,58 @@ mod tests {
         reads: Vec<(usize, usize)>,
     }
 
+    #[derive(Debug, Default)]
+    struct Races {
+        drain_while_listing: Option<OrderKeyId>,
+        deliver_before_reading: Option<OrderKeyId>,
+    }
+
+    #[derive(Debug, Default)]
+    struct Reads {
+        delays: HashMap<OrderKeyId, Duration>,
+        running: usize,
+        peak_running: usize,
+    }
+
+    #[derive(Debug)]
+    struct TrackedBody {
+        bytes: Bytes,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl TrackedBody {
+        fn wrap(bytes: Bytes, live: &Arc<AtomicUsize>, peak: &AtomicUsize) -> Bytes {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            Bytes::from_owner(Self {
+                bytes,
+                live: Arc::clone(live),
+            })
+        }
+    }
+
+    impl AsRef<[u8]> for TrackedBody {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for TrackedBody {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     #[derive(Debug)]
     struct CountingStore {
         inner: MemoryStateStore,
         counts: Mutex<Counts>,
         failing: AtomicBool,
+        stalls_leader: AtomicBool,
+        races: Mutex<Races>,
+        reads: Mutex<Reads>,
+        live_bodies: Arc<AtomicUsize>,
+        peak_bodies: AtomicUsize,
     }
 
     impl CountingStore {
@@ -608,11 +683,36 @@ mod tests {
                 inner: inner.clone(),
                 counts: Mutex::new(Counts::default()),
                 failing: AtomicBool::new(false),
+                stalls_leader: AtomicBool::new(false),
+                races: Mutex::new(Races::default()),
+                reads: Mutex::new(Reads::default()),
+                live_bodies: Arc::new(AtomicUsize::new(0)),
+                peak_bodies: AtomicUsize::new(0),
             })
         }
 
         fn counts(&self) -> MutexGuard<'_, Counts> {
             self.counts.lock().unwrap()
+        }
+
+        fn races(&self) -> MutexGuard<'_, Races> {
+            self.races.lock().unwrap()
+        }
+
+        fn reads(&self) -> MutexGuard<'_, Reads> {
+            self.reads.lock().unwrap()
+        }
+
+        async fn drain(&self, key: &OrderKeyId) {
+            let events = self.inner.read_parked(key, None, usize::MAX).await.unwrap();
+            let ids: Vec<_> = events.iter().map(|event| (*key, event.id)).collect();
+            self.inner.remove_parked(&ids).await.unwrap();
+        }
+
+        async fn deliver_head(&self, key: &OrderKeyId) {
+            let head = self.inner.read_parked(key, None, 1).await.unwrap();
+            let ids: Vec<_> = head.iter().map(|event| (*key, event.id)).collect();
+            self.inner.remove_parked(&ids).await.unwrap();
         }
 
         fn count(&self) -> Result<(), StoreError> {
@@ -644,10 +744,16 @@ mod tests {
             length_cap: usize,
         ) -> Result<Vec<ParkedHead>, StoreError> {
             self.count()?;
-            let listed = self
+            let mut listed = self
                 .inner
                 .list_parked_queues(after, limit, length_cap)
                 .await?;
+            let draining = self.races().drain_while_listing;
+            if let Some(key) = draining.filter(|key| listed.iter().any(|q| q.order_key == *key)) {
+                self.races().drain_while_listing = None;
+                self.drain(&key).await;
+                listed.retain(|queue| queue.order_key != key);
+            }
             self.counts().lists.push((limit, listed.len(), length_cap));
             Ok(listed)
         }
@@ -659,7 +765,29 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<ParkedEvent>, StoreError> {
             self.count()?;
-            let read = self.inner.read_parked(key, after, limit).await?;
+            if self.races().deliver_before_reading == Some(*key) {
+                self.races().deliver_before_reading = None;
+                self.deliver_head(key).await;
+            }
+            let delay = {
+                let mut reads = self.reads();
+                reads.running += 1;
+                reads.peak_running = reads.peak_running.max(reads.running);
+                reads.delays.get(key).copied()
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let read = self.inner.read_parked(key, after, limit).await;
+            self.reads().running -= 1;
+            let read: Vec<_> = read?
+                .into_iter()
+                .map(|mut event| {
+                    event.body =
+                        TrackedBody::wrap(event.body, &self.live_bodies, &self.peak_bodies);
+                    event
+                })
+                .collect();
             self.counts().reads.push((limit, read.len()));
             Ok(read)
         }
@@ -681,6 +809,9 @@ mod tests {
 
         async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
             self.count()?;
+            if self.stalls_leader.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             self.inner.read_leader().await
         }
 
@@ -1194,6 +1325,211 @@ mod tests {
         let answer = get(&fixture.admin, "/parked").await;
         assert_eq!(queue_keys(&answer), vec![b.to_string()]);
         fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_draining_during_the_listing_does_not_end_the_pages() {
+        let keys = sorted_keys(3);
+        let store = MemoryStateStore::new();
+        for key in &keys {
+            seed(&store, &[parked(*key, 0x10, 0, ParkStatus::Dead)]).await;
+        }
+        let counting = CountingStore::over(&store);
+        counting.races().drain_while_listing = Some(keys[0]);
+        let fixture = Fixture::reading(counting.clone()).await;
+
+        let answer = get(&fixture.admin, "/parked?status=dead&limit=2").await;
+        assert_eq!(answer.status, 200);
+        assert_eq!(
+            queue_keys(&answer),
+            vec![keys[1].to_string(), keys[2].to_string()]
+        );
+        assert_eq!(answer.body["next"], keys[2].to_string());
+        fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_head_delivered_between_listing_and_reading_is_reported_as_its_successor() {
+        let (a, b) = (named("a"), named("b"));
+        let successor = |key, lsn| ParkedEvent {
+            attempts: 7,
+            last_error: "second failure".to_owned(),
+            ..parked(key, lsn, 1, ParkStatus::Retrying)
+        };
+        let store = MemoryStateStore::new();
+        seed(
+            &store,
+            &[
+                parked(a, 0x10, 0, ParkStatus::Dead),
+                successor(a, 0x10),
+                parked(b, 0x20, 0, ParkStatus::Dead),
+                successor(b, 0x20),
+            ],
+        )
+        .await;
+        let counting = CountingStore::over(&store);
+        let fixture = Fixture::reading(counting.clone()).await;
+
+        counting.races().deliver_before_reading = Some(a);
+        let answer = get(&fixture.admin, "/parked").await;
+        let queues = answer.body["queues"].as_array().unwrap();
+        let of_a = queues
+            .iter()
+            .find(|queue| queue["order_key"] == a.to_string())
+            .unwrap();
+        assert_eq!(of_a["head"], id_text(0x10, 1));
+        assert_eq!(of_a["status"], "retrying");
+        assert_eq!(of_a["attempts"], 7);
+        assert_eq!(of_a["last_error"], "second failure");
+
+        counting.races().deliver_before_reading = Some(b);
+        let retrying = get(&fixture.admin, "/parked?status=retrying").await;
+        let mut keys = [a, b];
+        keys.sort();
+        assert_eq!(
+            queue_keys(&retrying),
+            keys.map(|key| key.to_string()).to_vec()
+        );
+        let heads: Vec<_> = retrying.body["queues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|queue| (queue["order_key"].clone(), queue["head"].clone()))
+            .collect();
+        assert!(heads.contains(&(json!(b.to_string()), json!(id_text(0x20, 1)))));
+        let dead = get(&fixture.admin, "/parked?status=dead").await;
+        assert_eq!(queue_keys(&dead), Vec::<String>::new());
+        fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn head_reads_run_at_most_sixteen_at_once_and_keep_key_order() {
+        let keys = sorted_keys(40);
+        let store = MemoryStateStore::new();
+        for key in &keys {
+            seed(&store, &[parked(*key, 0x10, 0, ParkStatus::Dead)]).await;
+        }
+        let counting = CountingStore::over(&store);
+        {
+            let mut reads = counting.reads();
+            for (index, key) in keys.iter().enumerate() {
+                let late = u64::try_from(keys.len() - index).unwrap();
+                reads.delays.insert(*key, Duration::from_millis(late));
+            }
+        }
+        let fixture = Fixture::reading(counting.clone()).await;
+
+        let first = get(&fixture.admin, "/parked?limit=30").await;
+        assert_eq!(first.status, 200);
+        let expected: Vec<_> = keys.iter().take(30).map(ToString::to_string).collect();
+        assert_eq!(queue_keys(&first), expected);
+        assert_eq!(first.body["next"], keys[29].to_string());
+        assert_eq!(counting.reads().peak_running, HEAD_READ_CONCURRENCY);
+
+        let rest = get(&fixture.admin, &format!("/parked?after={}", keys[29])).await;
+        let expected: Vec<_> = keys.iter().skip(30).map(ToString::to_string).collect();
+        assert_eq!(queue_keys(&rest), expected);
+        assert_eq!(rest.body["next"], Value::Null);
+        assert_eq!(counting.reads().peak_running, HEAD_READ_CONCURRENCY);
+        fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listing_holds_no_more_head_envelopes_than_reads_in_flight() {
+        let keys = sorted_keys(200);
+        let store = MemoryStateStore::new();
+        let large = Bytes::from(format!(r#"{{"pad":"{}"}}"#, "x".repeat(64 * 1024)));
+        for key in &keys {
+            let event = ParkedEvent {
+                body: large.clone(),
+                ..parked(*key, 0x10, 0, ParkStatus::Dead)
+            };
+            seed(&store, &[event]).await;
+        }
+        let counting = CountingStore::over(&store);
+        let fixture = Fixture::reading(counting.clone()).await;
+
+        let answer = get(&fixture.admin, "/parked?limit=200").await;
+        assert_eq!(answer.status, 200);
+        assert_eq!(queue_keys(&answer).len(), 200);
+        assert_eq!(counting.counts().reads.len(), 200);
+        let peak = counting.peak_bodies.load(Ordering::SeqCst);
+        assert!(
+            peak <= HEAD_READ_CONCURRENCY,
+            "{peak} envelopes held at once"
+        );
+        assert_eq!(counting.live_bodies.load(Ordering::SeqCst), 0);
+        fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_lookup_that_fails_or_stalls_still_answers_409_with_nulls() {
+        let key = named("a");
+        let id = id_text(0x10, 0);
+        let targets = [
+            (Method::GET, "/parked".to_owned()),
+            (Method::GET, format!("/parked/{key}")),
+            (Method::POST, format!("/parked/{key}/redrive")),
+            (Method::POST, format!("/parked/{key}/discard?id={id}")),
+        ];
+        let store = MemoryStateStore::new();
+        let record = LeaderRecord {
+            epoch: 4,
+            holder: "other-2".to_owned(),
+            state: LeaderState::Released,
+            confirmed_lsn: Lsn(0x30),
+            updated_ms: 1,
+        };
+        store.swap_leader(&record, None).await.unwrap();
+        let counting = CountingStore::over(&store);
+        let admin = Admin::new(Health::new(), Status::new(), identity());
+        admin.set_state_store(counting.clone());
+        let unknown = json!({
+            "error": "this task is not the active holder",
+            "role": "standby",
+            "holder": null,
+            "leader_state": null,
+            "epoch": null
+        });
+
+        for (method, target) in &targets {
+            let answer = call(&admin, method.clone(), target).await;
+            assert_eq!(answer.status, 409, "{target}");
+            assert_eq!(
+                answer.body,
+                json!({
+                    "error": "this task is not the active holder",
+                    "role": "standby",
+                    "holder": "other-2",
+                    "leader_state": "released",
+                    "epoch": 4
+                }),
+                "{target}"
+            );
+        }
+
+        counting.failing.store(true, Ordering::SeqCst);
+        for (method, target) in &targets {
+            let answer = call(&admin, method.clone(), target).await;
+            assert_eq!(answer.status, 409, "{target}");
+            assert_eq!(answer.headers[CONTENT_TYPE], "application/json");
+            assert_eq!(answer.body, unknown, "{target}");
+        }
+
+        counting.failing.store(false, Ordering::SeqCst);
+        counting.stalls_leader.store(true, Ordering::SeqCst);
+        for (method, target) in &targets {
+            let started = Instant::now();
+            let answer = call(&admin, method.clone(), target).await;
+            let waited = started.elapsed();
+            assert_eq!(answer.status, 409, "{target}");
+            assert_eq!(answer.body, unknown, "{target}");
+            assert!(
+                (HOLDER_LOOKUP_TIMEOUT..HOLDER_LOOKUP_TIMEOUT + Duration::from_secs(1))
+                    .contains(&waited),
+                "{target} waited {waited:?}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
