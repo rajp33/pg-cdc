@@ -2,8 +2,8 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -20,7 +20,7 @@ use pg_cdc::lane::Stores;
 use pg_cdc::leader::record::holder_id;
 use pg_cdc::logs::{self, LOG_BUFFER_LINES, LogFlush};
 use pg_cdc::payload::{PayloadStore, S3PayloadStore};
-use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig, SessionContext};
+use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig, SessionContext, shutdown_budget};
 use pg_cdc::sink::Sink;
 use pg_cdc::sink::discard::DiscardSink;
 use pg_cdc::sink::sns::SnsSink;
@@ -83,9 +83,28 @@ fn main() -> ExitCode {
     // Dropping the runtime waits for blocking-pool work, and a write to a full stdout pipe never returns.
     runtime.shutdown_background();
     if let Some(logs) = logs {
-        logs.flush(LOG_FLUSH_TIMEOUT);
+        let window = flush_window(logs.deadline, Instant::now());
+        if !window.is_zero() {
+            logs.flush.flush(window);
+        }
     }
     code
+}
+
+#[derive(Debug)]
+struct PendingLogs {
+    flush: LogFlush,
+    deadline: Option<Instant>,
+}
+
+fn flush_deadline(signalled: Option<Instant>, drain_timeout: Duration) -> Option<Instant> {
+    signalled?.checked_add(shutdown_budget(drain_timeout))
+}
+
+fn flush_window(deadline: Option<Instant>, now: Instant) -> Duration {
+    deadline.map_or(LOG_FLUSH_TIMEOUT, |deadline| {
+        LOG_FLUSH_TIMEOUT.min(deadline.saturating_duration_since(now))
+    })
 }
 
 async fn health_command(flag: Option<SocketAddr>) -> ExitCode {
@@ -114,7 +133,7 @@ fn health_addr(flag: Option<SocketAddr>, env: Option<&str>) -> Result<SocketAddr
     }
 }
 
-fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<LogFlush>) {
+fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<PendingLogs>) {
     let env = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)));
     let config = match pg_cdc::config::load(config, env) {
@@ -131,8 +150,10 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<LogFlush>)
             return (ExitCode::FAILURE, None);
         }
     };
+    let drain_timeout = config.leadership.drain_timeout;
+    let signalled = Arc::new(OnceLock::new());
     let code = runtime.block_on(async {
-        match run(config).await {
+        match run(config, Arc::clone(&signalled)).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 tracing::error!("pg-cdc stopped: {error:#}");
@@ -140,7 +161,14 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<LogFlush>)
             }
         }
     });
-    (code, Some(logs))
+    let deadline = flush_deadline(signalled.get().copied(), drain_timeout);
+    (
+        code,
+        Some(PendingLogs {
+            flush: logs,
+            deadline,
+        }),
+    )
 }
 
 fn init_logging(sink: &SinkConfig) -> std::io::Result<LogFlush> {
@@ -159,11 +187,16 @@ fn init_logging(sink: &SinkConfig) -> std::io::Result<LogFlush> {
     Ok(flush)
 }
 
-async fn run(config: Config) -> anyhow::Result<()> {
+async fn run(config: Config, signalled: Arc<OnceLock<Instant>>) -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
     let interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
-    tokio::spawn(watch_signals(terminate, interrupt, shutdown.clone()));
+    tokio::spawn(watch_signals(
+        terminate,
+        interrupt,
+        signalled,
+        shutdown.clone(),
+    ));
     let holder = holder_id();
     tracing::info!(pipeline = %config.pipeline, slot = %config.source.slot, %holder, "pg-cdc starting");
     let health = start_admin(config.admin.listen).await?;
@@ -308,11 +341,17 @@ async fn provider(source: &SourceConfig) -> Box<dyn ConnectionProvider> {
     }
 }
 
-async fn watch_signals(mut terminate: Signal, mut interrupt: Signal, shutdown: CancellationToken) {
+async fn watch_signals(
+    mut terminate: Signal,
+    mut interrupt: Signal,
+    signalled: Arc<OnceLock<Instant>>,
+    shutdown: CancellationToken,
+) {
     tokio::select! {
         _ = terminate.recv() => {}
         _ = interrupt.recv() => {}
     }
+    let _ = signalled.set(Instant::now());
     shutdown.cancel();
     tracing::info!("shutdown requested");
 }
@@ -320,6 +359,37 @@ async fn watch_signals(mut terminate: Signal, mut interrupt: Signal, shutdown: C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_flush_for_a_second_unless_the_sigterm_budget_has_less_left() {
+        let now = Instant::now();
+        assert_eq!(flush_window(None, now), LOG_FLUSH_TIMEOUT);
+        assert_eq!(
+            flush_window(Some(now + Duration::from_secs(10)), now),
+            LOG_FLUSH_TIMEOUT
+        );
+        assert_eq!(
+            flush_window(Some(now + Duration::from_millis(300)), now),
+            Duration::from_millis(300)
+        );
+        assert_eq!(flush_window(Some(now), now), Duration::ZERO);
+        assert_eq!(
+            flush_window(Some(now), now + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn the_flush_deadline_is_the_shutdown_budget_after_the_signal() {
+        let signalled = Instant::now();
+        let drain = Duration::from_secs(1);
+        assert_eq!(flush_deadline(None, drain), None);
+        assert_eq!(
+            flush_deadline(Some(signalled), drain),
+            Some(signalled + Duration::from_secs(5))
+        );
+        assert_eq!(flush_deadline(Some(signalled), Duration::MAX), None);
+    }
 
     #[test]
     fn health_address_comes_from_the_flag_then_the_environment_then_the_default() {

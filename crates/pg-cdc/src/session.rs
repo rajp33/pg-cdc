@@ -40,6 +40,13 @@ pub const HANDOVER_TAIL: Duration = Duration::from_secs(3);
 pub const LANE_STOP_GRACE: Duration = Duration::from_secs(1);
 pub const CONTROL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[must_use]
+pub fn shutdown_budget(drain_timeout: Duration) -> Duration {
+    drain_timeout
+        .saturating_mul(2)
+        .saturating_add(HANDOVER_TAIL)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
     pub pipeline: String,
@@ -818,6 +825,16 @@ fn known(
 mod tests {
     use super::*;
     use crate::leader::standby::StartError;
+
+    #[test]
+    fn the_shutdown_budget_is_two_drain_windows_and_the_tail() {
+        assert_eq!(
+            shutdown_budget(Duration::from_secs(5)),
+            Duration::from_secs(13)
+        );
+        assert_eq!(shutdown_budget(Duration::ZERO), HANDOVER_TAIL);
+        assert_eq!(shutdown_budget(Duration::MAX), Duration::MAX);
+    }
 
     fn xlog(wal_start: u64) -> ReplicationEvent {
         ReplicationEvent::XLogData {

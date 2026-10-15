@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use testcontainers::core::{ContainerPort, WaitFor};
+use testcontainers::core::{CmdWaitFor, ContainerPort, ExecCommand, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio_postgres::{Client, NoTls};
@@ -62,7 +62,7 @@ pub struct SlotState {
 
 #[derive(Debug)]
 pub struct Postgres {
-    _container: ContainerAsync<GenericImage>,
+    container: ContainerAsync<GenericImage>,
     port: u16,
     version: u8,
     certificates: Option<TestCertificates>,
@@ -143,7 +143,7 @@ impl Postgres {
         };
         let port = container.get_host_port_ipv4(5432).await?;
         let postgres = Self {
-            _container: container,
+            container,
             port,
             version,
             certificates,
@@ -323,6 +323,24 @@ impl Postgres {
             )
             .await?;
         Ok(row.try_get(0)?)
+    }
+
+    pub async fn freeze_walsender(&self, slot: &str) -> Result<bool, TestkitError> {
+        let Some(pid) = self
+            .slot_state(slot)
+            .await?
+            .and_then(|state| state.active_pid)
+        else {
+            return Ok(false);
+        };
+        let result = self
+            .container
+            .exec(
+                ExecCommand::new(["kill", "-STOP", &pid.to_string()])
+                    .with_cmd_ready_condition(CmdWaitFor::exit()),
+            )
+            .await?;
+        Ok(result.exit_code().await? == Some(0))
     }
 
     async fn wait_until_ready(&self) -> Result<(), TestkitError> {

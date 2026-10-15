@@ -22,6 +22,8 @@ const WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(25);
 const FENCE_DELAY: Duration = Duration::from_millis(4500);
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(7);
+const SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
+const EXIT_SLACK: Duration = Duration::from_millis(500);
 const TAKEOVER_WINDOW: Duration = Duration::from_secs(8);
 const LOSER_QUIET: Duration = Duration::from_secs(3);
 const SLOT: &str = "handover_slot";
@@ -181,17 +183,20 @@ impl Task {
             Logs::Stderr => command.stdout(Stdio::piped()).stderr(writer),
         };
         let mut child = command.spawn()?;
-        let events = Records::default();
-        if let Some(stdout) = child.stdout.take() {
-            collect(stdout, events.clone());
-        }
+        let unread = child.stdout.take();
         let task = Self {
             child,
-            events,
+            events: Records::default(),
             logs: Records::default(),
-            unread: None,
+            unread,
         };
         Ok((task, reader))
+    }
+
+    fn read_events(&mut self) -> TestResult {
+        let stdout = self.unread.take().ok_or("no stdout")?;
+        collect(stdout, self.events.clone());
+        Ok(())
     }
 
     fn events(&self) -> TestResult<Vec<(Instant, Value)>> {
@@ -610,6 +615,9 @@ async fn assert_sigterm_with_a_full_log_pipe_hands_over(logs: Logs) -> TestResul
     })
     .await?;
     let (mut a, _pipe) = deployment.spawn_with_full_log_pipe(logs).await?;
+    if matches!(logs, Logs::Stderr) {
+        a.read_events()?;
+    }
     let claimed = deployment.wait_for_record("active", 1).await?;
     deployment.insert(1, 5, "one").await?;
     let delivered = match logs {
@@ -639,4 +647,34 @@ async fn a_sigterm_with_a_full_stdout_log_pipe_still_hands_over_within_the_budge
 #[tokio::test]
 async fn a_sigterm_with_a_full_stderr_log_pipe_still_hands_over_within_the_budget() -> TestResult {
     assert_sigterm_with_a_full_log_pipe_hands_over(Logs::Stderr).await
+}
+
+#[tokio::test]
+async fn a_sigterm_that_exhausts_every_window_with_a_full_log_pipe_exits_within_the_bound()
+-> TestResult {
+    let deployment = Deployment::start().await?;
+    let (mut a, _pipe) = deployment.spawn_with_full_log_pipe(Logs::Stderr).await?;
+    assert!(deployment.wait_for_record("active", 1).await?);
+    deployment
+        .pg
+        .execute("INSERT INTO orders SELECT g, repeat('x', 20000) FROM generate_series(1, 40) g")
+        .await?;
+    sleep(Duration::from_secs(1)).await;
+    assert!(deployment.pg.freeze_walsender(SLOT).await?);
+
+    a.sigterm().await?;
+    let t_term = Instant::now();
+    let status = a.exit(SHUTDOWN_BUDGET).await?;
+    let elapsed = t_term.elapsed();
+
+    assert!(status.success(), "{status}");
+    assert!(
+        elapsed >= SHUTDOWN_BOUND.saturating_sub(EXIT_SLACK),
+        "the shutdown windows were not exhausted: {elapsed:?}"
+    );
+    assert!(elapsed < SHUTDOWN_BOUND + EXIT_SLACK, "{elapsed:?}");
+    let record = deployment.leader_record()?;
+    assert_eq!(record["state"], "active");
+    assert_eq!(record["epoch"], 1);
+    Ok(())
 }
