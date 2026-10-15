@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
+use std::io::{PipeReader, PipeWriter, Write as _};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,10 @@ struct Deployment {
 
 impl Deployment {
     async fn start() -> TestResult<Self> {
+        Self::start_with_sink("stdout").await
+    }
+
+    async fn start_with_sink(sink: &str) -> TestResult<Self> {
         let pg = Postgres::start().await?;
         pg.execute("CREATE TABLE orders (id int PRIMARY KEY, status text)")
             .await?;
@@ -44,7 +49,7 @@ impl Deployment {
         let mut config = tempfile::NamedTempFile::new()?;
         write!(
             config,
-            "pipeline: handover\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {SLOT}\n  publication: handover_pub\n  status_interval: 200ms\ndelivery:\n  order_by: key\n  lanes: 4\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: {path}\nleadership:\n  lease_timeout: 4s\n  fence_delay: 4500ms\n  drain_timeout: 1s\nadmin:\n  listen: 127.0.0.1:0\n",
+            "pipeline: handover\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {SLOT}\n  publication: handover_pub\n  status_interval: 200ms\ndelivery:\n  order_by: key\n  lanes: 4\nsink:\n  type: {sink}\nstate_store:\n  type: filesystem\n  path: {path}\nleadership:\n  lease_timeout: 4s\n  fence_delay: 4500ms\n  drain_timeout: 1s\nadmin:\n  listen: 127.0.0.1:0\n",
             host = pg.host(),
             port = pg.port(),
             database = pg.database(),
@@ -62,8 +67,28 @@ impl Deployment {
         Task::spawnunread(self.config.path(), self.pg.password())
     }
 
+    async fn spawn_with_full_log_pipe(&self, logs: Logs) -> TestResult<(Task, PipeReader)> {
+        Task::spawn_with_full_log_pipe(self.config.path(), self.pg.password(), logs).await
+    }
+
     fn leader_record(&self) -> TestResult<Value> {
         leader_record(self.state.path())
+    }
+
+    async fn wait_for_record(&self, state: &str, epoch: u64) -> TestResult<bool> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Ok(record) = self.leader_record()
+                && record.get("state") == Some(&Value::from(state))
+                && record.get("epoch") == Some(&Value::from(epoch))
+            {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            sleep(POLL).await;
+        }
     }
 
     async fn insert(&self, first: i32, last: i32, status: &str) -> TestResult {
@@ -92,6 +117,12 @@ impl Deployment {
             .and_then(|state| state.active_pid)
             .map(i64::from))
     }
+}
+
+#[derive(Clone, Copy)]
+enum Logs {
+    Stdout,
+    Stderr,
 }
 
 struct Task {
@@ -129,6 +160,38 @@ impl Task {
             logs,
             unread: Some(unread),
         })
+    }
+
+    async fn spawn_with_full_log_pipe(
+        config: &Path,
+        password: &str,
+        logs: Logs,
+    ) -> TestResult<(Self, PipeReader)> {
+        let (reader, writer) = full_pipe().await?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pg-cdc"));
+        command
+            .arg("run")
+            .arg("--config")
+            .arg(config)
+            .env("PGCDC__SOURCE__CREDENTIALS__PASSWORD", password)
+            .env_remove("PGCDC__ADMIN__LISTEN")
+            .kill_on_drop(true);
+        match logs {
+            Logs::Stdout => command.stdout(writer).stderr(Stdio::null()),
+            Logs::Stderr => command.stdout(Stdio::piped()).stderr(writer),
+        };
+        let mut child = command.spawn()?;
+        let events = Records::default();
+        if let Some(stdout) = child.stdout.take() {
+            collect(stdout, events.clone());
+        }
+        let task = Self {
+            child,
+            events,
+            logs: Records::default(),
+            unread: None,
+        };
+        Ok((task, reader))
     }
 
     fn events(&self) -> TestResult<Vec<(Instant, Value)>> {
@@ -267,6 +330,27 @@ fn collect<R: AsyncRead + Send + Unpin + 'static>(reader: R, records: Records) {
             }
         }
     });
+}
+
+async fn full_pipe() -> TestResult<(PipeReader, PipeWriter)> {
+    let (reader, writer) = std::io::pipe()?;
+    let mut filler = writer.try_clone()?;
+    let written = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&written);
+    std::thread::spawn(move || {
+        while filler.write_all(b"#").is_ok() {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let mut last = 0;
+    loop {
+        sleep(Duration::from_millis(200)).await;
+        let now = written.load(Ordering::Relaxed);
+        if now > 0 && now == last {
+            return Ok((reader, writer));
+        }
+        last = now;
+    }
 }
 
 fn snapshot(records: &Records) -> TestResult<Vec<(Instant, Value)>> {
@@ -517,4 +601,42 @@ async fn a_sigterm_with_a_full_stdout_pipe_still_exits_within_the_budget() -> Te
     assert_eq!(record["state"], "active");
     assert_eq!(record["epoch"], 1);
     Ok(())
+}
+
+async fn assert_sigterm_with_a_full_log_pipe_hands_over(logs: Logs) -> TestResult {
+    let deployment = Deployment::start_with_sink(match logs {
+        Logs::Stdout => "discard",
+        Logs::Stderr => "stdout",
+    })
+    .await?;
+    let (mut a, _pipe) = deployment.spawn_with_full_log_pipe(logs).await?;
+    let claimed = deployment.wait_for_record("active", 1).await?;
+    deployment.insert(1, 5, "one").await?;
+    let delivered = match logs {
+        Logs::Stdout => true,
+        Logs::Stderr => a.wait_for_row(5, "one").await.is_ok(),
+    };
+
+    a.sigterm().await?;
+    let t_term = Instant::now();
+    let status = a.exit(SHUTDOWN_BUDGET).await?;
+
+    assert!(status.success(), "{status}");
+    assert!(t_term.elapsed() < SHUTDOWN_BUDGET, "{:?}", t_term.elapsed());
+    assert!(claimed, "the leader record was never claimed");
+    assert!(delivered, "no event was delivered");
+    let record = deployment.leader_record()?;
+    assert_eq!(record.get("state"), Some(&Value::from("released")));
+    assert_eq!(record.get("epoch"), Some(&Value::from(1)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sigterm_with_a_full_stdout_log_pipe_still_hands_over_within_the_budget() -> TestResult {
+    assert_sigterm_with_a_full_log_pipe_hands_over(Logs::Stdout).await
+}
+
+#[tokio::test]
+async fn a_sigterm_with_a_full_stderr_log_pipe_still_hands_over_within_the_budget() -> TestResult {
+    assert_sigterm_with_a_full_log_pipe_hands_over(Logs::Stderr).await
 }

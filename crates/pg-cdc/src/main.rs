@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -17,6 +18,7 @@ use pg_cdc::connection::{
 use pg_cdc::health::Health;
 use pg_cdc::lane::Stores;
 use pg_cdc::leader::record::holder_id;
+use pg_cdc::logs::{self, LOG_BUFFER_LINES, LogFlush};
 use pg_cdc::payload::{PayloadStore, S3PayloadStore};
 use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig, SessionContext};
 use pg_cdc::sink::Sink;
@@ -28,6 +30,7 @@ use pg_cdc::state::filesystem::FilesystemStateStore;
 use pg_cdc::state::s3::{S3StateStore, s3_client};
 use pg_cdc::supervisor::{LiveSession, preflight, store_ready, supervise};
 use tokio::net::TcpListener;
+use tokio::runtime::Runtime;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -56,6 +59,7 @@ enum Command {
 }
 
 const ADMIN_LISTEN_VARIABLE: &str = "PGCDC__ADMIN__LISTEN";
+const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -72,14 +76,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let code = runtime.block_on(async {
-        match cli.command {
-            Command::Run { config } => run_command(&config).await,
-            Command::Health { addr } => health_command(addr).await,
-        }
-    });
+    let (code, logs) = match cli.command {
+        Command::Run { config } => run_command(&runtime, &config),
+        Command::Health { addr } => (runtime.block_on(health_command(addr)), None),
+    };
     // Dropping the runtime waits for blocking-pool work, and a write to a full stdout pipe never returns.
     runtime.shutdown_background();
+    if let Some(logs) = logs {
+        logs.flush(LOG_FLUSH_TIMEOUT);
+    }
     code
 }
 
@@ -109,33 +114,49 @@ fn health_addr(flag: Option<SocketAddr>, env: Option<&str>) -> Result<SocketAddr
     }
 }
 
-async fn run_command(config: &Path) -> ExitCode {
+fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<LogFlush>) {
     let env = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)));
     let config = match pg_cdc::config::load(config, env) {
         Ok(config) => config,
         Err(error) => {
             let _ = writeln!(std::io::stderr(), "pg-cdc: invalid configuration: {error}");
-            return ExitCode::FAILURE;
+            return (ExitCode::FAILURE, None);
         }
     };
-    init_logging(&config.sink);
-    match run(config).await {
-        Ok(()) => ExitCode::SUCCESS,
+    let logs = match init_logging(&config.sink) {
+        Ok(logs) => logs,
         Err(error) => {
-            tracing::error!("pg-cdc stopped: {error:#}");
-            ExitCode::FAILURE
+            let _ = writeln!(std::io::stderr(), "pg-cdc: cannot start logging: {error}");
+            return (ExitCode::FAILURE, None);
         }
-    }
+    };
+    let code = runtime.block_on(async {
+        match run(config).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                tracing::error!("pg-cdc stopped: {error:#}");
+                ExitCode::FAILURE
+            }
+        }
+    });
+    (code, Some(logs))
 }
 
-fn init_logging(sink: &SinkConfig) {
+fn init_logging(sink: &SinkConfig) -> std::io::Result<LogFlush> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().json().with_env_filter(filter);
-    match sink {
-        SinkConfig::Stdout(_) => builder.with_writer(std::io::stderr).init(),
-        SinkConfig::Discard(_) | SinkConfig::Sns(_) => builder.with_writer(std::io::stdout).init(),
-    }
+    let (writer, flush) = match sink {
+        SinkConfig::Stdout(_) => logs::non_blocking(std::io::stderr(), LOG_BUFFER_LINES)?,
+        SinkConfig::Discard(_) | SinkConfig::Sns(_) => {
+            logs::non_blocking(std::io::stdout(), LOG_BUFFER_LINES)?
+        }
+    };
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .init();
+    Ok(flush)
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
@@ -292,8 +313,8 @@ async fn watch_signals(mut terminate: Signal, mut interrupt: Signal, shutdown: C
         _ = terminate.recv() => {}
         _ = interrupt.recv() => {}
     }
-    tracing::info!("shutdown requested");
     shutdown.cancel();
+    tracing::info!("shutdown requested");
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ pub mod event;
 pub mod health;
 pub mod lane;
 pub mod leader;
+pub mod logs;
 pub mod order;
 pub mod payload;
 pub mod session;
