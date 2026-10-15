@@ -7,6 +7,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio_postgres::{Client, NoTls};
 
 use crate::error::TestkitError;
+use crate::reap::{created_label, reap_once};
 use crate::tls::TestCertificates;
 
 pub const PG_VERSION_ENV: &str = "PGCDC_TEST_PG_VERSION";
@@ -118,6 +119,8 @@ impl Postgres {
 
     pub async fn start_with(options: PostgresOptions) -> Result<Self, TestkitError> {
         let version = parse_pg_version(std::env::var(PG_VERSION_ENV).ok().as_deref())?;
+        reap_once().await;
+        let (label, created) = created_label();
         let image = GenericImage::new("postgres", &format!("{version}-alpine"))
             .with_exposed_port(ContainerPort::Tcp(5432))
             .with_wait_for(WaitFor::Nothing);
@@ -135,6 +138,7 @@ impl Postgres {
                     certificates.server_key_pem().as_bytes().to_vec(),
                 )
                 .with_cmd(["-c".to_owned(), tls_script(options)])
+                .with_label(label, created)
                 .start()
                 .await?;
             (container, Some(certificates))
@@ -142,6 +146,7 @@ impl Postgres {
             let container = image
                 .with_env_var("POSTGRES_PASSWORD", PASSWORD)
                 .with_cmd(server_args(options))
+                .with_label(label, created)
                 .start()
                 .await?;
             (container, None)

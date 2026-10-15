@@ -18,7 +18,7 @@ rcgen.workspace = true
 tempfile.workspace = true
 testcontainers.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["fs", "process", "rt", "time"] }
 tokio-postgres.workspace = true
 
 [dev-dependencies]

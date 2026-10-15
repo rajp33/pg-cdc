@@ -6,9 +6,10 @@ use aws_sdk_sqs::types::{Message, MessageSystemAttributeName, QueueAttributeName
 use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage};
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 use crate::error::TestkitError;
+use crate::reap::{created_label, reap_once};
 
 pub const MOTO_IMAGE: &str = "motoserver/moto";
 pub const MOTO_TAG: &str = "5.2.4";
@@ -27,9 +28,12 @@ pub struct AwsEmulator {
 
 impl AwsEmulator {
     pub async fn start() -> Result<Self, TestkitError> {
+        reap_once().await;
+        let (label, created) = created_label();
         let container = GenericImage::new(MOTO_IMAGE, MOTO_TAG)
             .with_exposed_port(ContainerPort::Tcp(5000))
             .with_wait_for(WaitFor::Nothing)
+            .with_label(label, created)
             .start()
             .await?;
         let port = container.get_host_port_ipv4(5000).await?;
