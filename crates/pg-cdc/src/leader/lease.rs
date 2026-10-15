@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout_at};
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until};
 
 use crate::health::Health;
 use crate::leader::POLL_INTERVAL;
@@ -44,15 +44,23 @@ pub async fn hold_lease(
         }
         let started = Instant::now();
         let limit = (started + POLL_INTERVAL).min(deadline);
-        match timeout_at(limit, probe.holder()).await {
-            Ok(Ok(SlotHolder::Held(pid))) if pid == own_pid => {
+        let answer = tokio::select! {
+            biased;
+            () = sleep_until(limit) => None,
+            answer = probe.holder() => Some(answer),
+        };
+        if Instant::now() >= deadline {
+            break FenceReason::Expired;
+        }
+        match answer {
+            Some(Ok(SlotHolder::Held(pid))) if pid == own_pid => {
                 last_ok = last_ok.max(started);
                 health.set_lease_valid(true);
                 tracing::debug!(own_pid, "lease renewed");
             }
-            Ok(Ok(holder)) => break FenceReason::Lost(holder),
-            Ok(Err(error)) => tracing::warn!(%error, "lease check failed"),
-            Err(_) => tracing::warn!("lease check timed out"),
+            Some(Ok(holder)) => break FenceReason::Lost(holder),
+            Some(Err(error)) => tracing::warn!(%error, "lease check failed"),
+            None => tracing::warn!("lease check timed out"),
         }
     };
     gate.fence();
@@ -72,7 +80,7 @@ mod tests {
 
     use async_trait::async_trait;
     use tokio::task::JoinHandle;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::{advance, sleep, timeout};
 
     use super::*;
     use crate::leader::gate::{Fenced, GateState};
@@ -88,6 +96,7 @@ mod tests {
     enum Step {
         Answer(Result<SlotHolder, ProbeError>),
         Slow(Duration, SlotHolder),
+        Stalled(Duration, SlotHolder),
         Hang,
     }
 
@@ -138,6 +147,10 @@ mod tests {
                 Step::Answer(answer) => answer,
                 Step::Slow(delay, holder) => {
                     sleep(delay).await;
+                    Ok(holder)
+                }
+                Step::Stalled(stall, holder) => {
+                    advance(stall).await;
                     Ok(holder)
                 }
                 Step::Hang => std::future::pending().await,
@@ -371,5 +384,40 @@ mod tests {
         assert_eq!(gate_state, GateState::Fenced);
         assert!(!lease.health.snapshot().lease_valid);
         assert_eq!(lease.probe.calls(), vec![secs(2), secs(4)]);
+    }
+
+    async fn assert_a_late_answer_does_not_renew(late: Step, fenced_at: Duration) {
+        let lease = start(
+            secs(4),
+            vec![
+                (secs(0), Step::Answer(Err(ProbeError("early".to_owned())))),
+                (secs(2), late),
+                (secs(3), Step::Hang),
+            ],
+        );
+
+        let (reason, returned_at, gate_state) =
+            timeout(secs(60), lease.task).await.unwrap().unwrap();
+
+        assert_eq!(reason, FenceReason::Expired);
+        assert_eq!(returned_at, fenced_at);
+        assert_eq!(gate_state, GateState::Fenced);
+        assert!(!lease.health.snapshot().lease_valid);
+        assert_eq!(lease.probe.calls(), vec![secs(2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_ready_exactly_at_the_deadline_does_not_renew() {
+        assert_a_late_answer_does_not_renew(Step::Slow(secs(2), SlotHolder::Held(OWN)), secs(4))
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_observed_after_the_deadline_does_not_renew() {
+        assert_a_late_answer_does_not_renew(
+            Step::Stalled(Duration::from_millis(2_100), SlotHolder::Held(OWN)),
+            Duration::from_millis(4_100),
+        )
+        .await;
     }
 }
