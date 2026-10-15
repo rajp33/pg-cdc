@@ -1,9 +1,14 @@
+use std::time::Duration;
+
 use pg_cdc::catalog::{
-    TypeResolver, key_columns, slot_confirmed_flush, tables_without_full_identity,
+    SlotActivity, TypeResolver, key_columns, slot_activity, slot_confirmed_flush,
+    tables_without_full_identity,
 };
 use pg_cdc_decoder::Lsn;
 use pg_cdc_decoder::value::TypeKind;
-use pg_cdc_testkit::Postgres;
+use pg_cdc_replication::{ReplicationConfig, ReplicationStream};
+use pg_cdc_testkit::{Postgres, SESSION_OPTIONS};
+use secrecy::SecretString;
 use tokio_postgres::Client;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -150,5 +155,59 @@ async fn reads_slot_position_and_identity_warnings() -> TestResult {
             ("public".to_owned(), "nothing_t".to_owned())
         ]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_activity_reports_the_walsender_holding_the_slot() -> TestResult {
+    let pg = Postgres::start().await?;
+    pg.execute("CREATE TABLE held (id int PRIMARY KEY)").await?;
+    pg.create_publication("it_pub", &["held"]).await?;
+    let start = pg.create_slot("it_slot").await?;
+    let client = pg.client().await?;
+    assert_eq!(
+        slot_activity(&client, "it_slot").await?,
+        Some(SlotActivity { active_pid: None })
+    );
+
+    let stream = ReplicationStream::start(ReplicationConfig {
+        host: pg.host().to_owned(),
+        port: pg.port(),
+        user: pg.user().to_owned(),
+        password: Some(SecretString::from(pg.password().to_owned())),
+        database: pg.database().to_owned(),
+        options: SESSION_OPTIONS.to_owned(),
+        application_name: "pg-cdc-catalog-test".to_owned(),
+        tls: None,
+        slot: "it_slot".to_owned(),
+        publication: "it_pub".to_owned(),
+        start_lsn: Lsn(start),
+        status_interval: Duration::from_millis(200),
+        connect_timeout: Duration::from_secs(10),
+        buffer: 8,
+    })
+    .await?;
+    assert_eq!(
+        slot_activity(&client, "it_slot").await?,
+        Some(SlotActivity {
+            active_pid: Some(stream.backend_pid())
+        })
+    );
+
+    stream.stop().await?;
+    pg.wait_for_slot("it_slot", Duration::from_secs(10), |state| !state.active)
+        .await?;
+    assert_eq!(
+        slot_activity(&client, "it_slot").await?,
+        Some(SlotActivity { active_pid: None })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_activity_is_none_for_a_missing_slot() -> TestResult {
+    let pg = Postgres::start().await?;
+    let client = pg.client().await?;
+    assert_eq!(slot_activity(&client, "nope").await?, None);
     Ok(())
 }

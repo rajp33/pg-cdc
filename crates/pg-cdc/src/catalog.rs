@@ -21,6 +21,8 @@ const KEY_SQL: &str = "SELECT a.attname::text FROM pg_index i \
 const SLOT_SQL: &str =
     "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1";
 
+const ACTIVITY_SQL: &str = "SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1";
+
 const IDENTITY_SQL: &str = "SELECT pt.schemaname::text, pt.tablename::text FROM pg_publication_tables pt \
      JOIN pg_namespace n ON n.nspname = pt.schemaname \
      JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename \
@@ -32,6 +34,13 @@ pub enum CatalogError {
     Query(#[from] tokio_postgres::Error),
     #[error("slot {slot} reports an invalid confirmed_flush_lsn {value:?}")]
     InvalidLsn { slot: String, value: String },
+    #[error("slot {slot} reports an invalid active_pid {pid}")]
+    InvalidPid { slot: String, pid: i32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotActivity {
+    pub active_pid: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +128,27 @@ pub async fn slot_confirmed_flush(
         })
 }
 
+pub async fn slot_activity(
+    client: &Client,
+    slot: &str,
+) -> Result<Option<SlotActivity>, CatalogError> {
+    let Some(row) = client.query_opt(ACTIVITY_SQL, &[&slot]).await? else {
+        return Ok(None);
+    };
+    let active_pid = row
+        .try_get::<_, Option<i32>>(0)?
+        .map(|pid| checked_pid(slot, pid))
+        .transpose()?;
+    Ok(Some(SlotActivity { active_pid }))
+}
+
+fn checked_pid(slot: &str, pid: i32) -> Result<u32, CatalogError> {
+    u32::try_from(pid).map_err(|_| CatalogError::InvalidPid {
+        slot: slot.to_owned(),
+        pid,
+    })
+}
+
 pub async fn tables_without_full_identity(
     client: &Client,
     publication: &str,
@@ -127,4 +157,23 @@ pub async fn tables_without_full_identity(
     rows.iter()
         .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_non_negative_pid_converts() {
+        assert_eq!(checked_pid("s", 4242).ok(), Some(4242));
+    }
+
+    #[test]
+    fn a_negative_pid_is_invalid() {
+        let error = checked_pid("s", -1).err();
+        assert!(
+            matches!(&error, Some(CatalogError::InvalidPid { slot, pid: -1 }) if slot == "s"),
+            "{error:?}"
+        );
+    }
 }

@@ -1,4 +1,6 @@
 use pg_cdc::validate::{Invalid, ValidationError, Verdict, validate};
+use std::time::Duration;
+
 use pg_cdc_testkit::{Postgres, PostgresOptions, WalLevel};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -124,6 +126,58 @@ async fn a_slot_with_the_wrong_plugin_or_database_fails_validation() -> TestResu
             &result,
             Err(ValidationError::Invalid(Invalid::SlotDatabase { found: Some(found), expected, .. }))
                 if found == "other" && expected == "postgres"
+        ),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lost_slot_fails_validation_and_an_unreserved_slot_only_warns() -> TestResult {
+    let pg = Postgres::start().await?;
+    pg.execute("CREATE TABLE filler (x int)").await?;
+    pg.create_publication(PUBLICATION, &["filler"]).await?;
+    pg.create_slot("lost_slot").await?;
+    let client = pg.client().await?;
+    client
+        .batch_execute("ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'")
+        .await?;
+    client.batch_execute("SELECT pg_reload_conf()").await?;
+
+    for _ in 0..2 {
+        client
+            .batch_execute("INSERT INTO filler VALUES (1)")
+            .await?;
+        client.batch_execute("SELECT pg_switch_wal()").await?;
+    }
+    pg.wait_for_slot("lost_slot", Duration::from_secs(10), |state| {
+        state.wal_status.as_deref() == Some("unreserved")
+    })
+    .await?;
+    assert_eq!(
+        validate(&client, "lost_slot", PUBLICATION).await?,
+        Verdict::Unreserved
+    );
+
+    let mut lost = false;
+    for _ in 0..5 {
+        client
+            .batch_execute("INSERT INTO filler VALUES (1)")
+            .await?;
+        client.batch_execute("SELECT pg_switch_wal()").await?;
+        client.batch_execute("CHECKPOINT").await?;
+        let state = pg.slot_state("lost_slot").await?;
+        if state.and_then(|state| state.wal_status).as_deref() == Some("lost") {
+            lost = true;
+            break;
+        }
+    }
+    assert!(lost, "the slot never reached wal_status lost");
+    let result = validate(&client, "lost_slot", PUBLICATION).await;
+    assert!(
+        matches!(
+            &result,
+            Err(ValidationError::Invalid(Invalid::SlotLost(slot))) if slot == "lost_slot"
         ),
         "{result:?}"
     );
