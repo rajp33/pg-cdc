@@ -59,13 +59,13 @@ fn check_order(sends: &[Sent], keys: &[u8]) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-async fn run_phase(
+async fn start_phase(
     store: TestStore,
     keys: &[u8],
     fates: &[Fate],
     outage_until: Instant,
     lanes: usize,
-) -> Result<Harness, TestCaseError> {
+) -> Harness {
     let setup = Setup {
         lanes,
         concurrency: 2,
@@ -79,6 +79,17 @@ async fn run_phase(
             .send(u32::try_from(ordinal).unwrap(), &[*key], 10)
             .unwrap();
     }
+    harness
+}
+
+async fn run_phase(
+    store: TestStore,
+    keys: &[u8],
+    fates: &[Fate],
+    outage_until: Instant,
+    lanes: usize,
+) -> Result<Harness, TestCaseError> {
+    let mut harness = start_phase(store, keys, fates, outage_until, lanes).await;
     let last = Lsn(100 + u64::try_from(keys.len() - 1).unwrap());
     prop_assert_eq!(harness.settle(keys.len()).await, last);
     prop_assert_eq!(harness.ack.inflight_events(), 0);
@@ -89,10 +100,11 @@ async fn run_phase(
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
     #[test]
-    fn o2_o3_a1_lanes_park_and_drain_under_random_failures_and_restarts(
+    fn o2_o3_a1_lanes_park_and_drain_under_random_failures_partial_appends_and_restarts(
         keys in proptest::collection::vec(0u8..KEYS, 1..EVENTS),
         codes in proptest::collection::vec(0u8..6, EVENTS),
         store_failures in 0u32..4,
+        landed in 0usize..3,
         lanes in 1usize..3,
     ) {
         let fates: Vec<Fate> = codes.iter().copied().map(fate).collect();
@@ -115,6 +127,7 @@ proptest! {
             let outage_until = Instant::now() + Duration::from_secs(5);
             let store = TestStore::default();
             store.fail_appends.store(store_failures, Ordering::SeqCst);
+            store.land_on_failure.store(landed, Ordering::SeqCst);
             let first = run_phase(store, &keys, &fates, outage_until, lanes).await?;
             let sends = first.sink.sends();
             check_order(&sends, &keys)?;
@@ -163,6 +176,66 @@ proptest! {
                 &replayed,
                 "only keys without a parked queue replay to the sink"
             );
+            Ok(())
+        })?;
+    }
+
+    #[test]
+    fn o2_a1_a_crash_in_the_middle_of_parking_loses_no_event(
+        keys in proptest::collection::vec(0u8..KEYS, 1..EVENTS),
+        codes in proptest::collection::vec(0u8..6, EVENTS),
+        store_failures in 0u32..6,
+        landed in 0usize..3,
+        crash_after_ms in 0u64..4000,
+        lanes in 1usize..3,
+    ) {
+        let fates: Vec<Fate> = codes.iter().copied().map(fate).collect();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let outage_until = Instant::now() + Duration::from_secs(5);
+            let store = TestStore {
+                append_delay: Duration::from_millis(30),
+                ..TestStore::default()
+            };
+            store.fail_appends.store(store_failures, Ordering::SeqCst);
+            store.land_on_failure.store(landed, Ordering::SeqCst);
+            let first = start_phase(store, &keys, &fates, outage_until, lanes).await;
+            tokio::time::sleep(Duration::from_millis(crash_after_ms)).await;
+            let before = first.sink.sends();
+            check_order(&before, &keys)?;
+            let inner = first.store.inner.clone();
+            drop(first);
+
+            let restarted = TestStore {
+                inner: inner.clone(),
+                ..TestStore::default()
+            };
+            let second = run_phase(restarted, &keys, &fates, outage_until, lanes).await?;
+            let after = second.sink.sends();
+            check_order(&after, &keys)?;
+            let delivered: HashSet<u32> = before
+                .iter()
+                .chain(&after)
+                .filter(|sent| sent.delivered)
+                .map(|sent| sent.ordinal)
+                .collect();
+            let mut stored = HashSet::new();
+            for key in 0..KEYS {
+                let queue = second.store.queue(&[key]).await;
+                stored.extend(queue.into_iter().map(|(ordinal, _)| ordinal));
+            }
+            for ordinal in 0..u32::try_from(keys.len()).unwrap() {
+                prop_assert!(
+                    delivered.contains(&ordinal) || stored.contains(&ordinal),
+                    "event {} of key {} was neither delivered nor kept in the store",
+                    ordinal,
+                    keys[usize::try_from(ordinal).unwrap()]
+                );
+            }
             Ok(())
         })?;
     }

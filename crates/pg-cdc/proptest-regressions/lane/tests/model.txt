@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e72fbff769b597bb8e898ea29c2b2f41b55f9fb271eb96fbe32cecb1603bcb16 # shrinks to keys = [0, 2, 3, 1, 0, 3, 0, 3, 3, 3, 1, 1, 2], codes = [2, 0, 1, 0, 0, 0, 4, 1, 3, 5, 4, 5, 5, 4, 3, 4, 0, 2, 5, 2, 5, 3, 3, 0, 5, 1, 5, 4, 3, 3], store_failures = 5, landed = 1, crash_after_ms = 160, lanes = 1
+cc 110a7e1fb5db63cae9d8407f1c5e36d101e9a4fa106ea79814efca462a2b0db1 # shrinks to keys = [2, 3, 2, 1, 2, 0, 3, 1, 3, 0, 1, 2, 3, 3, 0, 3, 1, 3], codes = [5, 5, 1, 0, 4, 4, 0, 4, 5, 5, 2, 4, 4, 5, 3, 4, 0, 3, 2, 1, 4, 0, 0, 3, 2, 5, 4, 2, 5, 4], store_failures = 3, landed = 2, lanes = 1
