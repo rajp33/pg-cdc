@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
+use aws_sdk_s3::config::interceptors::{
+    BeforeTransmitInterceptorContextMut, BeforeTransmitInterceptorContextRef,
+};
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{
     BehaviorVersion, ConfigBag, Credentials, Intercept, Region, RuntimeComponents,
@@ -208,6 +210,69 @@ async fn listing_queues_costs_one_page_per_queue_whatever_the_backlog() -> TestR
         ]
     );
     assert_eq!(requests.gets.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DrainWhileListed(String);
+
+impl Intercept for DrainWhileListed {
+    fn name(&self) -> &'static str {
+        "DrainWhileListed"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let request = context.request_mut();
+        let uri = request.uri();
+        if uri.contains("list-type=2") && !uri.contains("delimiter=") && uri.contains(&self.0) {
+            let hidden = uri.replace(&self.0, "drained");
+            request.set_uri(hidden)?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_queue_draining_while_listed_does_not_end_the_listing() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let seeding = S3StateStore::new(s3.clone(), BUCKET.to_owned(), "", "orders", 32);
+    let keys: Vec<OrderKeyId> = (1..=3).map(|n| key(0x42, n)).collect::<TestResult<_>>()?;
+    let events: Vec<ParkedEvent> = keys
+        .iter()
+        .map(|queue| event(*queue, id(9, 0), ParkStatus::Dead))
+        .collect();
+    seeding.append_parked(&events).await?;
+
+    let draining = aws_sdk_s3::Client::from_conf(
+        s3.config()
+            .to_builder()
+            .interceptor(DrainWhileListed(keys[0].to_string()))
+            .build(),
+    );
+    let store = S3StateStore::new(draining, BUCKET.to_owned(), "", "orders", 32);
+    let head = |order_key| ParkedHead {
+        order_key,
+        head: id(9, 0),
+        length: 1,
+    };
+
+    assert_eq!(
+        store.list_parked_queues(None, 1, 1000).await?,
+        vec![head(keys[1])]
+    );
+    assert_eq!(
+        store.list_parked_queues(None, 2, 1000).await?,
+        vec![head(keys[1]), head(keys[2])]
+    );
+    assert_eq!(
+        store.list_parked_queues(Some(&keys[1]), 2, 1000).await?,
+        vec![head(keys[2])]
+    );
     Ok(())
 }
 

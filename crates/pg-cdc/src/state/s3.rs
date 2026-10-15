@@ -389,13 +389,29 @@ impl StateStore for S3StateStore {
             return Ok(Vec::new());
         }
         let length_cap = length_cap.max(1);
-        let mut tasks = JoinSet::new();
-        for key in self.queue_keys(after, limit).await? {
-            let store = self.clone();
-            tasks.spawn(async move { store.queue_head(key, length_cap).await });
+        let mut after = after.copied();
+        let mut queues = Vec::new();
+        while queues.len() < limit {
+            let wanted = limit - queues.len();
+            let keys = self.queue_keys(after.as_ref(), wanted).await?;
+            let Some(last) = keys.last().copied() else {
+                break;
+            };
+            let listed = keys.len();
+            let mut tasks = JoinSet::new();
+            for key in keys {
+                let store = self.clone();
+                tasks.spawn(async move { store.queue_head(key, length_cap).await });
+            }
+            let mut found: Vec<ParkedHead> =
+                Self::join(tasks).await?.into_iter().flatten().collect();
+            found.sort_unstable_by_key(|queue| queue.order_key);
+            queues.extend(found);
+            after = Some(last);
+            if listed < wanted {
+                break;
+            }
         }
-        let mut queues: Vec<ParkedHead> = Self::join(tasks).await?.into_iter().flatten().collect();
-        queues.sort_unstable_by_key(|queue| queue.order_key);
         Ok(queues)
     }
 
