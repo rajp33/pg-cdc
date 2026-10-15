@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pg_cdc_decoder::Lsn;
 use postgres_protocol::message::backend::Message;
@@ -21,6 +21,27 @@ use crate::startup::{self, Conn, Io};
 type Delivery = Result<ReplicationEvent, ReplicationError>;
 type StatusReply = oneshot::Sender<Result<(), ReplicationError>>;
 
+#[derive(Debug, Clone, Default)]
+pub struct StatusClock {
+    sent_ms: Arc<AtomicU64>,
+}
+
+impl StatusClock {
+    pub fn record(&self, at: SystemTime) {
+        let ms = at.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+        self.sent_ms.store(ms, Ordering::Release);
+    }
+
+    pub fn last_sent(&self) -> Option<SystemTime> {
+        match self.sent_ms.load(Ordering::Acquire) {
+            0 => None,
+            ms => Some(UNIX_EPOCH + Duration::from_millis(ms)),
+        }
+    }
+}
+
 pub struct ReplicationStream {
     events: mpsc::Receiver<Delivery>,
     confirmed: Arc<AtomicU64>,
@@ -29,6 +50,7 @@ pub struct ReplicationStream {
     task: JoinHandle<Result<(), ReplicationError>>,
     backend_pid: u32,
     connect_timeout: Duration,
+    clock: StatusClock,
 }
 
 impl ReplicationStream {
@@ -62,11 +84,13 @@ impl ReplicationStream {
         let (sender, events) = mpsc::channel(config.buffer);
         let (stop, stop_requested) = oneshot::channel();
         let (status, status_requests) = mpsc::channel(1);
+        let clock = StatusClock::default();
         let worker = Worker {
             conn,
             confirmed: Arc::clone(&confirmed),
             status_interval: config.status_interval,
             status_requests,
+            clock: clock.clone(),
         };
         let task = tokio::spawn(worker.run(sender, stop_requested));
         Ok(Self {
@@ -77,7 +101,12 @@ impl ReplicationStream {
             task,
             backend_pid,
             connect_timeout: config.connect_timeout,
+            clock,
         })
+    }
+
+    pub fn status_clock(&self) -> StatusClock {
+        self.clock.clone()
     }
 
     pub fn backend_pid(&self) -> u32 {
@@ -133,6 +162,7 @@ struct Worker {
     confirmed: Arc<AtomicU64>,
     status_interval: Duration,
     status_requests: mpsc::Receiver<StatusReply>,
+    clock: StatusClock,
 }
 
 enum Ending {
@@ -237,7 +267,9 @@ impl Worker {
     async fn send_status(&mut self) -> Result<(), ReplicationError> {
         let confirmed = Lsn(self.confirmed.load(Ordering::Acquire));
         status_update(confirmed, pg_time(SystemTime::now()), &mut self.conn.write)?;
-        self.conn.flush().await
+        self.conn.flush().await?;
+        self.clock.record(SystemTime::now());
+        Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<(), ReplicationError> {
@@ -482,5 +514,29 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, ReplicationError::Config(_)), "{error:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_status_clock_records_each_flushed_status_update() {
+        let (stream, mut server) = fake::started(fake::config()).await;
+        let clock = stream.status_clock();
+        server.read_status().await;
+        let first = clock.last_sent().expect("the first status update");
+        assert!(first <= SystemTime::now());
+        let before = clock.clone();
+        stream.send_status().await.unwrap();
+        let second = clock.last_sent().expect("the second status update");
+        assert!(second >= first);
+        assert_eq!(before.last_sent(), Some(second));
+        assert_eq!(stream.status_clock().last_sent(), Some(second));
+    }
+
+    #[test]
+    fn a_status_clock_is_empty_until_the_first_update() {
+        let clock = StatusClock::default();
+        assert_eq!(clock.last_sent(), None);
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_500);
+        clock.record(at);
+        assert_eq!(clock.last_sent(), Some(at));
     }
 }
