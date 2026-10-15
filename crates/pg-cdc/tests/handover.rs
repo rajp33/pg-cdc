@@ -1,0 +1,484 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use pg_cdc_testkit::Postgres;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::process::{Child, Command};
+use tokio::time::{sleep, timeout};
+
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+type Records = Arc<Mutex<Vec<(Instant, Value)>>>;
+type Rows = BTreeSet<(i64, String)>;
+
+const WAIT: Duration = Duration::from_secs(30);
+const POLL: Duration = Duration::from_millis(25);
+const FENCE_DELAY: Duration = Duration::from_millis(4500);
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(7);
+const TAKEOVER_WINDOW: Duration = Duration::from_secs(8);
+const LOSER_QUIET: Duration = Duration::from_secs(3);
+const SLOT: &str = "handover_slot";
+const TOOK_OVER: &str = "took over the slot";
+const STANDBY: &str = "waiting as standby";
+
+struct Deployment {
+    pg: Postgres,
+    config: tempfile::NamedTempFile,
+    state: tempfile::TempDir,
+}
+
+impl Deployment {
+    async fn start() -> TestResult<Self> {
+        let pg = Postgres::start().await?;
+        pg.execute("CREATE TABLE orders (id int PRIMARY KEY, status text)")
+            .await?;
+        pg.create_publication("handover_pub", &["orders"]).await?;
+        pg.create_slot(SLOT).await?;
+        let state = tempfile::tempdir()?;
+        let mut config = tempfile::NamedTempFile::new()?;
+        write!(
+            config,
+            "pipeline: handover\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {SLOT}\n  publication: handover_pub\n  status_interval: 200ms\ndelivery:\n  order_by: key\n  lanes: 4\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: {path}\nleadership:\n  lease_timeout: 4s\n  fence_delay: 4500ms\n  drain_timeout: 1s\nadmin:\n  listen: 127.0.0.1:0\n",
+            host = pg.host(),
+            port = pg.port(),
+            database = pg.database(),
+            user = pg.user(),
+            path = state.path().display(),
+        )?;
+        Ok(Self { pg, config, state })
+    }
+
+    fn spawn(&self) -> TestResult<Task> {
+        Task::spawn(self.config.path(), self.pg.password())
+    }
+
+    fn leader_record(&self) -> TestResult<Value> {
+        leader_record(self.state.path())
+    }
+
+    async fn insert(&self, first: i32, last: i32, status: &str) -> TestResult {
+        self.pg
+            .execute(&format!(
+                "INSERT INTO orders SELECT g, '{status}' FROM generate_series({first}, {last}) g"
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn update(&self, last: i32, status: &str) -> TestResult {
+        self.pg
+            .execute(&format!(
+                "UPDATE orders SET status = '{status}' WHERE id <= {last}"
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn walsender_pid(&self) -> TestResult<Option<i64>> {
+        Ok(self
+            .pg
+            .slot_state(SLOT)
+            .await?
+            .and_then(|state| state.active_pid)
+            .map(i64::from))
+    }
+}
+
+struct Task {
+    child: Child,
+    events: Records,
+    logs: Records,
+}
+
+impl Task {
+    fn spawn(config: &Path, password: &str) -> TestResult<Self> {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pg-cdc"))
+            .arg("run")
+            .arg("--config")
+            .arg(config)
+            .env("PGCDC__SOURCE__CREDENTIALS__PASSWORD", password)
+            .env_remove("PGCDC__ADMIN__LISTEN")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let events = Records::default();
+        let logs = Records::default();
+        collect(child.stdout.take().ok_or("no stdout")?, events.clone());
+        collect(child.stderr.take().ok_or("no stderr")?, logs.clone());
+        Ok(Self {
+            child,
+            events,
+            logs,
+        })
+    }
+
+    fn events(&self) -> TestResult<Vec<(Instant, Value)>> {
+        snapshot(&self.events)
+    }
+
+    fn find_log(&self, message: &str) -> TestResult<Option<Value>> {
+        Ok(snapshot(&self.logs)?
+            .into_iter()
+            .map(|(_, log)| log)
+            .find(|log| log_message(log) == Some(message)))
+    }
+
+    async fn wait_for_log_within(
+        &self,
+        message: &str,
+        within: Duration,
+    ) -> TestResult<Option<Value>> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(log) = self.find_log(message)? {
+                return Ok(Some(log));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            sleep(POLL).await;
+        }
+    }
+
+    async fn wait_for_log(&self, message: &str) -> TestResult<Value> {
+        match self.wait_for_log_within(message, WAIT).await? {
+            Some(log) => Ok(log),
+            None => Err(format!("no {message:?} log within {WAIT:?}").into()),
+        }
+    }
+
+    async fn wait_for_event(
+        &self,
+        wanted: impl Fn(&Value) -> bool,
+    ) -> TestResult<(Instant, Value)> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(found) = self.events()?.into_iter().find(|(_, event)| wanted(event)) {
+                return Ok(found);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("no matching event within {WAIT:?}").into());
+            }
+            sleep(POLL).await;
+        }
+    }
+
+    async fn wait_for_row(&self, id: i64, status: &str) -> TestResult<(Instant, Value)> {
+        self.wait_for_event(|event| row(event) == Some((id, status)))
+            .await
+    }
+
+    async fn admin_addr(&self) -> TestResult<SocketAddr> {
+        let log = self.wait_for_log("admin listening").await?;
+        Ok(log
+            .get("fields")
+            .and_then(|fields| fields.get("addr"))
+            .and_then(Value::as_str)
+            .ok_or("no addr in the admin listening line")?
+            .parse()?)
+    }
+
+    async fn health_ok(&self) -> TestResult<bool> {
+        let addr = self.admin_addr().await?;
+        let output = timeout(
+            WAIT,
+            Command::new(env!("CARGO_BIN_EXE_pg-cdc"))
+                .arg("health")
+                .arg("--addr")
+                .arg(addr.to_string())
+                .env_remove("PGCDC__ADMIN__LISTEN")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await??;
+        Ok(output.status.success())
+    }
+
+    async fn readyz_status(&self) -> TestResult<u16> {
+        let mut socket = TcpStream::connect(self.admin_addr().await?).await?;
+        socket
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: pg-cdc\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = String::new();
+        timeout(WAIT, socket.read_to_string(&mut response)).await??;
+        let status = response
+            .split_whitespace()
+            .nth(1)
+            .ok_or("no status line in the readyz response")?;
+        Ok(status.parse()?)
+    }
+
+    async fn sigterm(&self) -> TestResult {
+        let pid = self.child.id().ok_or("process already exited")?;
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .await?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("kill -TERM failed".into())
+        }
+    }
+
+    async fn sigkill(&mut self) -> TestResult {
+        self.child.start_kill()?;
+        self.child.wait().await?;
+        Ok(())
+    }
+
+    async fn exit(&mut self, within: Duration) -> TestResult<ExitStatus> {
+        Ok(timeout(within, self.child.wait()).await??)
+    }
+
+    fn running(&mut self) -> TestResult<bool> {
+        Ok(self.child.try_wait()?.is_none())
+    }
+}
+
+fn collect<R: AsyncRead + Send + Unpin + 'static>(reader: R, records: Records) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && let Ok(mut records) = records.lock()
+            {
+                records.push((Instant::now(), value));
+            }
+        }
+    });
+}
+
+fn snapshot(records: &Records) -> TestResult<Vec<(Instant, Value)>> {
+    Ok(records
+        .lock()
+        .map_err(|_| "a reader task panicked")?
+        .clone())
+}
+
+fn log_message(log: &Value) -> Option<&str> {
+    log.get("fields")?.get("message")?.as_str()
+}
+
+fn log_field<'a>(log: &'a Value, name: &str) -> Option<&'a Value> {
+    log.get("fields")?.get(name)
+}
+
+fn row(event: &Value) -> Option<(i64, &str)> {
+    let after = event.get("after")?;
+    Some((after.get("id")?.as_i64()?, after.get("status")?.as_str()?))
+}
+
+fn rows(events: &[(Instant, Value)]) -> Rows {
+    events
+        .iter()
+        .filter_map(|(_, event)| row(event))
+        .map(|(id, status)| (id, status.to_owned()))
+        .collect()
+}
+
+fn expected_rows() -> Rows {
+    let statuses = ["one", "two", "three"];
+    (1..=5)
+        .flat_map(|id| statuses.map(|status| (id, status.to_owned())))
+        .chain((6..=10).map(|id| (id, "one".to_owned())))
+        .collect()
+}
+
+async fn wait_for_union(tasks: &[&Task], expected: &Rows) -> TestResult {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let mut delivered = Rows::new();
+        for task in tasks {
+            delivered.extend(rows(&task.events()?));
+        }
+        if delivered.is_superset(expected) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let missing: Vec<_> = expected.difference(&delivered).collect();
+            return Err(format!("events never arrived: {missing:?}").into());
+        }
+        sleep(POLL).await;
+    }
+}
+
+fn assert_key_order(events: &[(Instant, Value)]) -> TestResult {
+    let mut last: BTreeMap<i64, &str> = BTreeMap::new();
+    for (_, event) in events {
+        let key = event
+            .pointer("/key/id")
+            .and_then(Value::as_i64)
+            .ok_or("event without a key id")?;
+        let id = event
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("event without an id")?;
+        if let Some(previous) = last.insert(key, id)
+            && previous >= id
+        {
+            return Err(format!("key {key} went from {previous} to {id}").into());
+        }
+    }
+    Ok(())
+}
+
+fn leader_record(state_dir: &Path) -> TestResult<Value> {
+    let bytes = std::fs::read(state_dir.join("handover").join("leader.json"))?;
+    let file: Value = serde_json::from_slice(&bytes)?;
+    Ok(file
+        .get("record")
+        .ok_or("no record in leader.json")?
+        .clone())
+}
+
+async fn first_takeover(tasks: &[&Task], within: Duration) -> TestResult<usize> {
+    let deadline = Instant::now() + within;
+    loop {
+        for (index, task) in tasks.iter().enumerate() {
+            if task.find_log(TOOK_OVER)?.is_some() {
+                return Ok(index);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("no standby took over within {within:?}").into());
+        }
+        sleep(POLL).await;
+    }
+}
+
+#[tokio::test]
+async fn a_start_first_deploy_hands_over_on_sigterm_without_loss() -> TestResult {
+    let deployment = Deployment::start().await?;
+    let mut a = deployment.spawn()?;
+    let first = a.wait_for_log(TOOK_OVER).await?;
+    assert_eq!(log_field(&first, "kind"), Some(&Value::from("first")));
+    assert_eq!(log_field(&first, "epoch"), Some(&Value::from(1)));
+    deployment.insert(1, 5, "one").await?;
+    for id in 1..=5 {
+        a.wait_for_row(id, "one").await?;
+    }
+    let mut b = deployment.spawn()?;
+    b.wait_for_log(STANDBY).await?;
+    assert!(b.health_ok().await?, "a standby must be healthy");
+    assert_eq!(b.readyz_status().await?, 503);
+    deployment.update(5, "two").await?;
+    a.sigterm().await?;
+    let t_term = Instant::now();
+    deployment.update(5, "three").await?;
+    deployment.insert(6, 10, "one").await?;
+    let status = a.exit(SHUTDOWN_BUDGET).await?;
+    let t_exit = Instant::now();
+    assert!(status.success(), "{status}");
+    assert!(t_exit.duration_since(t_term) < SHUTDOWN_BUDGET);
+    let takeover = b.wait_for_log(TOOK_OVER).await?;
+    assert_eq!(log_field(&takeover, "kind"), Some(&Value::from("clean")));
+    assert_eq!(log_field(&takeover, "epoch"), Some(&Value::from(2)));
+    let (first_event, _) = b.wait_for_event(|_| true).await?;
+    let gap = first_event.saturating_duration_since(t_exit);
+    assert!(gap < FENCE_DELAY, "the handover took {gap:?}");
+    wait_for_union(&[&a, &b], &expected_rows()).await?;
+    let record = deployment.leader_record()?;
+    assert_eq!(record["epoch"], 2);
+    assert_eq!(record["state"], "active");
+    assert_eq!(Some(&record["holder"]), log_field(&takeover, "holder"));
+    b.sigterm().await?;
+    let status = b.exit(SHUTDOWN_BUDGET).await?;
+    assert!(status.success(), "{status}");
+    let released = deployment.leader_record()?;
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["epoch"], 2);
+    let from_b = rows(&b.events()?);
+    for id in 1..=5 {
+        assert!(from_b.contains(&(id, "three".to_owned())), "id {id}");
+    }
+    assert_key_order(&a.events()?)?;
+    assert_key_order(&b.events()?)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn l1_a_crash_takeover_waits_fence_delay_after_sigkill() -> TestResult {
+    let deployment = Deployment::start().await?;
+    let mut a = deployment.spawn()?;
+    let first = a.wait_for_log(TOOK_OVER).await?;
+    assert_eq!(log_field(&first, "epoch"), Some(&Value::from(1)));
+    let mut b = deployment.spawn()?;
+    b.wait_for_log(STANDBY).await?;
+    deployment.insert(1, 1, "one").await?;
+    a.wait_for_row(1, "one").await?;
+    let t_kill = Instant::now();
+    a.sigkill().await?;
+    deployment.insert(2, 2, "one").await?;
+    let takeover = b.wait_for_log(TOOK_OVER).await?;
+    assert_eq!(log_field(&takeover, "kind"), Some(&Value::from("unclean")));
+    assert_eq!(log_field(&takeover, "epoch"), Some(&Value::from(2)));
+    let (first_event, _) = b.wait_for_event(|_| true).await?;
+    let waited = first_event.saturating_duration_since(t_kill);
+    assert!(
+        waited >= FENCE_DELAY,
+        "B delivered {waited:?} after the kill"
+    );
+    b.wait_for_row(2, "one").await?;
+    b.sigterm().await?;
+    let status = b.exit(SHUTDOWN_BUDGET).await?;
+    assert!(status.success(), "{status}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_standby_that_loses_the_race_keeps_polling() -> TestResult {
+    let deployment = Deployment::start().await?;
+    let mut a = deployment.spawn()?;
+    a.wait_for_log(TOOK_OVER).await?;
+    let mut standbys = vec![deployment.spawn()?, deployment.spawn()?];
+    for standby in &standbys {
+        standby.wait_for_log(STANDBY).await?;
+        assert!(standby.health_ok().await?, "a standby must be healthy");
+    }
+    a.sigterm().await?;
+    let status = a.exit(SHUTDOWN_BUDGET).await?;
+    assert!(status.success(), "{status}");
+    let refs: Vec<&Task> = standbys.iter().collect();
+    let winner = first_takeover(&refs, TAKEOVER_WINDOW).await?;
+    let mut winner = standbys.remove(winner);
+    let mut loser = standbys.remove(0);
+    let takeover = winner.wait_for_log(TOOK_OVER).await?;
+    assert_eq!(log_field(&takeover, "kind"), Some(&Value::from("clean")));
+    assert_eq!(log_field(&takeover, "epoch"), Some(&Value::from(2)));
+    sleep(LOSER_QUIET).await;
+    assert!(
+        loser.find_log(TOOK_OVER)?.is_none(),
+        "both standbys took over"
+    );
+    assert!(loser.running()?, "the loser exited");
+    assert!(loser.health_ok().await?, "the loser must stay healthy");
+    let acquired = winner.wait_for_log("acquired the slot").await?;
+    assert_eq!(
+        deployment.walsender_pid().await?,
+        log_field(&acquired, "backend_pid").and_then(Value::as_i64)
+    );
+    winner.sigterm().await?;
+    let status = winner.exit(SHUTDOWN_BUDGET).await?;
+    assert!(status.success(), "{status}");
+    let takeover = loser
+        .wait_for_log_within(TOOK_OVER, TAKEOVER_WINDOW)
+        .await?
+        .ok_or("the loser never took over")?;
+    assert_eq!(log_field(&takeover, "kind"), Some(&Value::from("clean")));
+    assert_eq!(log_field(&takeover, "epoch"), Some(&Value::from(3)));
+    deployment.insert(1, 1, "one").await?;
+    loser.wait_for_row(1, "one").await?;
+    loser.sigterm().await?;
+    let status = loser.exit(SHUTDOWN_BUDGET).await?;
+    assert!(status.success(), "{status}");
+    Ok(())
+}
