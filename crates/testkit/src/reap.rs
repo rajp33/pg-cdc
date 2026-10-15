@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::OnceCell;
@@ -56,31 +58,59 @@ pub(crate) fn created_label() -> (String, String) {
     )
 }
 
+#[derive(Debug)]
+pub(crate) struct StampClaim {
+    _stamp: File,
+}
+
 pub(crate) async fn reap_once() {
     REAPED
         .get_or_init(|| async {
-            let stamp = std::env::temp_dir().join(STAMP_FILE);
-            if claim_stamp(&stamp, SystemTime::now()).await {
+            if let Some(_claim) = claim_stamp(&stamp_path(), SystemTime::now()).await {
                 let _ = reap(REAP_AGE).await;
             }
         })
         .await;
 }
 
-async fn claim_stamp(stamp: &Path, now: SystemTime) -> bool {
-    let fresh = tokio::fs::metadata(stamp)
+fn stamp_path() -> PathBuf {
+    std::env::temp_dir().join(STAMP_FILE)
+}
+
+async fn claim_stamp(stamp: &Path, now: SystemTime) -> Option<StampClaim> {
+    let stamp = stamp.to_path_buf();
+    tokio::task::spawn_blocking(move || claim_stamp_blocking(&stamp, now))
         .await
-        .and_then(|metadata| metadata.modified())
-        .is_ok_and(|modified| {
+        .ok()
+        .flatten()
+}
+
+fn claim_stamp_blocking(stamp: &Path, now: SystemTime) -> Option<StampClaim> {
+    let mut file = open_stamp(stamp).ok()?;
+    file.try_lock().ok()?;
+    let metadata = file.metadata().ok()?;
+    let fresh = metadata.len() > 0
+        && metadata.modified().is_ok_and(|modified| {
             now.duration_since(modified)
                 .is_ok_and(|elapsed| elapsed < STAMP_INTERVAL)
         });
     if fresh {
-        return false;
+        return None;
     }
-    tokio::fs::write(stamp, unix_seconds(now).to_string())
-        .await
-        .is_ok()
+    file.set_len(0).ok()?;
+    file.write_all(unix_seconds(now).to_string().as_bytes())
+        .ok()?;
+    file.set_modified(now).ok()?;
+    Some(StampClaim { _stamp: file })
+}
+
+fn open_stamp(stamp: &Path) -> std::io::Result<File> {
+    File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(stamp)
 }
 
 async fn docker(args: &[&str]) -> Result<String, TestkitError> {
@@ -158,15 +188,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stamp = dir.path().join("reap");
         let now = SystemTime::now();
-        assert!(claim_stamp(&stamp, now).await);
-        assert!(!claim_stamp(&stamp, now + Duration::from_secs(599)).await);
-        assert!(claim_stamp(&stamp, now + Duration::from_secs(601)).await);
+        assert!(claim_stamp(&stamp, now).await.is_some());
+        assert!(
+            claim_stamp(&stamp, now + Duration::from_secs(599))
+                .await
+                .is_none()
+        );
+        assert!(
+            claim_stamp(&stamp, now + Duration::from_secs(601))
+                .await
+                .is_some()
+        );
+    }
+
+    async fn concurrent_claims(stamp: &Path, now: SystemTime) -> usize {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let claims: Vec<_> = (0..16)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let stamp = stamp.to_path_buf();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    claim_stamp(&stamp, now).await.is_some()
+                })
+            })
+            .collect();
+        let mut claimed = 0;
+        for claim in claims {
+            if claim.await.unwrap() {
+                claimed += 1;
+            }
+        }
+        claimed
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn exactly_one_concurrent_caller_claims_an_absent_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("reap");
+        assert_eq!(concurrent_claims(&stamp, SystemTime::now()).await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn exactly_one_concurrent_caller_claims_an_expired_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("reap");
+        let now = SystemTime::now();
+        assert!(claim_stamp(&stamp, now).await.is_some());
+        let later = now + STAMP_INTERVAL + Duration::from_secs(1);
+        assert_eq!(concurrent_claims(&stamp, later).await, 1);
     }
 
     #[tokio::test]
     async fn an_unwritable_stamp_location_does_not_claim() {
         let dir = tempfile::tempdir().unwrap();
         let stamp = dir.path().join("missing").join("reap");
-        assert!(!claim_stamp(&stamp, SystemTime::now()).await);
+        assert!(claim_stamp(&stamp, SystemTime::now()).await.is_none());
     }
 }
