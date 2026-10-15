@@ -174,15 +174,107 @@ mod tests {
     use bytes::Bytes;
     use pg_cdc_decoder::Lsn;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     #[derive(Debug)]
-    struct Collecting(Arc<Mutex<Vec<String>>>);
+    struct Collecting(Arc<Mutex<Vec<(StoreOperation, Duration)>>>);
 
     impl Recorder for Collecting {
         fn record(&self, measurement: Measurement<'_>) {
-            if let Measurement::Store { operation, .. } = measurement {
-                self.0.lock().unwrap().push(operation.as_str().to_owned());
+            if let Measurement::Store { operation, elapsed } = measurement {
+                self.0.lock().unwrap().push((operation, elapsed));
             }
+        }
+    }
+
+    fn recording() -> Arc<Mutex<Vec<(StoreOperation, Duration)>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        crate::metrics::install(Box::new(Collecting(Arc::clone(&seen)))).unwrap();
+        seen
+    }
+
+    #[derive(Debug, Default)]
+    struct Slow {
+        inner: MemoryStateStore,
+        calls: AtomicU64,
+        fail: bool,
+    }
+
+    impl Slow {
+        async fn call<T>(
+            &self,
+            answer: impl Future<Output = Result<T, StoreError>>,
+        ) -> Result<T, StoreError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::time::sleep(Duration::from_millis(10 * call)).await;
+            if self.fail {
+                return Err(StoreError::Unavailable("injected outage".to_owned()));
+            }
+            answer.await
+        }
+    }
+
+    #[async_trait]
+    impl StateStore for Slow {
+        async fn append_parked(&self, events: &[ParkedEvent]) -> Result<(), StoreError> {
+            self.call(self.inner.append_parked(events)).await
+        }
+
+        async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
+            self.call(self.inner.load_parked_heads(partition)).await
+        }
+
+        async fn list_parked_queues(
+            &self,
+            after: Option<&OrderKeyId>,
+            limit: usize,
+            length_cap: usize,
+        ) -> Result<Vec<ParkedHead>, StoreError> {
+            self.call(self.inner.list_parked_queues(after, limit, length_cap))
+                .await
+        }
+
+        async fn read_parked(
+            &self,
+            key: &OrderKeyId,
+            after: Option<&EventId>,
+            limit: usize,
+        ) -> Result<Vec<ParkedEvent>, StoreError> {
+            self.call(self.inner.read_parked(key, after, limit)).await
+        }
+
+        async fn set_parked_status(
+            &self,
+            key: &OrderKeyId,
+            id: &EventId,
+            status: ParkStatus,
+        ) -> Result<(), StoreError> {
+            self.call(self.inner.set_parked_status(key, id, status))
+                .await
+        }
+
+        async fn remove_parked(&self, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError> {
+            self.call(self.inner.remove_parked(events)).await
+        }
+
+        async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
+            self.call(self.inner.read_leader()).await
+        }
+
+        async fn swap_leader(
+            &self,
+            next: &LeaderRecord,
+            expected: Option<&Version>,
+        ) -> Result<SwapOutcome, StoreError> {
+            self.call(self.inner.swap_leader(next, expected)).await
+        }
+    }
+
+    #[async_trait]
+    impl PayloadStore for Slow {
+        async fn put(&self, id: &EventId, body: &[u8]) -> Result<PayloadRef, StoreError> {
+            self.call(Payloads.put(id, body)).await
         }
     }
 
@@ -224,8 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_store_call_records_its_operation_and_duration() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        crate::metrics::install(Box::new(Collecting(Arc::clone(&seen)))).unwrap();
+        let seen = recording();
         let plain = MemoryStateStore::new();
         let state = InstrumentedStateStore::new(Arc::new(plain.clone()));
         let payload = InstrumentedPayloadStore::new(Arc::new(Payloads));
@@ -261,8 +352,14 @@ mod tests {
             plain.read_parked(&key, None, 10).await.unwrap()[0].status,
             ParkStatus::Retrying
         );
+        let operations: Vec<&str> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(operation, _)| operation.as_str())
+            .collect();
         assert_eq!(
-            *seen.lock().unwrap(),
+            operations,
             vec![
                 "append_parked",
                 "load_parked_heads",
@@ -275,5 +372,65 @@ mod tests {
                 "put_payload",
             ]
         );
+    }
+
+    const ALL_OPERATIONS: [StoreOperation; 9] = [
+        StoreOperation::AppendParked,
+        StoreOperation::LoadParkedHeads,
+        StoreOperation::ListParkedQueues,
+        StoreOperation::ReadParked,
+        StoreOperation::SetParkedStatus,
+        StoreOperation::RemoveParked,
+        StoreOperation::ReadLeader,
+        StoreOperation::SwapLeader,
+        StoreOperation::PutPayload,
+    ];
+
+    async fn call_each_operation(inner: &Arc<Slow>) -> Vec<bool> {
+        let state = InstrumentedStateStore::new(inner.clone());
+        let payload = InstrumentedPayloadStore::new(inner.clone());
+        let key = OrderKeyId::of(b"k");
+        let id = EventId::new(Lsn(0x10), 1);
+        vec![
+            state.append_parked(&[event(1)]).await.is_ok(),
+            state.load_parked_heads(key.partition()).await.is_ok(),
+            state.list_parked_queues(None, 10, 10).await.is_ok(),
+            state.read_parked(&key, None, 10).await.is_ok(),
+            state
+                .set_parked_status(&key, &id, ParkStatus::Dead)
+                .await
+                .is_ok(),
+            state.remove_parked(&[(key, id)]).await.is_ok(),
+            state.read_leader().await.is_ok(),
+            state.swap_leader(&leader(), None).await.is_ok(),
+            payload.put(&id, b"abc").await.is_ok(),
+        ]
+    }
+
+    fn timed_in_turn() -> Vec<(StoreOperation, Duration)> {
+        ALL_OPERATIONS
+            .into_iter()
+            .zip(1..)
+            .map(|(operation, turn)| (operation, Duration::from_millis(10 * turn)))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_store_call_records_exactly_its_own_duration() {
+        let seen = recording();
+        let inner = Arc::new(Slow::default());
+        assert_eq!(call_each_operation(&inner).await, vec![true; 9]);
+        assert_eq!(*seen.lock().unwrap(), timed_in_turn());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_store_call_still_records_its_duration() {
+        let seen = recording();
+        let inner = Arc::new(Slow {
+            fail: true,
+            ..Slow::default()
+        });
+        assert_eq!(call_each_operation(&inner).await, vec![false; 9]);
+        assert_eq!(*seen.lock().unwrap(), timed_in_turn());
     }
 }
