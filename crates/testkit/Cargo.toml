@@ -14,15 +14,17 @@ aws-sdk-s3.workspace = true
 aws-sdk-sns.workspace = true
 aws-sdk-sqs.workspace = true
 aws-smithy-http-client.workspace = true
+opentelemetry-proto.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true
 testcontainers.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "process", "rt", "time"] }
+tokio = { workspace = true, features = ["fs", "net", "process", "rt", "time"] }
 tokio-postgres.workspace = true
+tonic.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
