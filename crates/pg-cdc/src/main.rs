@@ -57,12 +57,30 @@ enum Command {
 
 const ADMIN_LISTEN_VARIABLE: &str = "PGCDC__ADMIN__LISTEN";
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match Cli::parse().command {
-        Command::Run { config } => run_command(&config).await,
-        Command::Health { addr } => health_command(addr).await,
-    }
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "pg-cdc: cannot start the runtime: {error}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(async {
+        match cli.command {
+            Command::Run { config } => run_command(&config).await,
+            Command::Health { addr } => health_command(addr).await,
+        }
+    });
+    // Dropping the runtime waits for blocking-pool work, and a write to a full stdout pipe never returns.
+    runtime.shutdown_background();
+    code
 }
 
 async fn health_command(flag: Option<SocketAddr>) -> ExitCode {

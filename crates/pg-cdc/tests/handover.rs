@@ -10,7 +10,7 @@ use pg_cdc_testkit::Postgres;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::{sleep, timeout};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -58,6 +58,10 @@ impl Deployment {
         Task::spawn(self.config.path(), self.pg.password())
     }
 
+    fn spawnunread(&self) -> TestResult<Task> {
+        Task::spawnunread(self.config.path(), self.pg.password())
+    }
+
     fn leader_record(&self) -> TestResult<Value> {
         leader_record(self.state.path())
     }
@@ -94,10 +98,18 @@ struct Task {
     child: Child,
     events: Records,
     logs: Records,
+    unread: Option<ChildStdout>,
 }
 
 impl Task {
     fn spawn(config: &Path, password: &str) -> TestResult<Self> {
+        let mut task = Self::spawnunread(config, password)?;
+        let stdout = task.unread.take().ok_or("no stdout")?;
+        collect(stdout, task.events.clone());
+        Ok(task)
+    }
+
+    fn spawnunread(config: &Path, password: &str) -> TestResult<Self> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_pg-cdc"))
             .arg("run")
             .arg("--config")
@@ -108,14 +120,14 @@ impl Task {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
-        let events = Records::default();
         let logs = Records::default();
-        collect(child.stdout.take().ok_or("no stdout")?, events.clone());
+        let unread = child.stdout.take().ok_or("no stdout")?;
         collect(child.stderr.take().ok_or("no stderr")?, logs.clone());
         Ok(Self {
             child,
-            events,
+            events: Records::default(),
             logs,
+            unread: Some(unread),
         })
     }
 
@@ -480,5 +492,29 @@ async fn a_standby_that_loses_the_race_keeps_polling() -> TestResult {
     loser.sigterm().await?;
     let status = loser.exit(SHUTDOWN_BUDGET).await?;
     assert!(status.success(), "{status}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sigterm_with_a_full_stdout_pipe_still_exits_within_the_budget() -> TestResult {
+    let deployment = Deployment::start().await?;
+    let mut a = deployment.spawnunread()?;
+    a.wait_for_log(TOOK_OVER).await?;
+    deployment
+        .pg
+        .execute("INSERT INTO orders SELECT g, repeat('x', 20000) FROM generate_series(1, 40) g")
+        .await?;
+    sleep(Duration::from_secs(1)).await;
+
+    a.sigterm().await?;
+    let t_term = Instant::now();
+    let status = a.exit(SHUTDOWN_BUDGET).await?;
+
+    assert!(status.success(), "{status}");
+    assert!(t_term.elapsed() < SHUTDOWN_BUDGET, "{:?}", t_term.elapsed());
+    assert!(a.find_log("pg-cdc stopped cleanly")?.is_some());
+    let record = deployment.leader_record()?;
+    assert_eq!(record["state"], "active");
+    assert_eq!(record["epoch"], 1);
     Ok(())
 }
