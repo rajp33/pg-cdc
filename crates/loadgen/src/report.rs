@@ -116,10 +116,27 @@ fn grouped(count: u64) -> String {
 fn drained(drain: &Value) -> Option<String> {
     let remaining = bytes(drain, &["remaining_events"])?;
     let watched = number(drain, &["to_s"])? - number(drain, &["from_s"])?;
-    if remaining == 0 {
+    let complete = drain
+        .get("complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(remaining == 0);
+    if complete {
         return Some(format!(
-            "parked events drained within {watched:.0} s after writes stopped"
+            "drain complete: no parked keys and lag under 16 MiB {watched:.0} s after writes stopped"
         ));
+    }
+    let limit = number(drain, &["deadline_s"]).unwrap_or(watched);
+    let progress = draining(drain, remaining, watched);
+    Some(format!(
+        "drain incomplete at the {limit:.0} s limit: {progress}"
+    ))
+}
+
+fn draining(drain: &Value, remaining: u64, watched: f64) -> String {
+    if remaining == 0 {
+        return format!(
+            "no events parked but lag not yet under 16 MiB {watched:.0} s after writes stopped"
+        );
     }
     let parked = format!(
         "{} events still parked {watched:.0} s after writes stopped",
@@ -127,10 +144,10 @@ fn drained(drain: &Value) -> Option<String> {
     );
     let rate = number(drain, &["events_per_s"]);
     if let Some(rising) = rate.filter(|rate| *rate <= 0.0) {
-        return Some(format!(
+        return format!(
             "{parked} and still rising ({:.1} events/s), so no drain rate was measured",
             -rising
-        ));
+        );
     }
     let rate = rate.map_or_else(
         || "an unmeasured rate".to_owned(),
@@ -140,7 +157,7 @@ fn drained(drain: &Value) -> Option<String> {
         || "no projected end".to_owned(),
         |projected| format!("about {:.0} min more", projected / 60.0),
     );
-    Some(format!("{parked}, draining {rate}, {rest}"))
+    format!("{parked}, draining {rate}, {rest}")
 }
 
 fn throughput(report: &Value) -> Option<Measurement> {
@@ -333,6 +350,7 @@ mod tests {
                 "remaining_keys": 990,
                 "events_per_s": 20.0,
                 "projected_s": 4_820.0,
+                "complete": false,
             },
             "criterion_3": "pass",
         })
@@ -458,7 +476,7 @@ mod tests {
         assert!(cells(&table, "3")[2].contains("2.5 MiB"), "{table}");
         assert!(
             cells(&table, "3")[2].contains(
-                "96,400 events still parked 180 s after writes stopped, draining 20.0 events/s, about 80 min more"
+                "drain incomplete at the 180 s limit: 96,400 events still parked 180 s after writes stopped, draining 20.0 events/s, about 80 min more"
             ),
             "{table}"
         );
@@ -523,7 +541,7 @@ mod tests {
         let row = cells(&summary_table(&[report]), "3");
         assert!(
             row[2].contains(
-                "74,135 events still parked 180 s after writes stopped and still rising (179.4 events/s), so no drain rate was measured"
+                "drain incomplete at the 180 s limit: 74,135 events still parked 180 s after writes stopped and still rising (179.4 events/s), so no drain rate was measured"
             ),
             "{row:?}"
         );
@@ -533,9 +551,21 @@ mod tests {
         emptied["drain"]["remaining_keys"] = json!(0);
         emptied["drain"]["to_s"] = json!(212.0);
         emptied["drain"]["projected_s"] = json!(0.0);
+        emptied["drain"]["complete"] = json!(true);
+        let row = cells(&summary_table(&[emptied.clone()]), "3");
+        assert!(
+            row[2].contains(
+                "drain complete: no parked keys and lag under 16 MiB 62 s after writes stopped"
+            ),
+            "{row:?}"
+        );
+
+        emptied["drain"]["complete"] = json!(false);
         let row = cells(&summary_table(&[emptied]), "3");
         assert!(
-            row[2].contains("parked events drained within 62 s after writes stopped"),
+            row[2].contains(
+                "drain incomplete at the 180 s limit: no events parked but lag not yet under 16 MiB 62 s after writes stopped"
+            ),
             "{row:?}"
         );
     }

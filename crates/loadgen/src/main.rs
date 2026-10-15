@@ -53,6 +53,8 @@ struct LoadArgs {
     topic_arn: Option<String>,
     #[arg(long, requires = "topic_arn")]
     real_aws: bool,
+    #[arg(long, default_value = "3m", value_parser = parse_duration)]
+    drain_limit: Duration,
 }
 
 #[derive(Debug, Args)]
@@ -148,6 +150,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                     report_dir: args.report_dir,
                     topic_arn: args.topic_arn,
                     real_aws: args.real_aws,
+                    drain_limit: args.drain_limit,
                 },
             )
             .await?;

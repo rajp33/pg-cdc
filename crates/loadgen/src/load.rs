@@ -31,6 +31,7 @@ pub struct LoadOptions {
     pub report_dir: PathBuf,
     pub topic_arn: Option<String>,
     pub real_aws: bool,
+    pub drain_limit: std::time::Duration,
 }
 
 const EVERY_SCENARIO: [Scenario; 7] = [

@@ -32,7 +32,8 @@ const PARK_AFTER_CONFIG: &str = "5s";
 const MAX_INFLIGHT: &str = "64MiB";
 const MAX_INFLIGHT_BYTES: u64 = 64 * 1024 * 1024;
 const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
-const DRAIN_DEADLINE: Duration = Duration::from_mins(3);
+#[cfg(test)]
+const DEFAULT_DRAIN_LIMIT: Duration = Duration::from_mins(3);
 const PARKED_PREFIX: &str = "load/load/parked/";
 const LIST_PROBE_PERIOD: Duration = Duration::from_secs(30);
 const CEILING_BUCKET: &str = "outage-ceiling";
@@ -390,6 +391,7 @@ fn finished(
     write_window: Option<Duration>,
     writer_done: bool,
     elapsed: Duration,
+    limit: Duration,
 ) -> bool {
     let Some(stopped) = write_window else {
         return false;
@@ -398,7 +400,7 @@ fn finished(
         && samples
             .last()
             .is_some_and(|last| last.t_s >= OUTAGE_END.as_secs_f64() && caught_up(last));
-    caught_up || elapsed >= stopped + DRAIN_DEADLINE
+    caught_up || elapsed >= stopped + limit
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -410,9 +412,10 @@ struct Drain {
     remaining_keys: u64,
     events_per_s: Option<f64>,
     projected_s: Option<f64>,
+    complete: bool,
 }
 
-fn drain(samples: &[Sample], from_s: f64) -> Drain {
+fn drain(samples: &[Sample], from_s: f64, limit: Duration) -> Drain {
     let last = samples.last().filter(|last| last.t_s >= from_s);
     let remaining_events = last.map_or(0, |last| last.parked_events);
     let events_per_s = drain_rate(samples, from_s);
@@ -422,17 +425,18 @@ fn drain(samples: &[Sample], from_s: f64) -> Drain {
         _ => None,
     };
     Drain {
-        deadline_s: DRAIN_DEADLINE.as_secs_f64(),
+        deadline_s: limit.as_secs_f64(),
         from_s,
         to_s: last.map_or(from_s, |last| last.t_s),
         remaining_events,
         remaining_keys: last.map_or(0, |last| last.parked_keys),
         events_per_s,
         projected_s,
+        complete: last.is_some_and(caught_up),
     }
 }
 
-async fn drive(fixture: &Fixture, kind: Kind) -> anyhow::Result<Driven> {
+async fn drive(fixture: &Fixture, kind: Kind, limit: Duration) -> anyhow::Result<Driven> {
     let writer_client = fixture.bench.postgres.client().await?;
     let probe = fixture.bench.postgres.client().await?;
     let stop = CancellationToken::new();
@@ -490,7 +494,7 @@ async fn drive(fixture: &Fixture, kind: Kind) -> anyhow::Result<Driven> {
                 });
             }
         }
-        if finished(&samples, write_window, writer.is_finished(), elapsed) {
+        if finished(&samples, write_window, writer.is_finished(), elapsed, limit) {
             break;
         }
     }
@@ -584,6 +588,7 @@ fn report(
     fixture: &Fixture,
     driven: Driven,
     moto_put_ceiling: PutCeiling,
+    limit: Duration,
 ) -> anyhow::Result<Report> {
     let steps = schedule(kind);
     let phases = phases(&steps, PARK_AFTER);
@@ -629,7 +634,7 @@ fn report(
                 Some(moto_put_ceiling.puts_per_s),
             )
         }),
-        drain: drain(&driven.samples, window.as_secs_f64()),
+        drain: drain(&driven.samples, window.as_secs_f64(), limit),
         list_probes: driven.list_probes,
         moto_put_ceiling,
         peaks,
@@ -639,10 +644,10 @@ fn report(
 
 async fn run_kind(kind: Kind, options: &LoadOptions) -> anyhow::Result<()> {
     let mut fixture = start(options, kind).await?;
-    let driven = drive(&fixture, kind).await?;
+    let driven = drive(&fixture, kind, options.drain_limit).await?;
     let stopped = rig::stop(&mut fixture.process).await?;
     let ceiling = moto_put_ceiling(&fixture).await?;
-    let report = report(kind, &fixture, driven, ceiling)?;
+    let report = report(kind, &fixture, driven, ceiling, options.drain_limit)?;
     for phase in &report.phases {
         writeln!(
             std::io::stdout(),
@@ -668,8 +673,14 @@ async fn run_kind(kind: Kind, options: &LoadOptions) -> anyhow::Result<()> {
     )?;
     writeln!(
         std::io::stdout(),
-        "load {}: {} events on {} keys still parked {:.0} s after the writer stopped, parked events falling at {:?} events/s (negative while still rising), projected {:?} s more to drain",
+        "load {}: drain {} at the {:.0} s limit: {} events on {} keys still parked {:.0} s after the writer stopped, parked events falling at {:?} events/s (negative while still rising), projected {:?} s more to drain",
         kind.name(),
+        if report.drain.complete {
+            "complete"
+        } else {
+            "incomplete"
+        },
+        report.drain.deadline_s,
         report.drain.remaining_events,
         report.drain.remaining_keys,
         report.drain.to_s - report.drain.from_s,
@@ -924,16 +935,22 @@ mod tests {
     }
 
     #[test]
-    fn the_run_ends_three_minutes_after_the_writer_stops_or_once_caught_up() {
+    fn the_run_ends_at_the_drain_limit_after_the_writer_stops_or_once_caught_up() {
+        let limit = DEFAULT_DRAIN_LIMIT;
         let backlog = [at_second(150, 0, 100_000, 1_000, 0)];
-        assert!(!finished(&backlog, None, false, at(400)));
-        assert!(!finished(&backlog, Some(at(150)), true, at(329)));
-        assert!(finished(&backlog, Some(at(150)), true, at(330)));
-        assert!(finished(&backlog, Some(at(150)), false, at(330)));
+        assert!(!finished(&backlog, None, false, at(400), limit));
+        assert!(!finished(&backlog, Some(at(150)), true, at(329), limit));
+        assert!(finished(&backlog, Some(at(150)), true, at(330), limit));
+        assert!(finished(&backlog, Some(at(150)), false, at(330), limit));
         let drained = [at_second(160, 0, 0, 0, 1_000)];
-        assert!(finished(&drained, Some(at(150)), true, at(160)));
-        assert!(!finished(&drained, Some(at(150)), false, at(160)));
-        assert!(!finished(&drained, None, true, at(160)));
+        assert!(finished(&drained, Some(at(150)), true, at(160), limit));
+        assert!(!finished(&drained, Some(at(150)), false, at(160), limit));
+        assert!(!finished(&drained, None, true, at(160), limit));
+
+        let hours = at(7_200);
+        assert!(!finished(&backlog, Some(at(150)), true, at(330), hours));
+        assert!(!finished(&backlog, Some(at(150)), true, at(7_349), hours));
+        assert!(finished(&backlog, Some(at(150)), true, at(7_350), hours));
     }
 
     #[test]
@@ -945,7 +962,7 @@ mod tests {
             at_second(330, 0, 96_400, 990, 0),
         ];
         assert_eq!(
-            drain(&samples, 150.0),
+            drain(&samples, 150.0, DEFAULT_DRAIN_LIMIT),
             Drain {
                 deadline_s: 180.0,
                 from_s: 150.0,
@@ -954,18 +971,29 @@ mod tests {
                 remaining_keys: 990,
                 events_per_s: Some(20.0),
                 projected_s: Some(4_820.0),
+                complete: false,
             }
         );
+        assert_eq!(drain(&samples, 150.0, at(3_600)).deadline_s, 3_600.0);
 
         let growing = [at_second(150, 0, 100, 10, 0), at_second(160, 0, 200, 10, 0)];
-        let grew = drain(&growing, 150.0);
+        let grew = drain(&growing, 150.0, DEFAULT_DRAIN_LIMIT);
         assert_eq!(grew.events_per_s, Some(-10.0));
         assert_eq!(grew.projected_s, None);
 
+        assert!(!grew.complete);
+
         let emptied = [at_second(150, 0, 100, 10, 0), at_second(160, 0, 0, 0, 0)];
-        assert_eq!(drain(&emptied, 150.0).projected_s, Some(0.0));
+        let caught_up = drain(&emptied, 150.0, DEFAULT_DRAIN_LIMIT);
+        assert_eq!(caught_up.projected_s, Some(0.0));
+        assert!(caught_up.complete);
+        let lagging = [
+            at_second(150, 0, 100, 10, 0),
+            at_second(160, 0, 0, 0, 20_000_000),
+        ];
+        assert!(!drain(&lagging, 150.0, DEFAULT_DRAIN_LIMIT).complete);
         assert_eq!(
-            drain(&[], 150.0),
+            drain(&[], 150.0, DEFAULT_DRAIN_LIMIT),
             Drain {
                 deadline_s: 180.0,
                 from_s: 150.0,
@@ -974,6 +1002,7 @@ mod tests {
                 remaining_keys: 0,
                 events_per_s: None,
                 projected_s: None,
+                complete: false,
             }
         );
     }
