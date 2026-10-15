@@ -166,7 +166,7 @@ fn sample(
         t_s: elapsed.as_secs_f64(),
         parked_puts: counts.parked_puts,
         parked_stored: counts.parked_stored,
-        parked_removed: counts.parked_deletes,
+        parked_removed: counts.parked_removed,
         parked_events: count("events"),
         parked_keys: count("keys"),
         inflight_bytes,
@@ -797,7 +797,8 @@ mod tests {
                 &ProxyCounts {
                     parked_puts: 40,
                     parked_stored: 31,
-                    parked_deletes: 9,
+                    parked_deletes: 12,
+                    parked_removed: 9,
                     ..ProxyCounts::default()
                 },
                 0x1000 + 600

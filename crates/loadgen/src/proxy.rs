@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,6 +23,7 @@ const S3_ERROR_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Error><Cod
 const SNS_ERROR_BODY: &str = "<ErrorResponse><Error><Type>Receiver</Type><Code>InternalFailure</Code><Message>chaos</Message></Error></ErrorResponse>";
 
 type TapFn = dyn Fn(&[u8], &[u8]) + Send + Sync;
+type RemovedFn = dyn Fn(&str) + Send + Sync;
 type OrderGroups = fn(&[u8]) -> Vec<String>;
 
 #[derive(Clone)]
@@ -106,6 +107,7 @@ pub struct ProxyCounts {
     pub parked_puts: u64,
     pub parked_stored: u64,
     pub parked_deletes: u64,
+    pub parked_removed: u64,
     pub publishes: u64,
 }
 
@@ -139,6 +141,8 @@ impl FaultProxy {
             counters: Counters::default(),
             tap,
             turns: Mutex::default(),
+            removed: Mutex::default(),
+            on_removed: OnceLock::new(),
         });
         let server = tokio::spawn(accept_loop(listener, Arc::clone(&shared)));
         Ok(Self {
@@ -160,6 +164,10 @@ impl FaultProxy {
     pub fn counts(&self) -> ProxyCounts {
         self.shared.counters.snapshot()
     }
+
+    pub fn on_parked_removed(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        let _ = self.shared.on_removed.set(RemovedHook(Box::new(hook)));
+    }
 }
 
 impl Drop for FaultProxy {
@@ -177,6 +185,16 @@ struct Shared {
     counters: Counters,
     tap: Option<Tap>,
     turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    removed: Mutex<HashSet<String>>,
+    on_removed: OnceLock<RemovedHook>,
+}
+
+struct RemovedHook(Box<RemovedFn>);
+
+impl fmt::Debug for RemovedHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RemovedHook")
+    }
 }
 
 impl Shared {
@@ -194,6 +212,7 @@ struct Counters {
     parked_puts: AtomicU64,
     parked_stored: AtomicU64,
     parked_deletes: AtomicU64,
+    parked_removed: AtomicU64,
     publishes: AtomicU64,
 }
 
@@ -207,6 +226,7 @@ impl Counters {
             parked_puts: self.parked_puts.load(Ordering::Relaxed),
             parked_stored: self.parked_stored.load(Ordering::Relaxed),
             parked_deletes: self.parked_deletes.load(Ordering::Relaxed),
+            parked_removed: self.parked_removed.load(Ordering::Relaxed),
             publishes: self.publishes.load(Ordering::Relaxed),
         }
     }
@@ -252,6 +272,7 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
     let body = body.collect().await.map_err(|_| Dropped)?.to_bytes();
     record_request(&shared, &parts, &body);
     let parked_put = is_parked_put(&parts);
+    let removals = parked_removals(&parts, &body);
     let faults = *shared.faults.borrow();
 
     if faults.mode == Mode::Outage {
@@ -277,6 +298,9 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
     bump(&shared.counters.forwarded);
     if parked_put && reply.status().is_success() {
         bump(&shared.counters.parked_stored);
+    }
+    if reply.status().is_success() && !removals.is_empty() {
+        confirm_removed(&shared, removals, &reply_body);
     }
     if let Some(tap) = &shared.tap
         && reply.status().is_success()
@@ -319,6 +343,59 @@ fn record_request(shared: &Shared, parts: &request::Parts, body: &Bytes) {
     }
     if shared.kind == Upstream::Sns && contains(body, b"Action=Publish") {
         bump(&counters.publishes);
+    }
+}
+
+fn parked_name(object: &str) -> Option<String> {
+    object
+        .split_once("/parked/")
+        .map(|(_, name)| name.to_owned())
+}
+
+fn tagged<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    text.split(open.as_str())
+        .skip(1)
+        .filter_map(|rest| rest.split_once(close.as_str()))
+        .map(|(inner, _)| inner)
+        .collect()
+}
+
+fn parked_removals(parts: &request::Parts, body: &Bytes) -> Vec<String> {
+    if parts.method == Method::DELETE {
+        return parked_name(parts.uri.path()).into_iter().collect();
+    }
+    if !is_batch_delete(parts) {
+        return Vec::new();
+    }
+    tagged(&String::from_utf8_lossy(body), "Key")
+        .into_iter()
+        .filter_map(parked_name)
+        .collect()
+}
+
+fn confirm_removed(shared: &Shared, removals: Vec<String>, reply: &[u8]) {
+    let reply = String::from_utf8_lossy(reply);
+    let failed: HashSet<String> = tagged(&reply, "Error")
+        .into_iter()
+        .flat_map(|error| tagged(error, "Key"))
+        .filter_map(parked_name)
+        .collect();
+    let fresh: Vec<String> = {
+        let mut removed = shared
+            .removed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        removals
+            .into_iter()
+            .filter(|name| !failed.contains(name) && removed.insert(name.clone()))
+            .collect()
+    };
+    for name in fresh {
+        bump(&shared.counters.parked_removed);
+        if let Some(hook) = shared.on_removed.get() {
+            (hook.0)(&name);
+        }
     }
 }
 
@@ -795,6 +872,145 @@ mod tests {
         assert_eq!(proxy.counts().parked_deletes, 2);
     }
 
+    async fn deleting_upstream() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| async move {
+                        let path = request.uri().path().to_owned();
+                        let body = request.into_body().collect().await.unwrap().to_bytes();
+                        let body = String::from_utf8(body.to_vec()).unwrap();
+                        let errors: String = tagged(&body, "Key")
+                            .into_iter()
+                            .filter(|key| key.contains("bad"))
+                            .flat_map(|key| {
+                                [
+                                    "<Error><Key>",
+                                    key,
+                                    "</Key><Code>InternalError</Code></Error>",
+                                ]
+                            })
+                            .collect();
+                        let status = if path.contains("broken") {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::OK
+                        };
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::from(format!(
+                                    "<DeleteResult>{errors}</DeleteResult>"
+                                ))))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn only_parked_objects_the_upstream_removed_count_as_removed_and_each_once() {
+        let proxy = FaultProxy::start(deleting_upstream().await, Upstream::S3, 1)
+            .await
+            .unwrap();
+        let heard: Arc<Mutex<Vec<String>>> = Arc::default();
+        proxy.on_parked_removed({
+            let heard = Arc::clone(&heard);
+            move |name| heard.lock().unwrap().push(name.to_owned())
+        });
+        let parked = |name: &str| format!("/bucket/pre/p/parked/{name}");
+        let removed = || (proxy.counts().parked_removed, heard.lock().unwrap().clone());
+
+        for faults in [
+            Faults {
+                mode: Mode::Outage,
+                ..Faults::HEALTHY
+            },
+            Faults {
+                error_rate: 1.0,
+                ..Faults::HEALTHY
+            },
+        ] {
+            proxy.set(faults);
+            assert_eq!(
+                answer(&proxy, Method::DELETE, &parked("k/1.json")).await.0,
+                503
+            );
+        }
+        proxy.set(Faults::HEALTHY);
+        assert_eq!(
+            answer(&proxy, Method::DELETE, &parked("broken/1.json"))
+                .await
+                .0,
+            500
+        );
+        assert_eq!(removed(), (0, vec![]));
+
+        assert_eq!(
+            answer(&proxy, Method::DELETE, &parked("k/1.json")).await.0,
+            200
+        );
+        assert_eq!(removed(), (1, vec!["k/1.json".to_owned()]));
+
+        proxy.set(Faults {
+            error_after_forward_rate: 1.0,
+            ..Faults::HEALTHY
+        });
+        assert_eq!(
+            answer(&proxy, Method::DELETE, &parked("k/2.json")).await.0,
+            503
+        );
+        proxy.set(Faults::HEALTHY);
+        assert_eq!(
+            answer(&proxy, Method::DELETE, &parked("k/2.json")).await.0,
+            200
+        );
+        assert_eq!(
+            answer(&proxy, Method::DELETE, "/bucket/pre/p/leader.json")
+                .await
+                .0,
+            200
+        );
+        assert_eq!(
+            removed(),
+            (2, vec!["k/1.json".to_owned(), "k/2.json".to_owned()])
+        );
+
+        let batch = "<Delete><Quiet>true</Quiet><Object><Key>pre/p/parked/k/3.json</Key></Object><Object><Key>pre/p/parked/k/bad.json</Key></Object><Object><Key>pre/p/parked/k/1.json</Key></Object><Object><Key>pre/p/other.json</Key></Object></Delete>";
+        call(&proxy, Method::POST, "/bucket?delete", batch)
+            .await
+            .unwrap();
+        call(
+            &proxy,
+            Method::POST,
+            "/broken?delete",
+            "<Delete><Object><Key>pre/p/parked/k/4.json</Key></Object></Delete>",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            removed(),
+            (
+                3,
+                vec![
+                    "k/1.json".to_owned(),
+                    "k/2.json".to_owned(),
+                    "k/3.json".to_owned()
+                ]
+            )
+        );
+        assert_eq!(proxy.counts().parked_deletes, 10);
+    }
+
     #[tokio::test]
     async fn the_proxy_forwards_delays_fails_and_resets_as_told() {
         let (upstream_addr, seen) = upstream().await;
@@ -884,6 +1100,7 @@ mod tests {
                 parked_puts: 1,
                 parked_stored: 1,
                 parked_deletes: 1,
+                parked_removed: 0,
                 publishes: 0,
             }
         );
