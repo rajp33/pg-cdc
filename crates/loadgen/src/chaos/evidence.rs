@@ -5,7 +5,7 @@ use std::sync::{Mutex, PoisonError};
 use anyhow::Context as _;
 use aws_sdk_s3::error::DisplayErrorContext;
 
-use crate::checker::{Observed, delivery_from_envelope, observed_from_message};
+use crate::checker::{Observed, change_from_envelope, observed_from_message};
 
 pub const SAMPLE_LIMIT: usize = 5;
 pub const SAMPLE_BYTES: usize = 200;
@@ -238,8 +238,8 @@ pub fn parked_seq(name: &str, bytes: &[u8]) -> anyhow::Result<i64> {
         .with_context(|| format!("parked object {name} is not JSON"))?;
     object
         .get("envelope")
-        .and_then(delivery_from_envelope)
-        .map(|delivery| delivery.seq)
+        .and_then(change_from_envelope)
+        .map(|change| change.seq)
         .with_context(|| format!("parked object {name} has no envelope with a seq"))
 }
 
@@ -275,32 +275,43 @@ pub async fn read_stored(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checker::Delivery;
+    use crate::checker::{Delivery, EventId};
+
+    fn delivery(seq: i64, key: i32) -> Observed {
+        Observed::Delivered(Delivery {
+            seq,
+            key,
+            id: EventId::new(u64::try_from(seq).unwrap(), 0),
+        })
+    }
 
     #[test]
     fn messages_become_observations_in_arrival_order_and_unknown_ones_are_counted() {
         let observations = Observations::default();
-        observations.record(r#"{"id":"e1","key":{"id":7},"after":{"seq":3}}"#);
+        observations
+            .record(r#"{"id":"0000000000000003-00000000","key":{"id":7},"after":{"seq":3}}"#);
         observations.record(r#"{"loadgen_discard":{"token":9,"key":7,"seq":3}}"#);
-        observations.record(r#"{"id":"e2","key":{"id":8},"before":{"seq":4}}"#);
+        observations
+            .record(r#"{"id":"0000000000000004-00000000","key":{"id":8},"before":{"seq":4}}"#);
         assert_eq!(
             observations.snapshot(),
             [
-                Observed::Delivered(Delivery { seq: 3, key: 7 }),
+                delivery(3, 7),
                 Observed::DiscardMarker {
                     token: 9,
                     key: 7,
                     seq: 3
                 },
-                Observed::Delivered(Delivery { seq: 4, key: 8 }),
+                delivery(4, 8),
             ]
         );
         assert_eq!(observations.unrecognized(), Vec::<String>::new());
 
         observations.record("not json at all");
         observations.record(r#"{"pointer":"s3://bucket/key"}"#);
+        observations.record(r#"{"id":"e5","key":{"id":7},"after":{"seq":5}}"#);
         let unrecognized = observations.unrecognized();
-        assert_eq!(unrecognized.len(), 2);
+        assert_eq!(unrecognized.len(), 3);
         assert!(
             unrecognized
                 .iter()
@@ -432,7 +443,9 @@ mod tests {
     }
 
     fn envelope(key: i32, seq: i64) -> String {
-        format!("%7B%22key%22%3A%7B%22id%22%3A{key}%7D%2C%22after%22%3A%7B%22seq%22%3A{seq}%7D%7D")
+        format!(
+            "%7B%22id%22%3A%22{seq:016x}-00000000%22%2C%22key%22%3A%7B%22id%22%3A{key}%7D%2C%22after%22%3A%7B%22seq%22%3A{seq}%7D%7D"
+        )
     }
 
     #[test]
@@ -457,14 +470,14 @@ mod tests {
         assert_eq!(
             observations.snapshot(),
             [
-                Observed::Delivered(Delivery { seq: 1, key: 7 }),
-                Observed::Delivered(Delivery { seq: 2, key: 7 }),
+                delivery(1, 7),
+                delivery(2, 7),
                 Observed::DiscardMarker {
                     token: 5,
                     key: 7,
                     seq: 2
                 },
-                Observed::Delivered(Delivery { seq: 3, key: 7 }),
+                delivery(3, 7),
             ]
         );
         assert_eq!(observations.unrecognized_count(), 0);

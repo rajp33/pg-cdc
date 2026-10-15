@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use crate::chaos::Unresolved;
-use crate::checker::delivery_from_envelope;
+use crate::checker::change_from_envelope;
 use crate::cluster::{ParkedOutput, PgCdc};
 
 const REFUSALS: [u16; 3] = [404, 409, 503];
@@ -73,11 +73,11 @@ pub fn dead_head(shown: &str) -> Option<DeadHead> {
     if head.get("status")?.as_str()? != "dead" {
         return None;
     }
-    let delivery = delivery_from_envelope(head.get("envelope")?)?;
+    let change = change_from_envelope(head.get("envelope")?)?;
     Some(DeadHead {
         id: head.get("id")?.as_str()?.to_owned(),
-        key: delivery.key,
-        seq: delivery.seq,
+        key: change.key,
+        seq: change.seq,
     })
 }
 

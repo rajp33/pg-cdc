@@ -142,7 +142,7 @@ pub fn missing_takeovers(kinds: &BTreeMap<String, u64>) -> Vec<String> {
 fn summary(report: &ChaosReport) -> String {
     let verdict = &report.verdict;
     format!(
-        "chaos seed={} duration={}s verdict={} committed={} delivered={} duplicates={} stored={} retained={} discarded={} takeovers={} clean={} unclean={} redrives={} discards={} missing={} phantoms={} out_of_order={}",
+        "chaos seed={} duration={}s verdict={} committed={} delivered={} duplicates={} stored={} retained={} discarded={} takeovers={} clean={} unclean={} redrives={} discards={} missing={} phantoms={} out_of_order={} id_violations={}",
         report.seed,
         report.duration_s,
         if verdict.passed() { "pass" } else { "fail" },
@@ -160,6 +160,7 @@ fn summary(report: &ChaosReport) -> String {
         verdict.missing.len(),
         verdict.phantoms.len(),
         verdict.out_of_order.len(),
+        verdict.id_violations.len(),
     )
 }
 
@@ -206,7 +207,7 @@ pub async fn run(options: &ChaosOptions) -> anyhow::Result<ChaosReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checker::Delivery;
+    use crate::checker::{Delivery, EventId};
     use crate::workload::Change;
 
     #[test]
@@ -257,7 +258,11 @@ mod tests {
     }
 
     fn delivered(seq: i64) -> Observed {
-        Observed::Delivered(Delivery { seq, key: 1 })
+        Observed::Delivered(Delivery {
+            seq,
+            key: 1,
+            id: EventId::new(u64::try_from(seq).unwrap(), 0),
+        })
     }
 
     #[test]

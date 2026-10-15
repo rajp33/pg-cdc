@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 use serde::Serialize;
 
@@ -6,10 +7,46 @@ use crate::workload::Change;
 
 const DISCARD_FIELD: &str = "loadgen_discard";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventId {
+    commit_lsn: u64,
+    ordinal: u32,
+}
+
+impl EventId {
+    pub fn new(commit_lsn: u64, ordinal: u32) -> Self {
+        Self {
+            commit_lsn,
+            ordinal,
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let (lsn, ordinal) = text.split_once('-')?;
+        let hex = |digits: &str, width: usize| {
+            digits.len() == width && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+        };
+        if !hex(lsn, 16) || !hex(ordinal, 8) {
+            return None;
+        }
+        Some(Self::new(
+            u64::from_str_radix(lsn, 16).ok()?,
+            u32::from_str_radix(ordinal, 16).ok()?,
+        ))
+    }
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:016x}-{:08x}", self.commit_lsn, self.ordinal)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Delivery {
     pub seq: i64,
     pub key: i32,
+    pub id: EventId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +73,14 @@ pub struct OrderViolation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IdViolation {
+    pub seq: i64,
+    pub id: String,
+    pub against_seq: i64,
+    pub against_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Verdict {
     pub committed: usize,
     pub delivered: usize,
@@ -46,11 +91,15 @@ pub struct Verdict {
     pub missing: Vec<i64>,
     pub phantoms: Vec<i64>,
     pub out_of_order: Vec<OrderViolation>,
+    pub id_violations: Vec<IdViolation>,
 }
 
 impl Verdict {
     pub fn passed(&self) -> bool {
-        self.missing.is_empty() && self.phantoms.is_empty() && self.out_of_order.is_empty()
+        self.missing.is_empty()
+            && self.phantoms.is_empty()
+            && self.out_of_order.is_empty()
+            && self.id_violations.is_empty()
     }
 }
 
@@ -99,7 +148,41 @@ pub fn check(evidence: &Evidence) -> Verdict {
         missing: missing.into_iter().collect(),
         phantoms: misrouted.into_iter().collect(),
         out_of_order: order_violations(evidence, &expected, &written),
+        id_violations: id_violations(evidence, &written),
     }
+}
+
+fn id_violations(evidence: &Evidence, written: &Written<'_>) -> Vec<IdViolation> {
+    let violation = |seq: i64, id: EventId, against_seq: i64, against_id: EventId| IdViolation {
+        seq,
+        id: id.to_string(),
+        against_seq,
+        against_id: against_id.to_string(),
+    };
+    let mut first: BTreeMap<i64, EventId> = BTreeMap::new();
+    let mut violations = Vec::new();
+    for observed in &evidence.observed {
+        let Observed::Delivered(delivery) = *observed else {
+            continue;
+        };
+        if !written.matches(delivery.seq, delivery.key) {
+            continue;
+        }
+        let known = *first.entry(delivery.seq).or_insert(delivery.id);
+        if known != delivery.id {
+            violations.push(violation(delivery.seq, delivery.id, delivery.seq, known));
+        }
+    }
+    let mut previous: Option<(i64, EventId)> = None;
+    for (&seq, &id) in &first {
+        if let Some((before, before_id)) = previous
+            && id <= before_id
+        {
+            violations.push(violation(seq, id, before, before_id));
+        }
+        previous = Some((seq, id));
+    }
+    violations
 }
 
 fn expected(evidence: &Evidence, written: &Written<'_>) -> Vec<Change> {
@@ -218,12 +301,21 @@ fn order_violations(
     violations
 }
 
-pub fn delivery_from_envelope(envelope: &serde_json::Value) -> Option<Delivery> {
+pub fn change_from_envelope(envelope: &serde_json::Value) -> Option<Change> {
     let key = envelope.get("key")?.get("id")?.as_i64()?;
     let seq = row_seq(envelope, "after").or_else(|| row_seq(envelope, "before"))?;
-    Some(Delivery {
+    Some(Change {
         seq,
         key: i32::try_from(key).ok()?,
+    })
+}
+
+pub fn delivery_from_envelope(envelope: &serde_json::Value) -> Option<Delivery> {
+    let change = change_from_envelope(envelope)?;
+    Some(Delivery {
+        seq: change.seq,
+        key: change.key,
+        id: EventId::parse(envelope.get("id")?.as_str()?)?,
     })
 }
 
@@ -255,8 +347,25 @@ mod tests {
         Change { seq, key }
     }
 
+    fn id(seq: i64) -> EventId {
+        EventId::new(u64::try_from(seq).unwrap() * 0x100, 0)
+    }
+
     fn delivered(seq: i64, key: i32) -> Observed {
-        Observed::Delivered(Delivery { seq, key })
+        with_id(seq, key, id(seq))
+    }
+
+    fn with_id(seq: i64, key: i32, id: EventId) -> Observed {
+        Observed::Delivered(Delivery { seq, key, id })
+    }
+
+    fn id_violation(seq: i64, id: EventId, against_seq: i64, against_id: EventId) -> IdViolation {
+        IdViolation {
+            seq,
+            id: id.to_string(),
+            against_seq,
+            against_id: against_id.to_string(),
+        }
     }
 
     fn marker(token: u64, seq: i64, key: i32) -> Observed {
@@ -533,25 +642,118 @@ mod tests {
     }
 
     #[test]
+    fn event_ids_stay_the_same_across_replays_and_increase_with_seq() {
+        let committed = [(1, 1), (2, 2), (3, 1)];
+        let replayed = check(&evidence(
+            &committed,
+            vec![
+                delivered(1, 1),
+                delivered(2, 2),
+                delivered(1, 1),
+                delivered(3, 1),
+                delivered(2, 2),
+            ],
+        ));
+        assert!(replayed.passed(), "{replayed:?}");
+
+        let renamed = check(&evidence(
+            &committed,
+            vec![
+                delivered(1, 1),
+                delivered(2, 2),
+                with_id(1, 1, EventId::new(0x100, 1)),
+                delivered(3, 1),
+            ],
+        ));
+        assert_eq!(
+            renamed.id_violations,
+            vec![id_violation(1, EventId::new(0x100, 1), 1, id(1))]
+        );
+        assert!(!renamed.passed());
+
+        let shared = check(&evidence(
+            &committed,
+            vec![delivered(1, 1), with_id(2, 2, id(1)), delivered(3, 1)],
+        ));
+        assert_eq!(shared.id_violations, vec![id_violation(2, id(1), 1, id(1))]);
+
+        let decreasing = check(&evidence(
+            &committed,
+            vec![with_id(2, 2, id(1)), with_id(1, 1, id(2)), delivered(3, 1)],
+        ));
+        assert_eq!(
+            decreasing.id_violations,
+            vec![id_violation(2, id(1), 1, id(2))]
+        );
+
+        let phantom = check(&evidence(
+            &committed,
+            vec![
+                delivered(1, 1),
+                delivered(2, 2),
+                delivered(3, 1),
+                with_id(9, 1, id(1)),
+            ],
+        ));
+        assert_eq!(phantom.id_violations, Vec::<IdViolation>::new());
+    }
+
+    #[test]
+    fn event_ids_print_and_parse_as_pg_cdc_writes_them() {
+        let parsed = EventId::parse("000000001a2b3c4d-00000003").unwrap();
+        assert_eq!(parsed, EventId::new(0x1a2b_3c4d, 3));
+        assert_eq!(parsed.to_string(), "000000001a2b3c4d-00000003");
+        assert!(EventId::new(1, 9) < EventId::new(2, 0));
+        assert!(EventId::new(2, 0) < EventId::new(2, 1));
+        for bad in [
+            "",
+            "e1",
+            "000000001a2b3c4d",
+            "000000001a2b3c4d-0000003",
+            "00000001a2b3c4d-00000003",
+            "000000001a2b3c4g-00000003",
+            "+00000001a2b3c4d-00000003",
+        ] {
+            assert_eq!(EventId::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
     fn deliveries_are_read_from_after_or_before() {
-        let upsert = json!({"op": "update", "key": {"id": 4}, "before": null, "after": {"id": 4, "seq": 11}});
+        let upsert = json!({"id": "0000000000000100-00000002", "op": "update", "key": {"id": 4}, "before": null, "after": {"id": 4, "seq": 11}});
         assert_eq!(
             delivery_from_envelope(&upsert),
-            Some(Delivery { seq: 11, key: 4 })
+            Some(Delivery {
+                seq: 11,
+                key: 4,
+                id: EventId::new(0x100, 2)
+            })
         );
 
-        let removal =
-            json!({"op": "delete", "key": {"id": 4}, "before": {"id": 4, "seq": 9}, "after": null});
+        let removal = json!({"id": "0000000000000100-00000003", "op": "delete", "key": {"id": 4}, "before": {"id": 4, "seq": 9}, "after": null});
         assert_eq!(
             delivery_from_envelope(&removal),
-            Some(Delivery { seq: 9, key: 4 })
+            Some(Delivery {
+                seq: 9,
+                key: 4,
+                id: EventId::new(0x100, 3)
+            })
         );
 
-        let pointer = json!({"op": "insert", "key": {"id": 4}, "payload_ref": "s3://bucket/key"});
+        let pointer = json!({"id": "0000000000000100-00000002", "op": "insert", "key": {"id": 4}, "payload_ref": "s3://bucket/key"});
         assert_eq!(delivery_from_envelope(&pointer), None);
 
-        let keyless = json!({"after": {"seq": 1}});
+        let keyless = json!({"id": "0000000000000100-00000002", "after": {"seq": 1}});
         assert_eq!(delivery_from_envelope(&keyless), None);
+
+        for id in [json!(null), json!("e1"), json!(7)] {
+            let unnamed = json!({"id": id, "key": {"id": 4}, "after": {"seq": 11}});
+            assert_eq!(delivery_from_envelope(&unnamed), None, "{id}");
+            assert_eq!(
+                change_from_envelope(&unnamed),
+                Some(Change { seq: 11, key: 4 })
+            );
+        }
 
         assert_eq!(
             observed_from_message(&discard_marker(7, 1, 3)),
@@ -561,7 +763,10 @@ mod tests {
                 seq: 3
             })
         );
-        assert_eq!(observed_from_message(&upsert), Some(delivered(11, 4)));
+        assert_eq!(
+            observed_from_message(&upsert),
+            Some(with_id(11, 4, EventId::new(0x100, 2)))
+        );
         assert_eq!(observed_from_message(&json!({"unrelated": true})), None);
     }
 }

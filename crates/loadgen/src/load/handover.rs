@@ -379,13 +379,14 @@ fn print_outcome(
     }
     writeln!(
         std::io::stdout(),
-        "load handover: committed {} delivered {} duplicates {} missing {} phantoms {} out of order {}, problems {problems:?}, criterion 5 {}",
+        "load handover: committed {} delivered {} duplicates {} missing {} phantoms {} out of order {} id violations {}, problems {problems:?}, criterion 5 {}",
         checker.committed,
         checker.delivered,
         checker.duplicates,
         checker.missing.len(),
         checker.phantoms.len(),
         checker.out_of_order.len(),
+        checker.id_violations.len(),
         serde_json::to_string(&criterion_5)?,
     )?;
     Ok(())
