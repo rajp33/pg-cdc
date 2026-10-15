@@ -516,19 +516,65 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    fn stale() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(1)
+    }
+
+    fn make_stale(clock: &StatusClock) -> SystemTime {
+        clock.record(stale());
+        assert_eq!(clock.last_sent(), Some(stale()));
+        SystemTime::now()
+    }
+
+    fn assert_fresh(clock: &StatusClock, since: SystemTime) {
+        let sent = clock.last_sent().expect("a status update was recorded");
+        assert!(
+            sent + Duration::from_millis(1) >= since,
+            "{sent:?} is older than {since:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn the_status_clock_records_each_flushed_status_update() {
         let (stream, mut server) = fake::started(fake::config()).await;
         let clock = stream.status_clock();
+        let cloned = stream.status_clock();
+        let since = SystemTime::now();
         server.read_status().await;
-        let first = clock.last_sent().expect("the first status update");
-        assert!(first <= SystemTime::now());
-        let before = clock.clone();
+        assert_fresh(&clock, since);
+
+        let since = make_stale(&clock);
+        server.read_status().await;
+        assert_fresh(&clock, since);
+
+        let since = make_stale(&clock);
+        server.keepalive(0x50, true).await;
+        server.read_status().await;
+        assert_fresh(&clock, since);
+
+        let since = make_stale(&clock);
         stream.send_status().await.unwrap();
-        let second = clock.last_sent().expect("the second status update");
-        assert!(second >= first);
-        assert_eq!(before.last_sent(), Some(second));
-        assert_eq!(stream.status_clock().last_sent(), Some(second));
+        assert_fresh(&cloned, since);
+        server.read_status().await;
+
+        let since = make_stale(&clock);
+        let stopping = tokio::spawn(stream.stop());
+        while server.read().await.tag != b'c' {}
+        assert_fresh(&clock, since);
+        server.send(b'c', b"").await;
+        assert_eq!(server.read().await.tag, b'X');
+        stopping.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_status_update_leaves_the_status_clock_unchanged() {
+        let (stream, mut server) = fake::started(fake::config()).await;
+        let clock = stream.status_clock();
+        server.read_status().await;
+        make_stale(&clock);
+        drop(server);
+        assert!(stream.send_status().await.is_err());
+        assert_eq!(clock.last_sent(), Some(stale()));
     }
 
     #[test]
