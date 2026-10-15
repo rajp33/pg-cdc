@@ -53,7 +53,7 @@ struct LoadArgs {
     topic_arn: Option<String>,
     #[arg(long, requires = "topic_arn")]
     real_aws: bool,
-    #[arg(long, default_value = "3m", value_parser = parse_duration)]
+    #[arg(long, default_value = "90s", value_parser = parse_duration)]
     drain_limit: Duration,
 }
 

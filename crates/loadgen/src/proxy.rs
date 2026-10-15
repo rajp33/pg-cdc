@@ -312,6 +312,10 @@ fn record_request(shared: &Shared, parts: &request::Parts, body: &Bytes) {
         bump(&counters.parked_puts);
     } else if parts.uri.path().contains("/parked/") && parts.method == Method::DELETE {
         bump(&counters.parked_deletes);
+    } else if is_batch_delete(parts) {
+        counters
+            .parked_deletes
+            .fetch_add(occurrences(body, b"/parked/"), Ordering::Relaxed);
     }
     if shared.kind == Upstream::Sns && contains(body, b"Action=Publish") {
         bump(&counters.publishes);
@@ -320,6 +324,23 @@ fn record_request(shared: &Shared, parts: &request::Parts, body: &Bytes) {
 
 fn is_parked_put(parts: &request::Parts) -> bool {
     parts.method == Method::PUT && parts.uri.path().contains("/parked/")
+}
+
+fn is_batch_delete(parts: &request::Parts) -> bool {
+    parts.method == Method::POST
+        && parts.uri.query().is_some_and(|query| {
+            query
+                .split('&')
+                .any(|pair| pair.split('=').next() == Some("delete"))
+        })
+}
+
+fn occurrences(haystack: &[u8], needle: &[u8]) -> u64 {
+    let count = haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count();
+    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -748,6 +769,30 @@ mod tests {
 
         let counts = proxy.counts();
         assert_eq!((counts.parked_puts, counts.parked_stored), (3, 1));
+    }
+
+    #[tokio::test]
+    async fn a_batch_delete_counts_each_parked_object_it_names() {
+        let (upstream_addr, _) = upstream().await;
+        let proxy = FaultProxy::start(upstream_addr, Upstream::S3, 1)
+            .await
+            .unwrap();
+        let batch = "<Delete><Quiet>true</Quiet><Object><Key>pre/p/parked/k/1.json</Key></Object><Object><Key>pre/p/parked/k/2.json</Key></Object></Delete>";
+        call(&proxy, Method::POST, "/bucket?delete", batch)
+            .await
+            .unwrap();
+        call(
+            &proxy,
+            Method::POST,
+            "/bucket?delete",
+            "<Delete><Object><Key>pre/p/other.json</Key></Object></Delete>",
+        )
+        .await
+        .unwrap();
+        call(&proxy, Method::POST, "/bucket/pre/p/parked/k/3.json", "")
+            .await
+            .unwrap();
+        assert_eq!(proxy.counts().parked_deletes, 2);
     }
 
     #[tokio::test]

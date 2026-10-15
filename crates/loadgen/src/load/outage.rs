@@ -33,7 +33,7 @@ const MAX_INFLIGHT: &str = "64MiB";
 const MAX_INFLIGHT_BYTES: u64 = 64 * 1024 * 1024;
 const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 #[cfg(test)]
-const DEFAULT_DRAIN_LIMIT: Duration = Duration::from_mins(3);
+const DEFAULT_DRAIN_LIMIT: Duration = Duration::from_secs(90);
 const PARKED_PREFIX: &str = "load/load/parked/";
 const LIST_PROBE_PERIOD: Duration = Duration::from_secs(30);
 const CEILING_BUCKET: &str = "outage-ceiling";
@@ -78,6 +78,7 @@ struct Sample {
     t_s: f64,
     parked_puts: u64,
     parked_stored: u64,
+    parked_removed: u64,
     parked_events: u64,
     parked_keys: u64,
     inflight_bytes: u64,
@@ -150,7 +151,7 @@ fn phases(steps: &[Step], park_after: Duration) -> Vec<Phase> {
 fn sample(
     elapsed: Duration,
     status: &serde_json::Value,
-    (parked_puts, parked_stored): (u64, u64),
+    counts: &ProxyCounts,
     wal: u64,
 ) -> Option<Sample> {
     let inflight_bytes = rig::inflight_bytes(status)?;
@@ -163,8 +164,9 @@ fn sample(
     };
     Some(Sample {
         t_s: elapsed.as_secs_f64(),
-        parked_puts,
-        parked_stored,
+        parked_puts: counts.parked_puts,
+        parked_stored: counts.parked_stored,
+        parked_removed: counts.parked_deletes,
         parked_events: count("events"),
         parked_keys: count("keys"),
         inflight_bytes,
@@ -411,6 +413,7 @@ struct Drain {
     remaining_events: u64,
     remaining_keys: u64,
     events_per_s: Option<f64>,
+    removed_per_s: Option<f64>,
     projected_s: Option<f64>,
     complete: bool,
 }
@@ -419,6 +422,9 @@ fn drain(samples: &[Sample], from_s: f64, limit: Duration) -> Drain {
     let last = samples.last().filter(|last| last.t_s >= from_s);
     let remaining_events = last.map_or(0, |last| last.parked_events);
     let events_per_s = drain_rate(samples, from_s);
+    let removed_per_s = last.and_then(|last| {
+        rate_per_second(samples, from_s, last.t_s, |sample| sample.parked_removed)
+    });
     let projected_s = match events_per_s {
         _ if last.is_some() && remaining_events == 0 => Some(0.0),
         Some(rate) if rate > 0.0 => Some(rig::count_f64(remaining_events) / rate),
@@ -431,6 +437,7 @@ fn drain(samples: &[Sample], from_s: f64, limit: Duration) -> Drain {
         remaining_events,
         remaining_keys: last.map_or(0, |last| last.parked_keys),
         events_per_s,
+        removed_per_s,
         projected_s,
         complete: last.is_some_and(caught_up),
     }
@@ -472,12 +479,7 @@ async fn drive(fixture: &Fixture, kind: Kind, limit: Duration) -> anyhow::Result
         let wal = wal_position(&probe).await?;
         let counts = fixture.s3_proxy.counts();
         let taken = match fixture.process.status().await {
-            Ok(status) => sample(
-                elapsed,
-                &status,
-                (counts.parked_puts, counts.parked_stored),
-                wal,
-            ),
+            Ok(status) => sample(elapsed, &status, &counts, wal),
             Err(_) => None,
         };
         match taken {
@@ -673,7 +675,7 @@ async fn run_kind(kind: Kind, options: &LoadOptions) -> anyhow::Result<()> {
     )?;
     writeln!(
         std::io::stdout(),
-        "load {}: drain {} at the {:.0} s limit: {} events on {} keys still parked {:.0} s after the writer stopped, parked events falling at {:?} events/s (negative while still rising), projected {:?} s more to drain",
+        "load {}: drain {} at the {:.0} s limit: {} events on {} keys still parked {:.0} s after the writer stopped, parked events falling at {:?} events/s (negative while still rising), {:?} parked events removed/s, projected {:?} s more to drain",
         kind.name(),
         if report.drain.complete {
             "complete"
@@ -687,6 +689,10 @@ async fn run_kind(kind: Kind, options: &LoadOptions) -> anyhow::Result<()> {
         report
             .drain
             .events_per_s
+            .map(|rate| (rate * 10.0).round() / 10.0),
+        report
+            .drain
+            .removed_per_s
             .map(|rate| (rate * 10.0).round() / 10.0),
         report.drain.projected_s.map(f64::round),
     )?;
@@ -788,13 +794,19 @@ mod tests {
             sample(
                 at(7) + Duration::from_millis(250),
                 &status,
-                (40, 31),
+                &ProxyCounts {
+                    parked_puts: 40,
+                    parked_stored: 31,
+                    parked_deletes: 9,
+                    ..ProxyCounts::default()
+                },
                 0x1000 + 600
             ),
             Some(Sample {
                 t_s: 7.25,
                 parked_puts: 40,
                 parked_stored: 31,
+                parked_removed: 9,
                 parked_events: 70,
                 parked_keys: 12,
                 inflight_bytes: 4_096,
@@ -810,11 +822,12 @@ mod tests {
             "slot_retained_bytes": null,
         });
         assert_eq!(
-            sample(at(1), &starting, (0, 0), 5_000),
+            sample(at(1), &starting, &ProxyCounts::default(), 5_000),
             Some(Sample {
                 t_s: 1.0,
                 parked_puts: 0,
                 parked_stored: 0,
+                parked_removed: 0,
                 parked_events: 0,
                 parked_keys: 0,
                 inflight_bytes: 0,
@@ -822,7 +835,7 @@ mod tests {
                 lag_bytes: 5_000,
             })
         );
-        assert_eq!(sample(at(1), &json!({}), (0, 0), 0), None);
+        assert_eq!(sample(at(1), &json!({}), &ProxyCounts::default(), 0), None);
     }
 
     fn at_second(t: u32, puts: u64, events: u64, keys: u64, lag: u64) -> Sample {
@@ -830,6 +843,7 @@ mod tests {
             t_s: SECOND.as_secs_f64() * f64::from(t),
             parked_puts: puts,
             parked_stored: puts / 4,
+            parked_removed: puts / 8,
             parked_events: events,
             parked_keys: keys,
             inflight_bytes: u64::from(t) * 1_000,
@@ -939,9 +953,9 @@ mod tests {
         let limit = DEFAULT_DRAIN_LIMIT;
         let backlog = [at_second(150, 0, 100_000, 1_000, 0)];
         assert!(!finished(&backlog, None, false, at(400), limit));
-        assert!(!finished(&backlog, Some(at(150)), true, at(329), limit));
-        assert!(finished(&backlog, Some(at(150)), true, at(330), limit));
-        assert!(finished(&backlog, Some(at(150)), false, at(330), limit));
+        assert!(!finished(&backlog, Some(at(150)), true, at(239), limit));
+        assert!(finished(&backlog, Some(at(150)), true, at(240), limit));
+        assert!(finished(&backlog, Some(at(150)), false, at(240), limit));
         let drained = [at_second(160, 0, 0, 0, 1_000)];
         assert!(finished(&drained, Some(at(150)), true, at(160), limit));
         assert!(!finished(&drained, Some(at(150)), false, at(160), limit));
@@ -957,19 +971,20 @@ mod tests {
     fn a_bounded_drain_reports_what_remains_its_rate_and_the_time_to_drain_the_rest() {
         let samples = [
             at_second(149, 0, 99_000, 1_000, 0),
-            at_second(150, 0, 100_000, 1_000, 0),
-            at_second(240, 0, 98_200, 1_000, 0),
-            at_second(330, 0, 96_400, 990, 0),
+            at_second(150, 8_000, 100_000, 1_000, 0),
+            at_second(240, 80_000, 98_200, 1_000, 0),
+            at_second(330, 152_000, 96_400, 990, 0),
         ];
         assert_eq!(
             drain(&samples, 150.0, DEFAULT_DRAIN_LIMIT),
             Drain {
-                deadline_s: 180.0,
+                deadline_s: 90.0,
                 from_s: 150.0,
                 to_s: 330.0,
                 remaining_events: 96_400,
                 remaining_keys: 990,
                 events_per_s: Some(20.0),
+                removed_per_s: Some(100.0),
                 projected_s: Some(4_820.0),
                 complete: false,
             }
@@ -995,12 +1010,13 @@ mod tests {
         assert_eq!(
             drain(&[], 150.0, DEFAULT_DRAIN_LIMIT),
             Drain {
-                deadline_s: 180.0,
+                deadline_s: 90.0,
                 from_s: 150.0,
                 to_s: 150.0,
                 remaining_events: 0,
                 remaining_keys: 0,
                 events_per_s: None,
+                removed_per_s: None,
                 projected_s: None,
                 complete: false,
             }
