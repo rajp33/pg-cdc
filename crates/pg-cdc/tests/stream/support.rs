@@ -1,16 +1,18 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use pg_cdc::config::{
-    DEFAULT_MAX_INFLIGHT_BYTES, DEFAULT_MAX_PARKED_EVENTS, DEFAULT_PARK_AFTER, TlsMode,
+    DEFAULT_DRAIN_TIMEOUT, DEFAULT_MAX_INFLIGHT_BYTES, DEFAULT_MAX_PARKED_EVENTS,
+    DEFAULT_PARK_AFTER, LeadershipConfig, TlsMode,
 };
 use pg_cdc::connection::{ConnectParams, PasswordProvider, TlsConfig};
 use pg_cdc::event::EventId;
+use pg_cdc::health::Health;
 use pg_cdc::lane::Stores;
 use pg_cdc::order::{OrderBy, OrderKeyId};
-use pg_cdc::session::{SessionConfig, SessionError, run_session};
+use pg_cdc::session::{SessionConfig, SessionContext, SessionError, run_session};
 use pg_cdc::sink::stdout::StdoutSink;
 use pg_cdc::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 use pg_cdc::state::filesystem::FilesystemStateStore;
@@ -33,6 +35,12 @@ pub(crate) const SLOT: &str = "it_slot";
 pub(crate) const PUBLICATION: &str = "it_pub";
 pub(crate) const PIPELINE: &str = "it";
 pub(crate) const WAIT: Duration = Duration::from_secs(30);
+
+pub(crate) const TEST_LEADERSHIP: LeadershipConfig = LeadershipConfig {
+    lease_timeout: Duration::from_secs(4),
+    fence_delay: Duration::from_millis(4500),
+    drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+};
 
 pub(crate) async fn prepare(pg: &Postgres, statements: &[&str], tables: &[&str]) -> TestResult {
     for statement in statements {
@@ -72,6 +80,17 @@ pub(crate) fn config(status_interval: Duration, buffer: usize) -> SessionConfig 
         park_after: DEFAULT_PARK_AFTER,
         max_parked_events: DEFAULT_MAX_PARKED_EVENTS,
         store_concurrency: 4,
+        leadership: TEST_LEADERSHIP,
+    }
+}
+
+pub(crate) fn context() -> SessionContext {
+    let health = Health::new();
+    health.set_sink_ready(true);
+    health.set_store_ready(true);
+    SessionContext {
+        holder: "test-holder".to_owned(),
+        health,
     }
 }
 
@@ -163,6 +182,95 @@ pub(crate) fn unparkable_stores() -> Stores {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct RecordingStore {
+    inner: Arc<dyn StateStore>,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl RecordingStore {
+    pub(crate) fn over(inner: Arc<dyn StateStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            calls: Mutex::default(),
+        })
+    }
+
+    pub(crate) fn calls(&self) -> Vec<&'static str> {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn stores(self: &Arc<Self>) -> Stores {
+        let state: Arc<dyn StateStore> = Arc::clone(self) as Arc<dyn StateStore>;
+        Stores {
+            state,
+            payload: None,
+        }
+    }
+
+    fn record(&self, method: &'static str) {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(method);
+    }
+}
+
+#[async_trait]
+impl StateStore for RecordingStore {
+    async fn append_parked(&self, events: &[ParkedEvent]) -> Result<(), StoreError> {
+        self.record("append_parked");
+        self.inner.append_parked(events).await
+    }
+
+    async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
+        self.record("load_parked_heads");
+        self.inner.load_parked_heads(partition).await
+    }
+
+    async fn read_parked(
+        &self,
+        key: &OrderKeyId,
+        after: Option<&EventId>,
+        limit: usize,
+    ) -> Result<Vec<ParkedEvent>, StoreError> {
+        self.record("read_parked");
+        self.inner.read_parked(key, after, limit).await
+    }
+
+    async fn set_parked_status(
+        &self,
+        key: &OrderKeyId,
+        id: &EventId,
+        status: ParkStatus,
+    ) -> Result<(), StoreError> {
+        self.record("set_parked_status");
+        self.inner.set_parked_status(key, id, status).await
+    }
+
+    async fn remove_parked(&self, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError> {
+        self.record("remove_parked");
+        self.inner.remove_parked(events).await
+    }
+
+    async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
+        self.record("read_leader");
+        self.inner.read_leader().await
+    }
+
+    async fn swap_leader(
+        &self,
+        next: &LeaderRecord,
+        expected: Option<&Version>,
+    ) -> Result<SwapOutcome, StoreError> {
+        self.record("swap_leader");
+        self.inner.swap_leader(next, expected).await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mode {
     Deliver,
@@ -234,6 +342,7 @@ pub(crate) struct Running {
     events: mpsc::UnboundedReceiver<Bytes>,
     mode: watch::Sender<Mode>,
     failures: watch::Receiver<u64>,
+    health: Health,
 }
 
 pub(crate) fn spawn_session(
@@ -262,6 +371,16 @@ pub(crate) fn spawn_full(
     stores: Stores,
     limits: SinkCapabilities,
 ) -> Running {
+    spawn_in_context(params, config, stores, limits, context())
+}
+
+pub(crate) fn spawn_in_context(
+    params: ConnectParams,
+    config: SessionConfig,
+    stores: Stores,
+    limits: SinkCapabilities,
+    context: SessionContext,
+) -> Running {
     let (mode, mode_receiver) = watch::channel(Mode::Deliver);
     let (failures_sender, failures) = watch::channel(0);
     let (delivered, events) = mpsc::unbounded_channel();
@@ -272,13 +391,15 @@ pub(crate) fn spawn_full(
         delivered,
     });
     let shutdown = CancellationToken::new();
-    let task = spawn_run(params, config, sink, stores, shutdown.clone());
+    let health = context.health.clone();
+    let task = spawn_run(params, config, sink, stores, context, shutdown.clone());
     Running {
         shutdown,
         task,
         events,
         mode,
         failures,
+        health,
     }
 }
 
@@ -287,11 +408,12 @@ fn spawn_run(
     config: SessionConfig,
     sink: Arc<dyn Sink>,
     stores: Stores,
+    context: SessionContext,
     shutdown: CancellationToken,
 ) -> JoinHandle<Result<(), SessionError>> {
     tokio::spawn(async move {
         let provider = PasswordProvider::new(params);
-        run_session(&config, &provider, &sink, &stores, &shutdown).await
+        run_session(&config, &provider, &sink, &stores, &context, &shutdown).await
     })
 }
 
@@ -322,6 +444,14 @@ impl Running {
         Ok(tokio::time::timeout(window, self.events.recv())
             .await
             .is_err())
+    }
+
+    pub(crate) fn health(&self) -> Health {
+        self.health.clone()
+    }
+
+    pub(crate) async fn finished(self, within: Duration) -> TestResult<Result<(), SessionError>> {
+        Ok(tokio::time::timeout(within, self.task).await??)
     }
 
     pub(crate) fn set_mode(&self, mode: Mode) {
@@ -368,6 +498,7 @@ pub(crate) fn spawn_stdout_session(
         config(status_interval, 64),
         sink,
         memory_stores(),
+        context(),
         shutdown.clone(),
     );
     StdoutRunning {

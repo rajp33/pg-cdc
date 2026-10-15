@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::ConnectionProvider;
 use crate::lane::Stores;
-use crate::session::{SessionConfig, SessionError, run_session};
+use crate::session::{SessionConfig, SessionContext, SessionError, run_session};
 use crate::sink::Sink;
 use crate::state::StateStore;
 
@@ -21,6 +21,7 @@ pub trait Attempt {
 
 pub struct LiveSession<'a> {
     pub config: &'a SessionConfig,
+    pub context: &'a SessionContext,
     pub provider: &'a dyn ConnectionProvider,
     pub sink: &'a Arc<dyn Sink>,
     pub stores: &'a Stores,
@@ -42,6 +43,7 @@ impl Attempt for LiveSession<'_> {
             self.provider,
             self.sink,
             self.stores,
+            self.context,
             self.shutdown,
         )
     }
@@ -212,6 +214,7 @@ mod tests {
         LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, StoreError, SwapOutcome, Version,
         Versioned,
     };
+    use crate::validate::Invalid;
     use async_trait::async_trait;
     use pg_cdc_decoder::message::DecodeError;
     use std::collections::VecDeque;
@@ -401,7 +404,7 @@ mod tests {
         }
         for error in [
             SessionError::StreamEnded,
-            SessionError::SlotMissing("s".to_owned()),
+            SessionError::Invalid(Invalid::SlotMissing("s".to_owned())),
         ] {
             assert!(!error.is_fatal(), "{error}");
         }

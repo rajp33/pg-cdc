@@ -16,8 +16,9 @@ use pg_cdc::connection::{
 };
 use pg_cdc::health::Health;
 use pg_cdc::lane::Stores;
+use pg_cdc::leader::record::holder_id;
 use pg_cdc::payload::{PayloadStore, S3PayloadStore};
-use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig};
+use pg_cdc::session::{REPLICATION_BUFFER, SessionConfig, SessionContext};
 use pg_cdc::sink::Sink;
 use pg_cdc::sink::discard::DiscardSink;
 use pg_cdc::sink::sns::SnsSink;
@@ -124,7 +125,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
     let interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
     tokio::spawn(watch_signals(terminate, interrupt, shutdown.clone()));
-    tracing::info!(pipeline = %config.pipeline, slot = %config.source.slot, "pg-cdc starting");
+    let holder = holder_id();
+    tracing::info!(pipeline = %config.pipeline, slot = %config.source.slot, %holder, "pg-cdc starting");
     let health = start_admin(config.admin.listen).await?;
     let Some(provider) = shutdown
         .run_until_cancelled(Box::pin(provider(&config.source)))
@@ -171,9 +173,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
         park_after: config.delivery.park_after,
         max_parked_events: config.delivery.max_parked_events,
         store_concurrency: config.state_store.max_concurrency(),
+        leadership: config.leadership,
     };
+    let context = SessionContext { holder, health };
     let mut live = LiveSession {
         config: &session,
+        context: &context,
         provider: provider.as_ref(),
         sink: &sink,
         stores: &stores,

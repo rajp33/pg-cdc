@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use pg_cdc_decoder::Lsn;
 use pg_cdc_decoder::message::{DecodeError, LogicalMessage, Relation, decode};
 use pg_cdc_replication::{
@@ -13,14 +14,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ack::{AckError, AckTracker};
 use crate::catalog::{self, CatalogError, TypeResolver};
+use crate::config::LeadershipConfig;
 use crate::connection::{
     CONNECT_TIMEOUT, ConnectError, ConnectParams, ConnectionProvider, ControlConnection,
     SESSION_OPTIONS, connect_control, replication_tls,
 };
 use crate::event::{BuildError, Builder, Built, ColumnInfo, RelationInfo};
+use crate::health::{Health, Role};
 use crate::lane::{LaneError, LaneSettings, LaneStopped, Lanes, Pending, Report, Stores};
+use crate::leader::standby::{
+    AcquireError, OBJECT_IN_USE, ProbeError, SlotHolder, SlotProbe, StartError, acquire,
+};
 use crate::order::{OrderBy, order_key};
 use crate::sink::{Outbound, Sink};
+use crate::validate::{Invalid, ValidationError, validate};
 
 pub const REPLICATION_BUFFER: usize = 64;
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +47,13 @@ pub struct SessionConfig {
     pub park_after: Duration,
     pub max_parked_events: u64,
     pub store_concurrency: usize,
+    pub leadership: LeadershipConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionContext {
+    pub holder: String,
+    pub health: Health,
 }
 
 impl SessionConfig {
@@ -59,8 +73,10 @@ pub enum SessionError {
     Connect(#[from] ConnectError),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
-    #[error("replication slot {0} does not exist")]
-    SlotMissing(String),
+    #[error(transparent)]
+    Invalid(#[from] Invalid),
+    #[error(transparent)]
+    Probe(#[from] ProbeError),
     #[error("replication stream failed: {0}")]
     Replication(#[from] ReplicationError),
     #[error("replication stream ended")]
@@ -113,21 +129,40 @@ pub async fn run_session(
     provider: &dyn ConnectionProvider,
     sink: &Arc<dyn Sink>,
     stores: &Stores,
+    context: &SessionContext,
+    shutdown: &CancellationToken,
+) -> Result<(), SessionError> {
+    let result = attempt(config, provider, sink, stores, context, shutdown).await;
+    context.health.set_delivering(false);
+    context.health.set_lease_valid(false);
+    context.health.set_role(Role::Standby);
+    result
+}
+
+async fn attempt(
+    config: &SessionConfig,
+    provider: &dyn ConnectionProvider,
+    sink: &Arc<dyn Sink>,
+    stores: &Stores,
+    context: &SessionContext,
     shutdown: &CancellationToken,
 ) -> Result<(), SessionError> {
     let params = provider.params().await?;
-    let control = connect_control(&params).await?;
-    let start = catalog::slot_confirmed_flush(control.client(), &config.slot)
-        .await?
-        .ok_or_else(|| SessionError::SlotMissing(config.slot.clone()))?;
-    for (schema, table) in
-        catalog::tables_without_full_identity(control.client(), &config.publication).await?
-    {
-        tracing::warn!(%schema, %table, "published table does not use REPLICA IDENTITY FULL");
-    }
-    let mut stream = ReplicationStream::start(replication_config(&params, config, start).await?)
-        .await
-        .map_err(|error| stream_fault(error, start))?;
+    let control = Arc::new(connect_control(&params).await?);
+    check_source(&control, config, &context.health).await?;
+    context.health.set_role(Role::Standby);
+    let probe = Arc::new(ControlProbe {
+        control: Arc::clone(&control),
+        slot: config.slot.clone(),
+    });
+    let Some((mut stream, start, _acquired)) =
+        acquire_slot(probe.as_ref(), &control, &params, config, context, shutdown).await?
+    else {
+        return Ok(());
+    };
+    context.health.set_role(Role::Active);
+    context.health.set_lease_valid(true);
+    tracing::info!(backend_pid = stream.backend_pid(), start_lsn = %start, "acquired the slot");
     let (reports, mut settled) = mpsc::unbounded_channel();
     let permits = Arc::new(Semaphore::new(
         config.sink_concurrency.clamp(1, Semaphore::MAX_PERMITS),
@@ -153,6 +188,94 @@ pub async fn run_session(
         tracing::warn!(%error, "replication stream did not stop cleanly");
     }
     Ok(())
+}
+
+async fn check_source(
+    control: &ControlConnection,
+    config: &SessionConfig,
+    health: &Health,
+) -> Result<(), SessionError> {
+    match validate(control.client(), &config.slot, &config.publication).await {
+        Ok(_) => health.set_validated(true),
+        Err(ValidationError::Invalid(invalid)) => {
+            health.set_validated(false);
+            return Err(invalid.into());
+        }
+        Err(ValidationError::Catalog(error)) => return Err(error.into()),
+    }
+    for (schema, table) in
+        catalog::tables_without_full_identity(control.client(), &config.publication).await?
+    {
+        tracing::warn!(%schema, %table, "published table does not use REPLICA IDENTITY FULL");
+    }
+    Ok(())
+}
+
+async fn acquire_slot(
+    probe: &ControlProbe,
+    control: &ControlConnection,
+    params: &ConnectParams,
+    config: &SessionConfig,
+    context: &SessionContext,
+    shutdown: &CancellationToken,
+) -> Result<Option<(ReplicationStream, Lsn, Instant)>, SessionError> {
+    let start = || async {
+        let start = catalog::slot_confirmed_flush(control.client(), &config.slot)
+            .await
+            .map_err(|error| StartError::Failed(error.into()))?
+            .ok_or_else(|| StartError::Failed(Invalid::SlotMissing(config.slot.clone()).into()))?;
+        let replication = replication_config(params, config, start)
+            .await
+            .map_err(|error| StartError::Failed(error.into()))?;
+        let acquired = Instant::now();
+        let stream = ReplicationStream::start(replication)
+            .await
+            .map_err(|error| start_error(error, start))?;
+        Ok((stream, start, acquired))
+    };
+    match acquire(probe, start, shutdown).await {
+        Ok(acquired) => Ok(acquired),
+        Err(AcquireError::SlotMissing) => {
+            context.health.set_validated(false);
+            Err(Invalid::SlotMissing(config.slot.clone()).into())
+        }
+        Err(AcquireError::Probe(error)) => Err(error.into()),
+        Err(AcquireError::Start(error)) => {
+            if matches!(error, SessionError::Invalid(_)) {
+                context.health.set_validated(false);
+            }
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ControlProbe {
+    control: Arc<ControlConnection>,
+    slot: String,
+}
+
+#[async_trait]
+impl SlotProbe for ControlProbe {
+    async fn holder(&self) -> Result<SlotHolder, ProbeError> {
+        let activity = catalog::slot_activity(self.control.client(), &self.slot)
+            .await
+            .map_err(|error| ProbeError(error.to_string()))?;
+        Ok(match activity {
+            None => SlotHolder::Missing,
+            Some(activity) => activity
+                .active_pid
+                .map_or(SlotHolder::Free, SlotHolder::Held),
+        })
+    }
+}
+
+pub fn start_error(error: ReplicationError, at: Lsn) -> StartError<SessionError> {
+    if error.sqlstate() == Some(OBJECT_IN_USE) {
+        StartError::InUse
+    } else {
+        StartError::Failed(stream_fault(error, at))
+    }
 }
 
 fn next_event(
@@ -418,6 +541,7 @@ fn known(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::leader::standby::StartError;
 
     fn xlog(wal_start: u64) -> ReplicationEvent {
         ReplicationEvent::XLogData {
@@ -463,6 +587,31 @@ mod tests {
         assert!(matches!(
             stream_fault(ReplicationError::Protocol("startup".to_owned()), Lsn(0x20)).fault_lsn(),
             Some(Lsn(0x20))
+        ));
+    }
+
+    #[test]
+    fn start_error_maps_55006_to_in_use() {
+        let server = |sqlstate: &str| ReplicationError::Server {
+            sqlstate: sqlstate.to_owned(),
+            message: "replication slot is active".to_owned(),
+        };
+        assert!(matches!(
+            start_error(server("55006"), Lsn(0x10)),
+            StartError::InUse
+        ));
+        for error in [server("42704"), ReplicationError::Closed] {
+            assert!(
+                matches!(
+                    start_error(error, Lsn(0x10)),
+                    StartError::Failed(SessionError::Replication(_))
+                ),
+                "not a plain failure"
+            );
+        }
+        assert!(matches!(
+            start_error(ReplicationError::Protocol("bad".to_owned()), Lsn(0x20)),
+            StartError::Failed(SessionError::Malformed { at: Lsn(0x20), .. })
         ));
     }
 }
