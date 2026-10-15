@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use pg_cdc_loadgen::chaos::{self, ChaosOptions};
+use pg_cdc_loadgen::load::{self, LoadOptions, Scenario};
 use pg_cdc_loadgen::workload::{self, WorkloadConfig};
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +26,23 @@ struct Cli {
 enum Command {
     Write(WriteArgs),
     Chaos(ChaosArgs),
+    Load(LoadArgs),
+}
+
+#[derive(Debug, Args)]
+struct LoadArgs {
+    #[arg(value_enum)]
+    scenario: Scenario,
+    #[arg(long = "pg-cdc")]
+    binary: PathBuf,
+    #[arg(long)]
+    baseline: Option<PathBuf>,
+    #[arg(long, default_value = "target/load")]
+    report_dir: PathBuf,
+    #[arg(long, requires = "real_aws")]
+    topic_arn: Option<String>,
+    #[arg(long, requires = "topic_arn")]
+    real_aws: bool,
 }
 
 #[derive(Debug, Args)]
@@ -111,6 +129,20 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 async fn main() -> anyhow::Result<ExitCode> {
     match Cli::parse().command {
         Command::Write(args) => write(args).await.map(|()| ExitCode::SUCCESS),
+        Command::Load(args) => {
+            load::run(
+                args.scenario,
+                &LoadOptions {
+                    binary: args.binary,
+                    baseline: args.baseline,
+                    report_dir: args.report_dir,
+                    topic_arn: args.topic_arn,
+                    real_aws: args.real_aws,
+                },
+            )
+            .await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Chaos(args) => {
             let report = Box::pin(chaos::run(&ChaosOptions {
                 binary: args.binary,

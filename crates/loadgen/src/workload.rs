@@ -263,10 +263,23 @@ async fn run_transaction(
     client.batch_execute("COMMIT").await
 }
 
+fn limit_reached(max_events: Option<u64>, written: usize) -> bool {
+    max_events.is_some_and(|max| u64::try_from(written).map_or(true, |written| written >= max))
+}
+
 pub async fn write(
     client: &Client,
     config: &WorkloadConfig,
     stop: CancellationToken,
+) -> anyhow::Result<Ledger> {
+    write_events(client, config, stop, None).await
+}
+
+pub async fn write_events(
+    client: &Client,
+    config: &WorkloadConfig,
+    stop: CancellationToken,
+    max_events: Option<u64>,
 ) -> anyhow::Result<Ledger> {
     let upsert = client
         .prepare(&format!(
@@ -279,7 +292,7 @@ pub async fn write(
     let mut pacer = Pacer::new(config.rate, Instant::now());
     let mut ledger = Ledger::default();
     let mut failures = 0;
-    while !stop.is_cancelled() {
+    while !stop.is_cancelled() && !limit_reached(max_events, ledger.committed.len()) {
         let plan = planner.next_transaction();
         let changes: Vec<Change> = plan.rows.iter().map(|row| row.change).collect();
         match run_transaction(client, &upsert, &plan.rows).await {
@@ -440,6 +453,15 @@ mod tests {
         );
         assert_eq!(first, plans(&quiet, 30));
         assert_ne!(first, plans(&WorkloadConfig { seed: 12, ..quiet }, 30));
+    }
+
+    #[test]
+    fn an_event_limit_stops_after_the_transaction_that_reaches_it() {
+        assert!(!limit_reached(None, 1_000_000));
+        assert!(!limit_reached(Some(100), 99));
+        assert!(limit_reached(Some(100), 100));
+        assert!(limit_reached(Some(100), 150));
+        assert!(limit_reached(Some(0), 0));
     }
 
     #[test]

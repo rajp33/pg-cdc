@@ -2395,6 +2395,7 @@ dependencies = [
  "pg-cdc-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-postgres",
  "tokio-util",

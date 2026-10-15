@@ -96,6 +96,15 @@ run = [
   "cargo run --release -p pg-cdc-loadgen -- chaos --pg-cdc target/release/pg-cdc --seed ${CHAOS_SEED:-$(date +%s)} --duration 10m --settle 5m --report target/chaos/full.json",
 ]
 
+[tasks.load]
+description = "Load scenarios (ceiling, sns, overhead, memory); LOAD_SCENARIO picks one, default all"
+run = [
+  "cargo build --release -p pg-cdc",
+  "cargo build --release -p pg-cdc --no-default-features --target-dir target/baseline",
+  "cargo build --release -p pg-cdc-loadgen",
+  "target/release/loadgen load ${LOAD_SCENARIO:-all} --pg-cdc target/release/pg-cdc --baseline target/baseline/release/pg-cdc --report-dir target/load",
+]
+
 [tasks.ci]
 description = "Everything CI runs, locally"
 run = [
