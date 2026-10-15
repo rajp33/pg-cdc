@@ -97,7 +97,7 @@ pg-cdc v1 is the change reader for Theia's [THE-526](https://linear.app/theia-vi
 
 ## 4. Success criteria
 
-1. **No committed change is lost.** Each is delivered at least once or held in the state store, as proven by the chaos tests (§18.3).
+1. **No committed change is lost.** Each is delivered at least once, held in the state store, or still retained by the slot for replay, as proven by the chaos tests (§18.3).
 2. **Per-order-key order holds** at the sink.
 3. **WAL stays bounded during a sink outage.** The slot keeps advancing once events park, so retained WAL is roughly `park_after` worth of write volume.
 4. **Throughput:** at least 5,000 events/s sustained, with p99 commit-to-acknowledgement under 1 s against a healthy SNS topic.
@@ -707,7 +707,7 @@ Each invariant has an enforcement mechanism listed in §14.6. A runtime violatio
 | Model-based property tests of lanes and parking, with random failures, appends that store only a prefix, clean restarts, crashes in the middle of a park, and operator actions | O2, O3, A1 |
 | Fuzzing the decoder, which must never panic | D1–D3 |
 | `to_jsonb` reference tests over every built-in type | D2 |
-| Chaos integration tests: SIGKILL at random points, sink and store faults, dropped connections and takeovers. A checker verifies every change was delivered at least once and per-key order held. | O1–O3, A1–A4, L1–L3 |
+| Chaos integration tests: SIGKILL at random points, sink and store faults, dropped connections and takeovers. A checker verifies every change was delivered at least once, is still parked or is still retained by the slot, and that per-key order held. | O1–O3, A1–A4, L1–L3 |
 | A settled event can only be constructed from a delivery or a park | A1 |
 | Runtime checks with fail-stop | A2, O2 |
 
@@ -923,7 +923,7 @@ The harness:
 4. drops connections;
 5. runs clean and crash takeovers between two instances.
 
-A checker then asserts that every committed change was either delivered at least once or is still in the store, and that per-key order held.
+A checker then asserts that every committed change was delivered at least once, is still in the store, or is still retained by the slot, and that per-key order held. A change is retained when its transaction lies at or past the slot's confirmed position, so the next start replays it. The settle phase after the chaos is bounded, so a backlog still draining at its end is checked where it is rather than waited for.
 
 ### 18.4 Conformance
 
@@ -1014,9 +1014,9 @@ Also in v1.1, outside the ranking: an optional `pprof` build feature for CPU pro
 | SNS topics above 256 KiB may restrict subscription types, and the `PublishBatch` aggregate limit for such topics is unverified | Verify during milestone 2; `preflight` reads limits from the topic |
 | The in-house transport is protocol code pg-cdc maintains | Keep it small and behind the transport crate's API; test it against a fake server and against Postgres 14 to 18 |
 | Fencing assumes no process pauses for longer than `fence_delay` | Only duplicates result; documented |
-| Parking during a long outage costs about $5 per million events on S3 | `max_parked_events`; a segmented layout in v1.1 if needed |
+| Parking during a long outage costs about $5.40 per million events on S3: a PUT to park and a GET to drain each event, plus batched deletes and a listing per 1,000 events | `max_parked_events`; a segmented layout in v1.1 if needed |
 | Primary keys are read from the current catalog, not as of the WAL position | A key change during traffic can mis-key a few events; documented |
-| A hot key moves at most one event per sink round trip | Documented, along with the `order_by` choices |
+| A hot key moves at most one event per sink round trip; while its parked queue drains, each event also costs a GET and its share of a batched delete, with a listing per 1,000 events (§11.4) | Documented, along with the `order_by` choices; parked drain across keys is bounded by `state_store.max_concurrency` (§15) |
 | Changing a publication during a backlog can renumber replayed ordinals | Change publications only when caught up (§7.2) |
 
 ## 22. References
