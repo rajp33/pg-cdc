@@ -9,7 +9,7 @@ use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 
 use crate::cluster::PgCdc;
-use crate::measure::{self, Machine};
+use crate::measure::{self, ClockOffset, Machine};
 use crate::workload::{self, Ledger, WorkloadConfig};
 
 pub(super) const PUBLICATION: &str = "load_pub";
@@ -391,6 +391,18 @@ pub(super) struct Latency {
     pub observed: u64,
 }
 
+pub(super) fn verified_p99(
+    latency: Latency,
+    expected: u64,
+    drained: bool,
+    offsets: &[ClockOffset],
+) -> Option<f64> {
+    if !drained || latency.observed < expected {
+        return None;
+    }
+    measure::commit_latency_upper_bound(latency.p99_upper_bound_s, offsets)
+}
+
 pub(super) async fn latency(receiver: &OtlpReceiver, expected: u64) -> Latency {
     let exported = receiver
         .wait_for(EXPORT_WAIT, |seen| {
@@ -502,6 +514,42 @@ mod tests {
         let starting = serde_json::json!({ "confirmed_lsn": null });
         assert_eq!(confirmed(&starting), None);
         assert_eq!(inflight_bytes(&starting), None);
+    }
+
+    fn clock(offset_ms: f64) -> ClockOffset {
+        ClockOffset {
+            offset_ms,
+            uncertainty_ms: 2.0,
+        }
+    }
+
+    #[test]
+    fn a_fast_majority_with_a_missing_slow_tail_verifies_no_latency() {
+        let partial = Latency {
+            p99_upper_bound_s: Some(0.25),
+            observed: 9_000,
+        };
+        assert_eq!(verified_p99(partial, 10_000, true, &[clock(0.0)]), None);
+        let complete = Latency {
+            observed: 10_000,
+            ..partial
+        };
+        let bound = verified_p99(complete, 10_000, true, &[clock(0.0)]).unwrap();
+        assert!((bound - 0.252).abs() < 1e-9, "{bound}");
+        assert_eq!(verified_p99(complete, 10_000, false, &[clock(0.0)]), None);
+        assert_eq!(verified_p99(complete, 10_000, true, &[]), None);
+    }
+
+    #[test]
+    fn a_skewed_clock_is_charged_to_the_verified_latency() {
+        let complete = Latency {
+            p99_upper_bound_s: Some(0.01),
+            observed: 100,
+        };
+        let ahead = verified_p99(complete, 100, true, &[clock(3_000.0)]).unwrap();
+        assert!((ahead - 3.012).abs() < 1e-9, "{ahead}");
+        let behind = verified_p99(complete, 100, true, &[clock(-3_000.0)]).unwrap();
+        assert!((behind - 0.01).abs() < 1e-9, "{behind}");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use super::rig::{
     SinkSpec, StoreSpec,
 };
 use super::{LoadOptions, Verdict, criterion_four, write_report};
-use crate::measure::Machine;
+use crate::measure::{self, ClockOffset, Machine};
 
 const SLOT: &str = "sns_slot";
 const BUCKET: &str = "load-state";
@@ -54,6 +54,8 @@ struct Report {
     drained: bool,
     histogram_events: u64,
     p99_upper_bound_s: Option<f64>,
+    clock_offsets: Vec<ClockOffset>,
+    p99_verified_upper_bound_s: Option<f64>,
     moto_ceiling: Option<MotoCeiling>,
     criterion_4: Verdict,
 }
@@ -210,6 +212,7 @@ pub(super) async fn run(options: &LoadOptions) -> anyhow::Result<()> {
         .spawn(&options.binary, &spec, &target.env, "sns")
         .await?;
     let before = delivered(&receiver.received());
+    let mut clock_offsets = vec![measure::clock_offset(&bench.client).await?];
     let run = rig::sustain(
         &bench,
         &process,
@@ -223,6 +226,8 @@ pub(super) async fn run(options: &LoadOptions) -> anyhow::Result<()> {
         .await
         .is_ok();
     let latency = rig::latency(&receiver, run.written()).await;
+    clock_offsets.push(measure::clock_offset(&bench.client).await?);
+    let p99_verified = rig::verified_p99(latency, run.written(), drained, &clock_offsets);
     rig::stop(&mut process).await?;
     let moto_ceiling = match &target.aws {
         Some(aws) => Some(moto_ceiling(aws).await?),
@@ -232,14 +237,21 @@ pub(super) async fn run(options: &LoadOptions) -> anyhow::Result<()> {
     let criterion_4 = criterion_four(
         delivered_rate,
         run.kept_up(),
-        latency.p99_upper_bound_s,
+        p99_verified,
         moto_ceiling.as_ref().map(|ceiling| ceiling.entries_per_s),
     );
     writeln!(
         std::io::stdout(),
-        "load sns: offered {OFFERED_RATE}/s, delivered {delivered_rate:.0}/s, kept up {}, p99 upper bound {:?} s, moto ceiling {:?}/s, criterion 4 {}",
+        "load sns: offered {OFFERED_RATE}/s, delivered {delivered_rate:.0}/s, kept up {}, p99 upper bound {:?} s ({} of {} observed, verified with clock offsets {:?} ms: {:?} s), moto ceiling {:?}/s, criterion 4 {}",
         run.kept_up(),
         latency.p99_upper_bound_s,
+        latency.observed,
+        run.written(),
+        clock_offsets
+            .iter()
+            .map(|offset| offset.offset_ms.round())
+            .collect::<Vec<_>>(),
+        p99_verified,
         moto_ceiling.as_ref().map(|ceiling| ceiling.entries_per_s),
         serde_json::to_string(&criterion_4)?,
     )?;
@@ -261,6 +273,8 @@ pub(super) async fn run(options: &LoadOptions) -> anyhow::Result<()> {
         drained,
         histogram_events: latency.observed,
         p99_upper_bound_s: latency.p99_upper_bound_s,
+        clock_offsets,
+        p99_verified_upper_bound_s: p99_verified,
         moto_ceiling,
         criterion_4,
     };

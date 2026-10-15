@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use pg_cdc_testkit::{MOTO_TAG, Postgres};
@@ -26,6 +26,49 @@ pub struct Machine {
     pub moto: String,
     pub rustc: String,
     pub commit: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ClockOffset {
+    pub offset_ms: f64,
+    pub uncertainty_ms: f64,
+}
+
+pub fn offset_from(sent_ms: f64, received_ms: f64, database_ms: f64) -> ClockOffset {
+    ClockOffset {
+        offset_ms: database_ms - f64::midpoint(sent_ms, received_ms),
+        uncertainty_ms: (received_ms - sent_ms) / 2.0,
+    }
+}
+
+fn unix_ms() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64() * 1_000.0)
+}
+
+pub async fn clock_offset(client: &tokio_postgres::Client) -> anyhow::Result<ClockOffset> {
+    let sent = unix_ms();
+    let row = client
+        .query_one(
+            "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::float8",
+            &[],
+        )
+        .await?;
+    let received = unix_ms();
+    Ok(offset_from(sent, received, row.try_get(0)?))
+}
+
+pub fn commit_latency_upper_bound(
+    p99_upper_bound: Option<f64>,
+    offsets: &[ClockOffset],
+) -> Option<f64> {
+    let p99 = p99_upper_bound?;
+    let ahead_ms = offsets
+        .iter()
+        .map(|offset| offset.offset_ms + offset.uncertainty_ms)
+        .reduce(f64::max)?;
+    Some(p99 + ahead_ms.max(0.0) / 1_000.0)
 }
 
 pub fn parse_cpu_time(text: &str) -> Option<Duration> {
@@ -190,6 +233,44 @@ pub async fn machine(pg: &Postgres) -> anyhow::Result<Machine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offset(offset_ms: f64, uncertainty_ms: f64) -> ClockOffset {
+        ClockOffset {
+            offset_ms,
+            uncertainty_ms,
+        }
+    }
+
+    #[test]
+    fn a_database_clock_ahead_of_the_host_widens_the_latency_bound() {
+        let ahead = [offset(1_990.0, 5.0), offset(2_000.0, 10.0)];
+        let bound = commit_latency_upper_bound(Some(0.01), &ahead).unwrap();
+        assert!((bound - 2.02).abs() < 1e-9, "{bound}");
+    }
+
+    #[test]
+    fn a_database_clock_behind_the_host_leaves_the_measured_bound() {
+        let behind = [offset(-2_000.0, 5.0), offset(-1_500.0, 5.0)];
+        assert_eq!(commit_latency_upper_bound(Some(0.5), &behind), Some(0.5));
+        let straddling = [offset(-1.0, 4.0)];
+        let bound = commit_latency_upper_bound(Some(0.5), &straddling).unwrap();
+        assert!((bound - 0.503).abs() < 1e-9, "{bound}");
+    }
+
+    #[test]
+    fn no_clock_measurement_or_no_percentile_gives_no_bound() {
+        assert_eq!(commit_latency_upper_bound(Some(0.5), &[]), None);
+        assert_eq!(commit_latency_upper_bound(None, &[offset(0.0, 1.0)]), None);
+    }
+
+    #[test]
+    fn the_offset_is_the_database_time_against_the_midpoint_of_the_query() {
+        assert_eq!(
+            offset_from(1_000.0, 1_020.0, 3_010.0),
+            offset(2_000.0, 10.0)
+        );
+        assert_eq!(offset_from(1_000.0, 1_000.0, 500.0), offset(-500.0, 0.0));
+    }
 
     #[test]
     fn cpu_times_parse_in_every_ps_format() {
