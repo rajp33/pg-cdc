@@ -1043,3 +1043,86 @@ async fn a_final_status_update_that_cannot_be_sent_keeps_the_record_active() -> 
     assert_eq!(record.holder, "holder-a");
     Ok(())
 }
+
+async fn reply_time_ms(pg: &Postgres) -> TestResult<i64> {
+    let row = pg
+        .client()
+        .await?
+        .query_one(
+            "SELECT (extract(epoch FROM r.reply_time) * 1000)::bigint FROM pg_stat_replication r \
+             JOIN pg_replication_slots s ON s.active_pid = r.pid WHERE s.slot_name = $1",
+            &[&SLOT],
+        )
+        .await?;
+    Ok(row.try_get(0)?)
+}
+
+#[tokio::test]
+async fn l1_a_closed_gate_reads_within_the_inflight_bound_and_confirms_nothing() -> TestResult {
+    const ROWS: i64 = 30_000;
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let shared = memory();
+    let store = RecordingStore::over(Arc::clone(&shared));
+    store.stall_leader_swaps();
+    let mut config = support::config(FAST, BUFFER);
+    config.max_inflight_bytes = 2048;
+    let mut a = support::spawn_in_context(
+        support::params(&pg),
+        config,
+        store.stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    active(&a.health(), WAIT).await?;
+    wait_for_swaps(&store, 1).await?;
+    let start = pg
+        .slot_state(SLOT)
+        .await?
+        .and_then(|state| state.confirmed_flush_lsn)
+        .ok_or("the slot has no confirmed position")?;
+
+    pg.execute(&format!(
+        "INSERT INTO orders SELECT g, repeat('x', 1000) FROM generate_series(1, {ROWS}) g"
+    ))
+    .await?;
+    let end = pg.current_wal_lsn().await?;
+    let first_reply = reply_time_ms(&pg).await?;
+    assert!(a.no_event_within(Duration::from_secs(2)).await?);
+
+    let sent = pg.sent_lsn(SLOT).await?.ok_or("no walsender")?;
+    assert!(sent > start, "the session never read: {sent:#x}");
+    assert!(
+        sent < end,
+        "nothing held the walsender back: {sent:#x} {end:#x}"
+    );
+    let slot = pg.slot_state(SLOT).await?.ok_or("the slot disappeared")?;
+    assert_eq!(slot.confirmed_flush_lsn, Some(start), "{slot:?}");
+    assert!(reply_time_ms(&pg).await? > first_reply);
+    assert!(
+        store
+            .calls()
+            .iter()
+            .all(|call| matches!(*call, "read_leader" | "swap_leader")),
+        "{:?}",
+        store.calls()
+    );
+    assert!(a.health().snapshot().lease_valid);
+    a.abort().await?;
+
+    let mut b = support::spawn_in_context(
+        support::params(&pg),
+        support::config(FAST, BUFFER),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-b"),
+    );
+    let mut replayed = BTreeSet::new();
+    while replayed.len() < usize::try_from(ROWS)? {
+        replayed.insert(row(&b.next_event().await?));
+    }
+    assert_eq!(replayed, (1..=ROWS).collect::<BTreeSet<_>>());
+    let record = leader(&shared).await?.value;
+    assert_eq!((record.epoch, record.holder.as_str()), (1, "holder-b"));
+    b.stop().await
+}
