@@ -6,7 +6,7 @@ Status: every v1 milestone of the [design](docs/superpowers/specs/2026-10-14-pg-
 
 Measured against the design's section 4 ([docs/load.md](docs/load.md)), on one laptop with Postgres and moto in Docker:
 
-- **Passed:** nothing lost and per-key order held through a 10-minute chaos run (criteria 1 and 2); five deploy handovers under load were ready within 2.21 s with nothing lost (criterion 5); memory stayed flat from 50,000 to 500,000-row transactions, at 122 MiB peak with `max_inflight_bytes: 64MiB` and a stalled sink (criterion 6).
+- **Passed:** nothing lost and per-key order held through a 10-minute chaos run (criteria 1 and 2); five deploy handovers under load were ready within 1.85 s with nothing lost (criterion 5); memory stayed flat from 50,000 to 500,000-row transactions, at 122 MiB peak with `max_inflight_bytes: 64MiB` and a stalled sink (criterion 6).
 - **Unverified:** 5,000 events/s against SNS with p99 under 1 s (criterion 4) and bounded WAL during a sink outage (criterion 3). In both runs moto's own ceiling (4,364 SNS messages/s, 636 S3 puts/s) was below the load, so they stay unverified until the pre-production runs against a real SNS topic and S3 bucket pass ([runbook](docs/runbook.md#7-pre-production-checklist)). pg-cdc alone drains 228,772 events/s into the discard sink.
 - **Not resolved:** telemetry overhead within 1% (criterion 7). Two runs gave +1.71% and -0.73%, with run-to-run spread of 8% to 14% on a shared machine.
 

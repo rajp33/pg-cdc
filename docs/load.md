@@ -6,7 +6,7 @@ The section 4 criteria this milestone measures, as `loadgen report` summarizes t
 |---|---|---|---|---|
 | 3. WAL stays bounded during a sink outage | retained WAL about park_after of write volume | peak retained 77.7 MiB against 2.8 MiB written in park_after (5 s); parking stored 632 events/s against 1000 written; drain incomplete at the 180 s limit: 74,135 events still parked 180 s after writes stopped and still rising (179.4 events/s), so no drain rate was measured; moto's own PutObject ceiling 636 puts/s; pending the real-S3 check (R128) | unverified (emulator-bound) | outage |
 | 4. Throughput against SNS | at least 5,000 events/s with p99 commit-to-acknowledgement under 1 s | delivered 3822 events/s, p99 upper bound 60.00 s; moto's own ceiling 4364 messages/s; pending the real-SNS check (R128) | unverified (emulator-bound) | sns |
-| 5. Handover | a deploy handover under 10 s with nothing lost | 5 handovers: worst SIGTERM to /readyz 2.21 s, worst delivery gap 2.06 s, worst exit 0.19 s; evidence intact | pass | handover |
+| 5. Handover | a deploy handover under 10 s with nothing lost | 5 handovers: worst SIGTERM to /readyz 1.85 s, worst delivery gap 1.95 s, worst exit 0.10 s; evidence intact | pass | handover |
 | 6. Memory | within max_inflight_bytes plus fixed overhead whatever the transaction size | peak RSS 122.3 MiB with max_inflight_bytes 64 MiB, flat from 50,000 to 500,000 rows | pass | memory |
 | 7. Telemetry overhead | within 1% of a build without the otel feature when unconfigured | -0.73% CPU per event, runs spread 14.0%, beyond the 1% to resolve | not resolved | overhead |
 
@@ -25,7 +25,7 @@ Numbers recorded here come from the `loadgen` binary, which drives pg-cdc as a c
 - The checker passes when every committed change was delivered at least once under the key it was written with, is still parked in S3 or was discarded by the harness, when the first delivery of each change comes after the delivery or discard of every smaller committed change of its key, and when nothing was delivered that was not written. A delivery under a different key counts as a phantom.
 - The run also fails when an instance exits non-zero after SIGTERM, when a published message cannot be read, when a key's messages arrive under two FIFO message groups, or when the instances' logs do not show at least one `clean` and one `unclean` takeover (`took over the slot`).
 
-Deliveries are recorded at the SNS proxy rather than read back from a FIFO queue behind the topic. Moto's FIFO queue cost grows with its depth: sending 3,000 messages into one without reading took 128 s, and after every takeover the backlog flush buried it, so a smoke run that needs seconds took six minutes. The proxy forwards one SNS request at a time, so the order it records is the order moto accepted the publishes. It records a `PublishBatch` entry only when moto's reply lists the entry's `Id` under `Successful`, so a partly failed batch counts only its accepted entries. Discard markers go into the same log at the moment before the discard request.
+Deliveries are recorded at the SNS proxy rather than read back from a FIFO queue behind the topic. Moto's FIFO queue cost grows with its depth: sending 3,000 messages into one without reading took 128 s, and after every takeover the backlog flush buried it, so a smoke run that needs seconds took six minutes. The proxy forwards one SNS request at a time per FIFO message group: a request waits while another request for any of its groups is at moto. For each key, therefore, the recorded order is the order moto accepted the publishes, and keys do not wait for each other. It records a `PublishBatch` entry only when moto's reply lists the entry's `Id` under `Successful`, so a partly failed batch counts only its accepted entries. Discard markers go into the same log at the moment before the discard request.
 
 The settle window is a stall limit. `--settle` is how long the run waits without any committed change leaving the outstanding set, and the run ends at ten times that in any case. Parked queues of hot keys drain one event at a time, so a backlog from a long outage legitimately takes longer than one window.
 
@@ -33,12 +33,12 @@ Each run writes its report as JSON (`target/chaos/smoke.json` or `full.json`), t
 
 ### Smoke run
 
-`mise run chaos-smoke` builds the debug binary and runs seed 1 for 15 s, after the opening takeovers, with a 30 s settle window. It runs as its own CI job and in `mise run ci`, and takes about two minutes on the machine below. Three runs in a row on commit `36441d1`:
+`mise run chaos-smoke` builds the debug binary and runs seed 1 for 15 s, after the opening takeovers, with a 30 s settle window. It runs as its own CI job and in `mise run ci`, and takes about two minutes on the machine below. Three runs in a row on commit `622b3e8`:
 
 ```
-chaos seed=1 duration=15s verdict=pass committed=8206 delivered=8203 duplicates=105 stored=0 discarded=3 takeovers=3 clean=1 unclean=2 redrives=1 discards=3 missing=0 phantoms=0 out_of_order=0
-chaos seed=1 duration=15s verdict=pass committed=7991 delivered=7988 duplicates=197 stored=0 discarded=3 takeovers=3 clean=1 unclean=2 redrives=1 discards=3 missing=0 phantoms=0 out_of_order=0
-chaos seed=1 duration=15s verdict=pass committed=6543 delivered=6540 duplicates=10 stored=0 discarded=3 takeovers=3 clean=2 unclean=1 redrives=1 discards=3 missing=0 phantoms=0 out_of_order=0
+chaos seed=1 duration=15s verdict=pass committed=6586 delivered=6583 duplicates=250 stored=0 discarded=3 takeovers=3 clean=2 unclean=1 redrives=1 discards=3 missing=0 phantoms=0 out_of_order=0
+chaos seed=1 duration=15s verdict=pass committed=6580 delivered=6577 duplicates=38 stored=0 discarded=3 takeovers=3 clean=2 unclean=1 redrives=1 discards=3 missing=0 phantoms=0 out_of_order=0
+chaos seed=1 duration=15s verdict=pass committed=6623 delivered=6620 duplicates=256 stored=0 discarded=3 takeovers=3 clean=2 unclean=1 redrives=1 discards=3 missing=0 phantoms=0 out_of_order=0
 ```
 
 ### Ten-minute run
@@ -205,14 +205,14 @@ The scenarios stop `--drain-limit` after the writer stops (default 3 minutes), o
 
 ### Handover (criterion 5)
 
-Command: `LOAD_SCENARIO=handover mise run load`. pg-cdc release build (unchanged since commit `dea6918`), loadgen at commit `36441d1`. A FIFO SNS topic and the S3 state store on moto, two pg-cdc instances with the default leadership settings (`lease_timeout: 6s`, `fence_delay: 10s`, `drain_timeout: 5s`), the writer at 500 events/s over 1,000 keys. Five times: wait 20 s plus a random share of the 2 s standby poll, SIGTERM the active instance, and measure three times: to the old instance's exit, until the standby's `/readyz` answers 200, and the largest gap between consecutive deliveries around the handover. Then start the stopped instance again as the next standby. Deliveries are recorded at the SNS proxy as in the chaos run: only accepted entries, in the order moto accepted them. After the last round the writer stops, the run settles and the chaos checker reads the evidence. Criterion 5 passes only when every handover is ready and every gap is under 10 s, the checker passes, and the run recorded no problem: no non-zero exit, forced kill, unreadable message or message group mismatch.
+Command: `LOAD_SCENARIO=handover mise run load`. pg-cdc release build (unchanged since commit `dea6918`), loadgen at commit `622b3e8`. A FIFO SNS topic and the S3 state store on moto, two pg-cdc instances with the default leadership settings (`lease_timeout: 6s`, `fence_delay: 10s`, `drain_timeout: 5s`), the writer at 500 events/s over 1,000 keys. Five times: wait 20 s plus a random share of the 2 s standby poll, SIGTERM the active instance, and measure three times: to the old instance's exit, until the standby's `/readyz` answers 200, and the largest gap between consecutive deliveries around the handover. Then start the stopped instance again as the next standby. Deliveries are recorded at the SNS proxy as in the chaos run: only accepted entries, in the order moto accepted them per message group. After the last round the writer stops, the run settles and the chaos checker reads the evidence. Criterion 5 passes only when every handover is ready and every gap is under 10 s, the checker passes, and the run recorded no problem: no non-zero exit, forced kill, unreadable message or message group mismatch.
 
 | Round | SIGTERM to old exit | SIGTERM to new `/readyz` 200 | Largest delivery gap |
 |---|---|---|---|
-| 1 | 0.09 s | 1.01 s | 0.97 s |
-| 2 | 0.14 s | 1.31 s | 1.19 s |
-| 3 | 0.19 s | 1.86 s | 1.70 s |
-| 4 | 0.08 s | 0.75 s | 0.70 s |
-| 5 | 0.19 s | 2.21 s | 2.06 s |
+| 1 | 0.02 s | 0.91 s | 0.98 s |
+| 2 | 0.01 s | 1.17 s | 1.20 s |
+| 3 | 0.02 s | 1.85 s | 1.95 s |
+| 4 | 0.10 s | 0.64 s | 0.60 s |
+| 5 | 0.04 s | 0.19 s | 0.24 s |
 
-The checker saw 58,400 committed changes and 58,400 delivered. There were no duplicates, nothing missing, no phantoms, nothing out of order and no problems. Criterion 5 passes: every handover was ready in under 10 s (worst 2.21 s), the worst delivery gap was 2.06 s, and nothing was lost. Readiness varies by up to one standby poll of `pg_replication_slots` (2 s; section 12.5, "the drain plus one poll"), depending on where the poll falls after the old instance releases the slot. Two earlier runs with the previous evidence collection also passed: worst ready 2.21 s and gap 2.05 s, then 1.73 s and 1.83 s. The report is `u6-r1-handover.json` in the milestone workspace.
+The checker saw 57,200 committed changes and 57,200 delivered. There were no duplicates, nothing missing, no phantoms, nothing out of order and no problems. Criterion 5 passes: every handover was ready in under 10 s (worst 1.85 s), the worst delivery gap was 1.95 s, and nothing was lost. Readiness varies by up to one standby poll of `pg_replication_slots` (2 s; section 12.5, "the drain plus one poll"), depending on where the poll falls after the old instance releases the slot. Three earlier runs also passed: two with the previous evidence collection (worst ready 2.21 s and gap 2.05 s, then 1.73 s and 1.83 s), and one with a single global ordering gate (2.21 s and 2.06 s). The report is `u6-r1-handover.json` in the milestone workspace.
