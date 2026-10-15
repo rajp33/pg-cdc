@@ -288,9 +288,7 @@ impl Lane {
             return;
         }
         let outbound = head.outbound();
-        if outbound.encoded_len() <= self.capabilities.max_message_bytes {
-            self.heads_in_memory += 1;
-        }
+        self.heads_in_memory += 1;
         stored.head = Some(outbound);
         self.make_ready(key);
     }

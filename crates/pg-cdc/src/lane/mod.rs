@@ -165,6 +165,7 @@ struct Key {
     backoff: Backoff,
     failure: Option<Failure>,
     stored: Option<Stored>,
+    offloaded: Option<Outbound>,
 }
 
 impl Key {
@@ -174,6 +175,7 @@ impl Key {
             backoff: Backoff::new(RETRY_BASE, RETRY_CAP),
             failure: None,
             stored: None,
+            offloaded: None,
         }
     }
 }
@@ -375,7 +377,10 @@ impl Lane {
         let state = self.keys.get(key)?;
         match &state.stored {
             Some(stored) => stored.head.as_ref(),
-            None => state.queue.front().map(|pending| &pending.outbound),
+            None => state
+                .offloaded
+                .as_ref()
+                .or_else(|| state.queue.front().map(|pending| &pending.outbound)),
         }
     }
 
@@ -463,6 +468,7 @@ impl Lane {
         }
         match outcome {
             Outcome::Delivered => {
+                state.offloaded = None;
                 let Some(head) = state.queue.pop_front() else {
                     return;
                 };

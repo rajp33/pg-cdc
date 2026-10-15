@@ -12,7 +12,7 @@ impl Lane {
         let Some(key) = self.to_offload.pop_front() else {
             return;
         };
-        let (Some(payload), Some(head)) = (self.payload.clone(), self.front(&key).cloned()) else {
+        let (Some(payload), Some(head)) = (self.payload.clone(), self.original(&key)) else {
             return;
         };
         let reference = match payload.put(&head.id, &head.body).await {
@@ -46,17 +46,18 @@ impl Lane {
             return;
         };
         match state.stored.as_mut() {
-            Some(stored) => {
-                stored.head = Some(pointer);
-                self.heads_in_memory += 1;
-            }
-            None => {
-                if let Some(front) = state.queue.front_mut() {
-                    front.outbound = pointer;
-                }
-            }
+            Some(stored) => stored.head = Some(pointer),
+            None => state.offloaded = Some(pointer),
         }
         self.ready.push_back(key);
+    }
+
+    fn original(&self, key: &OrderKeyId) -> Option<Outbound> {
+        let state = self.keys.get(key)?;
+        match &state.stored {
+            Some(stored) => stored.head.clone(),
+            None => state.queue.front().map(|pending| pending.outbound.clone()),
+        }
     }
 
     fn offload_failed(&mut self, key: OrderKeyId, error: &SinkError) {
@@ -64,7 +65,9 @@ impl Lane {
             return;
         };
         if let Some(stored) = state.stored.as_mut() {
-            stored.head = None;
+            if stored.head.take().is_some() {
+                self.heads_in_memory = self.heads_in_memory.saturating_sub(1);
+            }
             tracing::warn!(order_key = %key, %error, "retrying a parked oversize event");
             state.record_failure(error);
             let delay = state.backoff.next_delay();

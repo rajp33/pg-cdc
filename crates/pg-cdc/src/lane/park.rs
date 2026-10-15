@@ -60,6 +60,7 @@ impl Lane {
             return;
         }
         let floor = state.queue.front().map(|pending| pending.outbound.id);
+        state.offloaded = None;
         state.stored = Some(Stored {
             floor,
             dead_on_append: dead,
@@ -93,6 +94,7 @@ impl Lane {
         };
         if let Some(stored) = state.stored.as_mut() {
             if let Some(head) = stored.head.take() {
+                self.heads_in_memory = self.heads_in_memory.saturating_sub(1);
                 tracing::error!(order_key = %key, id = %head.id, %error, "a parked event cannot be sent; marking it dead");
                 self.to_kill.push((key, head.id));
             }

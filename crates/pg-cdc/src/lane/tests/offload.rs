@@ -129,3 +129,74 @@ async fn a_parked_oversize_event_drains_as_a_pointer() {
     assert_eq!(harness.store.queue(b"k").await, vec![]);
     assert_eq!(payloads.stored.lock().unwrap().len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn oversize_parked_heads_waiting_for_offload_stay_within_one_batch() {
+    let store = TestStore::default();
+    for key in 0u8..24 {
+        let ordinal = u32::from(key);
+        store
+            .inner
+            .append_parked(&[ParkedEvent {
+                body: envelope(ordinal, 400),
+                ..parked(&[key], ordinal, ParkStatus::Retrying)
+            }])
+            .await
+            .unwrap();
+    }
+    let limits = SinkCapabilities {
+        max_batch_messages: 4,
+        max_message_bytes: 300,
+        ..LIMITS
+    };
+    let mut sink = ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered));
+    sink.latency = Duration::from_millis(10);
+    let harness = Harness::start_with_payloads(
+        Setup::default(),
+        sink,
+        store,
+        Some(Arc::new(TestPayloads::default())),
+    )
+    .await;
+    let mut delivered = harness.delivered(24).await;
+    delivered.sort_unstable();
+    assert_eq!(delivered, (0..24).collect::<Vec<u32>>());
+    assert!(harness.store.peak_outstanding.load(Ordering::SeqCst) <= 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_pointer_that_cannot_be_delivered_parks_the_full_event() {
+    let payloads = Arc::new(TestPayloads::default());
+    let limits = SinkCapabilities {
+        max_message_bytes: 300,
+        ..LIMITS
+    };
+    let script: Script = Box::new(|_, _| Outcome::Retryable(SinkError("down".to_owned())));
+    let setup = Setup {
+        park_after: Duration::from_secs(1),
+        ..Setup::default()
+    };
+    let mut harness = Harness::start_with_payloads(
+        setup,
+        ScriptedSink::new(limits, script),
+        TestStore::default(),
+        Some(Arc::clone(&payloads)),
+    )
+    .await;
+    let full = envelope(0, 400);
+    harness.send_body(0, b"k", full.clone()).unwrap();
+    assert_eq!(harness.settle(1).await, Lsn(100));
+    let queue = harness
+        .store
+        .inner
+        .read_parked(&OrderKeyId::of(b"k"), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].body, full);
+    let bodies = harness.sink.bodies.lock().unwrap().clone();
+    assert_eq!(
+        std::str::from_utf8(&bodies[&0]).unwrap(),
+        pointer(0, full.len())
+    );
+}
