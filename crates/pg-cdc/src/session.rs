@@ -148,7 +148,7 @@ pub async fn run_session(
         .stream(&mut stream, &mut settled, shutdown, start)
         .await?;
     session.drain(&stream, &mut settled).await?;
-    session.lanes.shutdown().await;
+    session.lanes.stop(Duration::ZERO).await;
     if let Err(error) = stream.stop().await {
         tracing::warn!(%error, "replication stream did not stop cleanly");
     }

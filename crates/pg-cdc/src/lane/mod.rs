@@ -81,7 +81,8 @@ enum Inbound {
 #[derive(Debug)]
 pub struct Lanes {
     inboxes: Vec<mpsc::UnboundedSender<Inbound>>,
-    tasks: JoinSet<()>,
+    running: JoinSet<()>,
+    loader: JoinSet<()>,
 }
 
 impl Lanes {
@@ -94,7 +95,7 @@ impl Lanes {
     ) -> Self {
         let capabilities = sink.capabilities();
         let parked = Arc::new(AtomicU64::new(0));
-        let mut tasks = JoinSet::new();
+        let mut running = JoinSet::new();
         let inboxes: Vec<_> = (0..settings.lanes.max(1))
             .map(|index| {
                 let (inbox, receiver) = mpsc::unbounded_channel();
@@ -127,17 +128,22 @@ impl Lanes {
                     parked: Arc::clone(&parked),
                     closing: false,
                 };
-                tasks.spawn(lane.run());
+                running.spawn(lane.run());
                 inbox
             })
             .collect();
-        tasks.spawn(loader::load(
+        let mut loader = JoinSet::new();
+        loader.spawn(loader::load(
             Arc::clone(&stores.state),
             inboxes.clone(),
             settings.store_concurrency,
             parked,
         ));
-        Self { inboxes, tasks }
+        Self {
+            inboxes,
+            running,
+            loader,
+        }
     }
 
     pub fn dispatch(&self, pending: Pending) -> Result<(), LaneStopped> {
@@ -154,8 +160,23 @@ impl Lanes {
         }
     }
 
-    pub async fn shutdown(mut self) {
-        self.tasks.shutdown().await;
+    pub async fn stop(self, grace: Duration) -> bool {
+        let Self {
+            inboxes,
+            mut running,
+            mut loader,
+        } = self;
+        loader.shutdown().await;
+        drop(inboxes);
+        let exited = tokio::time::timeout(grace, async {
+            while running.join_next().await.is_some() {}
+        })
+        .await
+        .is_ok();
+        if !exited {
+            running.shutdown().await;
+        }
+        exited
     }
 }
 

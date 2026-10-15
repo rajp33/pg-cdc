@@ -699,7 +699,68 @@ async fn dispatch_routes_each_order_key_to_its_lane() {
     harness.send(1, &second, 10).unwrap();
     harness.settle(2).await;
     assert_eq!(harness.sink.batches(), vec![vec![0, 1]]);
-    harness.lanes.shutdown().await;
+    harness.lanes.stop(Duration::ZERO).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_waits_for_a_send_in_flight_and_reports_a_clean_stop() {
+    let mut sink = ScriptedSink::delivering();
+    sink.latency = Duration::from_millis(300);
+    let mut harness = Harness::new(1, 1, sink).await;
+    harness.send(0, b"k", 10).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(harness.lanes.stop(Duration::from_secs(1)).await);
+    assert_eq!(harness.sink.batches(), vec![vec![0]]);
+    match harness.reports.recv().await {
+        Some(Report::Settled(settled)) => {
+            assert_eq!(harness.ack.settle(settled).unwrap(), Lsn(100));
+        }
+        other => panic!("expected a settlement, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_aborts_a_lane_stuck_past_the_grace() {
+    let mut sink = ScriptedSink::delivering();
+    sink.latency = Duration::from_secs(3600);
+    let mut harness = Harness::new(1, 1, sink).await;
+    harness.send(0, b"k", 10).unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let started = Instant::now();
+    assert!(!harness.lanes.stop(Duration::from_secs(1)).await);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+    assert_eq!(harness.sink.sends(), vec![]);
+    assert!(harness.reports.recv().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_while_heads_are_loading_aborts_the_loader_and_lets_lanes_exit() {
+    let store = TestStore::default();
+    store.hold(0);
+    let harness = Harness::start(
+        Setup {
+            lanes: 2,
+            ..Setup::default()
+        },
+        ScriptedSink::delivering(),
+        store,
+    )
+    .await;
+    let started = Instant::now();
+    assert!(harness.lanes.stop(Duration::from_secs(1)).await);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_with_zero_grace_aborts_at_once() {
+    let mut sink = ScriptedSink::delivering();
+    sink.latency = Duration::from_secs(3600);
+    let mut harness = Harness::new(1, 1, sink).await;
+    harness.send(0, b"k", 10).unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let started = Instant::now();
+    assert!(!harness.lanes.stop(Duration::ZERO).await);
+    assert_eq!(started.elapsed(), Duration::ZERO);
 }
 
 proptest! {
