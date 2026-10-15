@@ -173,10 +173,10 @@ Command: `LOAD_SCENARIO=outage mise run load`. Release build of commit `16230f7`
 | Criterion 3 | unverified (emulator-bound) |
 | Parked 90 s after the writer stopped | 95,015 events on 1,000 keys, still rising (58,062 when the writer stopped) |
 | In flight and lag at the deadline | 30 MiB in flight, 44 MiB of WAL not yet confirmed |
-| Parked events removed after redelivery | 809 in the whole run; 5.8 a second in the 90 s after the writer stopped |
+| Parked deletes requested (attempts, including retries and failed requests; measured before `5d3df67`) | 809 in the whole run; 5.8 a second in the 90 s after the writer stopped |
 | SNS requests | 12,026 publish requests, 6,518 refused during the outage |
 
-Cause: moto bounds the parking rate. pg-cdc stored 588 parked events a second while moto took at most 628 direct `PutObject` calls a second, so parking could not keep up with 1,000 events/s and retained WAL grew with the backlog instead of staying near one `park_after` of writes. Because moto, not pg-cdc, set the ceiling, criterion 3 is recorded as unverified rather than failed (R128): it needs a run against real S3. Once the SNS proxy recovered every key already had a parked queue (all 1,000 by 60 s), so every later event queued behind it and parked too. Parking that backlog used all of moto's capacity until the deadline, so the drain got almost none of it; see the drain section below. The report is `target/load/outage.json`, copied to the milestone workspace as `u6-drain-outage.json`. An earlier run at commit `dea6918` with the old code and a 3-minute drain window measured the same shape: 632 events/s parked, 77.7 MiB retained, 658 parked events removed in the whole run (`u6-t14-outage.json`).
+Cause: moto bounds the parking rate. pg-cdc stored 588 parked events a second while moto took at most 628 direct `PutObject` calls a second, so parking could not keep up with 1,000 events/s and retained WAL grew with the backlog instead of staying near one `park_after` of writes. Because moto, not pg-cdc, set the ceiling, criterion 3 is recorded as unverified rather than failed (R128): it needs a run against real S3. Once the SNS proxy recovered every key already had a parked queue (all 1,000 by 60 s), so every later event queued behind it and parked too. Parking that backlog used all of moto's capacity until the deadline, so the drain got almost none of it; see the drain section below. The report is `target/load/outage.json`, copied to the milestone workspace as `u6-drain-outage.json`. An earlier run at commit `dea6918` with the old code and a 3-minute drain window measured the same shape: 632 events/s parked, 77.7 MiB retained, 658 parked deletes requested in the whole run, counting retries and failed requests (`u6-t14-outage.json`).
 
 ### S3 brownout during a sink outage (R136)
 
@@ -192,7 +192,7 @@ Command: `LOAD_SCENARIO=brownout mise run load`, the outage scenario with the S3
 | Peak slot retained bytes | 84.5 MiB, against 2.8 MiB written in one `park_after` |
 | Parked 3 minutes after the writer stopped | 102,427 events on 948 keys, still rising (649 when the writer stopped) |
 | Lag at the deadline | 79 MiB of WAL not yet confirmed, 24 MiB in flight |
-| Parked events removed after redelivery (S3 deletes, whole run) | 2,241 |
+| Parked deletes requested (attempts, including retries and failed requests; measured before `5d3df67`; whole run) | 2,241 |
 
 Parking falls far behind the write rate during an S3 brownout: about 58 events a second at 500 ms of added latency and 15 at 2 s, against 1,000 written, because each parked event is its own S3 write and at most `state_store.max_concurrency` store calls are in flight, 32 in this run: 32 calls at 0.5 s and at 2 s allow about 64 and 16 writes a second. The default is now 256, which allows eight times that; the brownout was not re-run. The reader stalls at `max_inflight_bytes` and Postgres holds the WAL; nothing is lost, and the backlog parks once S3 recovers. This is a v1 limit, recorded in the runbook, and the reason for the segmented S3 layout in v1.1 (section 20, item 3); the inline S3 write of M3.10 is unchanged. The `/status` parked count stayed near 650 from 60 s to 150 s while the S3 proxy accepted about 627 parked writes a second, then rose by about 100,000 in the next three minutes; the approximate count lags the store during a backlog. The report is `u6-t14-brownout.json` in the milestone workspace.
 
@@ -205,7 +205,7 @@ Draining a parked event used to cost three S3 requests in series: a `ListObjects
 | Drain probe on moto: 112,000 parked events on 1,000 keys, S3 and SNS behind the fault proxies, 64 lanes, store concurrency 32, no new writes | 21 to 31 events/s (four 60 s windows, commit `dea6918`) | 133 events/s over a 30 s window, 229 to 263 events/s in its last 10 s and still rising (commit `8fd05b1`) |
 | Model S3 at 20 ms per request, 20,000 events on 1,000 keys, 64 lanes, three requests per drained event (`lane::tests::drain`) | 38.6 s at 32 permits (518 events/s) | 5.9 s at 256 (3,390 events/s) |
 | Same model with 1,000 new events/s for 30 s | the parked count doubles, to 40,487 | the parked count falls to 0 |
-| Outage scenario: parked events removed per second while the WAL backlog still parks | 2.5 and 8.6 (whole run after the outage, the outage and brownout runs) | 5.8 (90 s after the writer stopped) |
+| Outage scenario: parked deletes requested per second while the WAL backlog still parks (attempts, including retries and failed requests; measured before `5d3df67`) | 2.5 and 8.6 (whole run after the outage, the outage and brownout runs) | 5.8 (90 s after the writer stopped) |
 
 Moto still bounds what these runs show:
 
@@ -217,7 +217,7 @@ Against real S3 at 20 to 50 ms a request, 256 permits and about 1.1 requests per
 
 Nothing is lost while a backlog drains, and keys without a parked queue keep flowing. But after an outage that parked every key, every key's new events queue behind its backlog, so delivery lags by the drain time; alert on `pgcdc.parked.oldest_age`.
 
-The outage scenarios stop `--drain-limit` after the writer stops (default 90 s), or earlier once no key is parked and lag is under 16 MiB. They report what is still parked, the rate at which the parked count fell over that window (from the once-a-second `/status` samples), the parked events removed per second (the S3 proxy's count of deleted parked objects) and the time the rest would take at the falling rate. The report's `drain.complete` is true only when the last sample was caught up, and the summary row reads "drain complete" or "drain incomplete at the N s limit".
+The outage scenarios stop `--drain-limit` after the writer stops (default 90 s), or earlier once no key is parked and lag is under 16 MiB. They report what is still parked, the rate at which the parked count fell over that window (from the once-a-second `/status` samples), the parked events removed per second (`parked_removed`: the parked objects the S3 proxy saw the upstream confirm deleted, each counted once; since `5d3df67`, so the delete figures above, measured before it, count requests instead) and the time the rest would take at the falling rate. The report's `drain.complete` is true only when the last sample was caught up, and the summary row reads "drain complete" or "drain incomplete at the N s limit".
 
 ### Handover (criterion 5)
 
