@@ -2380,6 +2380,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg-cdc-loadgen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "fastrand",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tokio-util",
+]
+
+[[package]]
 name = "pg-cdc-replication"
 version = "0.1.0"
 dependencies = [
