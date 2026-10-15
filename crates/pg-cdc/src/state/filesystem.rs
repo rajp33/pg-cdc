@@ -1,12 +1,13 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::thread;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
 
 use super::{
     LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEvent, ParkedHead, StateStore,
@@ -19,6 +20,7 @@ pub const LEADER_LOCK: &str = "leader.lock";
 const CREATE_ATTEMPTS: usize = 3;
 
 type Cancelled<'a> = &'a dyn Fn() -> bool;
+type LeaderJob = Box<dyn FnOnce(&Path) + Send>;
 
 struct CancelOnDrop {
     flag: Arc<AtomicBool>,
@@ -40,10 +42,44 @@ fn check(cancelled: Cancelled<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct LeaderWorker {
+    jobs: Mutex<Option<mpsc::Sender<LeaderJob>>>,
+}
+
+impl LeaderWorker {
+    fn submit(&self, root: &Path, job: LeaderJob) -> Result<(), StoreError> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let job = match jobs.as_ref() {
+            Some(sender) => match sender.send(job) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        let (sender, receiver) = mpsc::channel::<LeaderJob>();
+        let root = root.to_path_buf();
+        thread::Builder::new()
+            .name("pg-cdc-leader".to_owned())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    job(&root);
+                }
+            })
+            .map_err(|error| StoreError::Unavailable(format!("leader worker: {error}")))?;
+        sender
+            .send(job)
+            .map_err(|_| StoreError::Unavailable("the leader worker stopped".to_owned()))?;
+        *jobs = Some(sender);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemStateStore {
     root: PathBuf,
     permits: Arc<Semaphore>,
+    leader: Arc<LeaderWorker>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,6 +96,7 @@ impl FilesystemStateStore {
             permits: Arc::new(Semaphore::new(
                 max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
             )),
+            leader: Arc::default(),
         }
     }
 
@@ -73,14 +110,6 @@ impl FilesystemStateStore {
             .acquire()
             .await
             .map_err(|_| StoreError::Unavailable("the store is closed".to_owned()))?;
-        self.unbounded(operation).await
-    }
-
-    async fn unbounded<T, F>(&self, operation: F) -> Result<T, StoreError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&Path, Cancelled<'_>) -> Result<T, StoreError> + Send + 'static,
-    {
         let root = self.root.clone();
         let flag = Arc::new(AtomicBool::new(false));
         let mut guard = CancelOnDrop {
@@ -92,6 +121,23 @@ impl FilesystemStateStore {
                 .await;
         guard.completed = true;
         joined.map_err(|error| StoreError::Unavailable(error.to_string()))?
+    }
+
+    async fn leader<T, F>(&self, operation: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Path) -> Result<T, StoreError> + Send + 'static,
+    {
+        let (reply, answer) = oneshot::channel();
+        self.leader.submit(
+            &self.root,
+            Box::new(move |root| {
+                let _ = reply.send(operation(root));
+            }),
+        )?;
+        answer
+            .await
+            .map_err(|_| StoreError::Unavailable("the leader worker stopped".to_owned()))?
     }
 }
 
@@ -421,7 +467,7 @@ impl StateStore for FilesystemStateStore {
     }
 
     async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
-        self.unbounded(|root, _| {
+        self.leader(|root| {
             Ok(read_leader_file(root)?.map(|file| Versioned {
                 value: file.record,
                 version: Version(file.version.to_string()),
@@ -436,7 +482,7 @@ impl StateStore for FilesystemStateStore {
         expected: Option<&Version>,
     ) -> Result<SwapOutcome, StoreError> {
         let (next, expected) = (next.clone(), expected.cloned());
-        self.unbounded(move |root, _| swap(root, next, expected.as_ref()))
+        self.leader(move |root| swap(root, next, expected.as_ref()))
             .await
     }
 }
@@ -539,6 +585,74 @@ mod tests {
         )
         .await;
         assert!(parked_read.is_err());
+    }
+
+    #[test]
+    fn leader_calls_finish_while_parking_occupies_every_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FilesystemStateStore::new(dir.path(), "orders", 4);
+            let (started, mut running) = tokio::sync::mpsc::unbounded_channel();
+            let mut releases = Vec::new();
+            let mut parking = Vec::new();
+            for _ in 0..2 {
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                releases.push(release);
+                let (store, started) = (store.clone(), started.clone());
+                parking.push(tokio::spawn(async move {
+                    store
+                        .blocking(move |_, _| {
+                            started.send(()).unwrap();
+                            let _ = wait.recv();
+                            Ok(())
+                        })
+                        .await
+                }));
+            }
+            for _ in 0..2 {
+                timeout(Duration::from_secs(5), running.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+
+            let swapped = timeout(Duration::from_secs(2), store.swap_leader(&record(), None)).await;
+            assert!(
+                matches!(swapped, Ok(Ok(SwapOutcome::Swapped(_)))),
+                "{swapped:?}"
+            );
+            let read = timeout(Duration::from_secs(2), store.read_leader())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.value, record());
+
+            drop(releases);
+            for call in parking {
+                call.await.unwrap().unwrap();
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_stopped_leader_worker_is_replaced_on_the_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilesystemStateStore::new(dir.path(), "orders", 2);
+        assert!(store.read_leader().await.unwrap().is_none());
+        *store.leader.jobs.lock().unwrap() = Some(mpsc::channel().0);
+        let swapped = store.swap_leader(&record(), None).await;
+        assert!(
+            matches!(swapped, Ok(SwapOutcome::Swapped(_))),
+            "{swapped:?}"
+        );
+        let read = store.read_leader().await.unwrap().unwrap();
+        assert_eq!(read.value, record());
     }
 
     #[tokio::test]
