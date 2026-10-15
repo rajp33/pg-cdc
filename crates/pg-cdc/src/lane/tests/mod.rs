@@ -380,6 +380,7 @@ struct Setup {
     park_after: Duration,
     max_parked_events: u64,
     store_concurrency: usize,
+    instrumented: bool,
 }
 
 impl Default for Setup {
@@ -390,6 +391,7 @@ impl Default for Setup {
             park_after: Duration::from_secs(30),
             max_parked_events: 0,
             store_concurrency: 4,
+            instrumented: false,
         }
     }
 }
@@ -433,10 +435,13 @@ impl Harness {
             max_parked_events: setup.max_parked_events,
             store_concurrency: setup.store_concurrency,
         };
-        let stores = Stores {
+        let mut stores = Stores {
             state: store.clone(),
             payload: payloads.map(|payloads| payloads as Arc<dyn PayloadStore>),
         };
+        if setup.instrumented {
+            stores = crate::state::instrumented::instrumented(&stores);
+        }
         let lanes = Lanes::spawn(
             settings,
             &dyn_sink,

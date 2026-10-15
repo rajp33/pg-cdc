@@ -415,6 +415,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_status_update_span_is_filtered_out_at_info() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        let spans = StatusSpans::default();
+        let subscriber = tracing_subscriber::registry().with(
+            spans
+                .clone()
+                .with_filter(tracing::level_filters::LevelFilter::INFO),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (stream, mut server) = fake::started(fake::config()).await;
+        server.read_status().await;
+        stream.confirm(Lsn(0x40));
+        stream.send_status().await.unwrap();
+        assert_eq!(server.read_status().await.flush, 0x40);
+        let seen = spans.0.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|(name, _, _)| name != "status_update"),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn stop_sends_the_highest_confirmed_lsn_then_copy_done() {
         let (stream, mut server) = fake::started(fake::config()).await;
         stream.confirm(Lsn(0x30));

@@ -386,3 +386,77 @@ fn the_worst_outcome_wins_terminal_over_retryable_over_delivered() {
         cases.iter().map(|(_, worst)| (*worst, elapsed)).collect();
     assert_eq!(sink_points(&seen), expected);
 }
+
+const HOT_PATH_SPANS: [&str; 4] = ["sink_send", "park", "drain", "store"];
+
+async fn spans_of_parking_and_draining(level: LevelFilter) -> Vec<SpanSeen> {
+    let (capture, _guard) = Capture::install(level);
+    let store = TestStore::default();
+    store.seed(b"drained", 1, ParkStatus::Retrying).await;
+    let script: Script = Box::new(|ordinal, _| match ordinal {
+        2 => Outcome::Terminal(SinkError("rejected".to_owned())),
+        _ => Outcome::Delivered,
+    });
+    let setup = Setup {
+        instrumented: true,
+        ..Setup::default()
+    };
+    let mut harness = Harness::start(setup, ScriptedSink::new(LIMITS, script), store).await;
+    harness.delivered(1).await;
+    harness.send(2, b"rejected", 1).unwrap();
+    harness.settle(1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(harness.store.queue(b"drained").await, vec![]);
+    assert_eq!(
+        harness.store.queue(b"rejected").await,
+        vec![(2, ParkStatus::Dead)]
+    );
+    capture.spans()
+}
+
+fn fields_of<'a>(spans: &'a [SpanSeen], name: &str) -> Vec<Vec<(&'a str, &'a str)>> {
+    spans
+        .iter()
+        .filter(|span| span.name == name)
+        .inspect(|span| assert_eq!(span.level, Level::DEBUG, "{span:?}"))
+        .map(|span| {
+            span.fields
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn park_drain_and_store_spans_are_debug_and_disabled_at_info() {
+    let at_info = spans_of_parking_and_draining(LevelFilter::INFO).await;
+    assert!(
+        at_info
+            .iter()
+            .all(|span| !HOT_PATH_SPANS.contains(&span.name.as_str())),
+        "{at_info:?}"
+    );
+    let at_debug = spans_of_parking_and_draining(LevelFilter::DEBUG).await;
+    assert_eq!(fields_of(&at_debug, "park"), vec![vec![("events", "1")]]);
+    assert_eq!(fields_of(&at_debug, "drain"), vec![vec![("events", "1")]]);
+    let stores = fields_of(&at_debug, "store");
+    for operation in [
+        "load_parked_heads",
+        "read_parked",
+        "remove_parked",
+        "append_parked",
+    ] {
+        assert!(
+            stores.contains(&vec![("count", "1"), ("operation", operation)]),
+            "{operation}: {stores:?}"
+        );
+    }
+    assert!(
+        stores
+            .iter()
+            .all(|fields| fields.len() == 2 && fields[0].0 == "count"),
+        "{stores:?}"
+    );
+    assert_eq!(fields_of(&at_debug, "sink_send").len(), 2, "{at_debug:?}");
+}
