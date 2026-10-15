@@ -1,5 +1,15 @@
 # Load and chaos results
 
+The section 4 criteria this milestone measures, as `loadgen report` summarizes the reports recorded below. Criteria 1 and 2 (nothing lost, per-key order) are the chaos checker's, in the next section.
+
+| Criterion | Target | Measured | Verdict | Scenario |
+|---|---|---|---|---|
+| 3. WAL stays bounded during a sink outage | retained WAL about park_after of write volume | peak retained 77.7 MiB against 2.8 MiB written in park_after (5 s); parking stored 632 events/s against 1000 written; 74,135 events still parked 180 s after writes stopped and still rising (179.4 events/s), so no drain rate was measured; moto's own PutObject ceiling 636 puts/s; pending the real-S3 check (R128) | unverified (emulator-bound) | outage |
+| 4. Throughput against SNS | at least 5,000 events/s with p99 commit-to-acknowledgement under 1 s | delivered 3822 events/s, p99 upper bound 60.00 s; moto's own ceiling 4364 messages/s; pending the real-SNS check (R128) | unverified (emulator-bound) | sns |
+| 5. Handover | a deploy handover under 10 s with nothing lost | 5 handovers: worst SIGTERM to /readyz 2.21 s, worst delivery gap 2.05 s, worst exit 0.21 s; evidence intact | pass | handover |
+| 6. Memory | within max_inflight_bytes plus fixed overhead whatever the transaction size | peak RSS 122.3 MiB with max_inflight_bytes 64 MiB, flat from 50,000 to 500,000 rows | pass | memory |
+| 7. Telemetry overhead | within 1% of a build without the otel feature when unconfigured | -0.73% CPU per event, runs spread 14.0%, beyond the 1% to resolve | not resolved | overhead |
+
 Numbers recorded here come from the `loadgen` binary, which drives pg-cdc as a child process against Postgres and moto in Docker. Nothing here touches real AWS. Each section states its machine, versions and command so a reader can repeat it.
 
 ## Chaos
@@ -64,17 +74,13 @@ Reading the numbers:
 
 ## Load
 
-`loadgen load <scenario>` measures criteria 4, 6 and 7 of section 4. Each scenario starts its own Postgres (and moto where it needs one), writes a pg-cdc config into a temp directory (`status_interval: 1s`, `order_by: key`, `lanes: 64`, `admin.listen: 127.0.0.1:0`), drives a release build of `pg-cdc` as a child process, reads its progress from `/status`, and writes `<report-dir>/<scenario>.json` with the config, the machine and the numbers. `mise run load` builds the default and `--no-default-features` binaries and runs every scenario into `target/load`; `LOAD_SCENARIO=ceiling|sns|overhead|memory` runs one.
+`loadgen load <scenario>` measures criteria 3 to 7 of section 4. Each scenario starts its own Postgres (and moto where it needs one), writes a pg-cdc config into a temp directory (`status_interval: 1s`, `order_by: key`, `lanes: 64`, `admin.listen: 127.0.0.1:0`), drives a release build of `pg-cdc` as a child process, reads its progress from `/status`, and writes `<report-dir>/<scenario>.json` with the config, the machine and the numbers. `mise run load` builds the default and `--no-default-features` binaries and runs every scenario into `target/load`; `LOAD_SCENARIO=ceiling|sns|overhead|memory|outage|brownout|handover` runs one. `loadgen report --report-dir <dir> --out <file>` writes the summary table at the top of this page from every report in a directory.
 
 Machine: Apple M3 Max, 16 cores, 64 GiB, macOS 26.5.2. Docker: OrbStack 29.4.0 (linux/arm64). Postgres 17.11 (`postgres:17-alpine`, `fsync=off`), moto 5.2.4, Rust 1.99.0, pg-cdc and loadgen release builds at commit `933a205`. Postgres and moto run in Docker on the same machine as pg-cdc and the load generator, and other jobs shared the machine (load average 3 to 5 during the runs), so absolute numbers are this machine's and the runs are noisy.
 
 CPU time and resident memory are read from outside the process with `ps -o rss=,time=`, so they cover everything pg-cdc does, including startup. The workload is the one from the chaos section without TOAST or oversize rows: upserts into `loadgen_items` from one connection in transactions of exactly 100 changes (`row_bytes 200`, 1,000 keys, uniform), with `REPLICA IDENTITY FULL`.
 
-| Criterion | Scenario | Result |
-|---|---|---|
-| 4. At least 5,000 events/s with p99 commit-to-acknowledgement under 1 s against SNS | `sns` | unverified (emulator-bound): moto ceilinged at 4,364 messages/s |
-| 6. Memory within `max_inflight_bytes` plus fixed overhead | `memory` | pass |
-| 7. Telemetry unconfigured is within 1% of a build without `otel` | `overhead` | not resolved: one run of the scenario failed (+1.71%), one passed (-0.73%), the 36 runs pooled give -0.31% |
+The summary at the top of this page gives each criterion's verdict. For criterion 7 it reads the second overhead run; the first failed (+1.71%), and the 36 runs of both pooled give -0.31%.
 
 Criterion 4 stays unmet against SNS until `loadgen load sns --topic-arn <arn> --real-aws` passes (the pre-production check in the runbook).
 
@@ -141,3 +147,62 @@ In the stalled mode, in-flight bytes reached the bound (64 MiB = 67,108,864) and
 Findings worth knowing:
 
 - The 100,000-key variant of the stalled run did not finish. With the sink down, every key with an event in flight retries on its own 100 ms to 30 s backoff, the retries arrive as new connections, and about 16,000 of them within seconds exhausted macOS's ephemeral ports (`Can't assign requested address`) for the whole machine until the sockets left `TIME_WAIT`. The recorded runs use 1,000 keys, the keyspace of the other scenarios. The retry connection churn grows with the number of distinct keys failing at once, and the port exhaustion itself comes from the sink endpoint sitting on the same host as the load generator.
+
+### Sink outage (criterion 3)
+
+Command: `LOAD_SCENARIO=outage mise run load`. pg-cdc release build of commit `dea6918` (the Task 14 commits change only `loadgen` and the docs), on the machine above. A standard SNS topic and the S3 state store on moto, each behind its own fault proxy; `park_after: 5s`, `max_inflight_bytes: 64MiB`, 64 lanes. The writer upserts 1,000 events/s over 1,000 keys for 150 s (transactions of 100 changes, 200-byte rows). From 10 s to 70 s the SNS proxy answers every request with a 500. The scenario samples `/status`, the S3 proxy's counts and `pg_current_wal_lsn()` every second, then watches the drain for 3 minutes after the writer stops (it does not wait for the parked queues to empty). Afterwards it measures moto's own `PutObject` ceiling with a direct client (32 workers, 700-byte bodies, 10 s).
+
+| | |
+|---|---|
+| Written | 150,100 events in 150.06 s (1,000 events/s, 573 KiB of WAL per second) |
+| Parking during the outage (15 s to 70 s) | 632 events/s stored in S3 against 1,000 written; 21,770 parked at the outage's end |
+| Moto's `PutObject` ceiling (direct client) | 636 puts/s |
+| Reader stalled at `max_inflight_bytes` | yes, from about 150 s |
+| Peak slot retained bytes | 77.7 MiB, against 2.8 MiB written in one `park_after` |
+| Criterion 3 | unverified (emulator-bound) |
+| Parked 3 minutes after the writer stopped | 74,135 events on 1,000 keys, still rising (41,843 when the writer stopped) |
+| In flight and lag at the deadline | 44 MiB in flight, 54 MiB of WAL not yet confirmed |
+| Parked events removed after redelivery (S3 deletes, whole run) | 658 |
+| SNS requests | 12,154 publish requests, 6,562 refused during the outage |
+
+Cause: moto bounds the parking rate. pg-cdc stored 632 parked events a second while moto took at most 636 direct `PutObject` calls a second, so parking could not keep up with 1,000 events/s, in-flight bytes climbed to the bound and the reader stalled; retained WAL then grew with the backlog instead of staying near one `park_after` of writes. Because moto, not pg-cdc, set the ceiling, criterion 3 is recorded as unverified rather than failed (R128): it needs a run against real S3. Once the SNS proxy recovered every key already had a parked queue (all 1,000 by 50 s), so every later event queued behind it and parked too; three minutes after the writer stopped pg-cdc was still parking that backlog, so the parked count was still rising and the run measured no drain rate. Between 223 s and 303 s the parked count held at about 66,950 and in-flight bytes did not move while the S3 proxy saw 591 parked `PUT`s a second, 332 of them answered `412` (the object already existed); the cause is under investigation with the drain rate below. The report is `target/load/outage.json`, copied to the milestone workspace as `u6-t14-outage.json`.
+
+### S3 brownout during a sink outage (R136)
+
+Command: `LOAD_SCENARIO=brownout mise run load`, the outage scenario with the S3 proxy adding 500 ms to every request from 10 s to 40 s and 2 s from 40 s to 70 s, while SNS is down.
+
+| | |
+|---|---|
+| Written | 151,000 events in 150.96 s |
+| Parking with S3 at +500 ms (15 s to 40 s) | 58 events/s stored against 1,000 written |
+| Parking with S3 at +2 s (40 s to 70 s) | 15 events/s stored |
+| Parking after both ended (70 s to 150 s) | 627 parked `PUT`s/s accepted by S3; moto's direct `PutObject` ceiling in this run 781 puts/s |
+| Reader stalled at `max_inflight_bytes` | yes, from about 111 s |
+| Peak slot retained bytes | 84.5 MiB, against 2.8 MiB written in one `park_after` |
+| Parked 3 minutes after the writer stopped | 102,427 events on 948 keys, still rising (649 when the writer stopped) |
+| Lag at the deadline | 79 MiB of WAL not yet confirmed, 24 MiB in flight |
+| Parked events removed after redelivery (S3 deletes, whole run) | 2,241 |
+
+Parking falls far behind the write rate during an S3 brownout: about 58 events a second at 500 ms of added latency and 15 at 2 s, against 1,000 written, because each parked event is its own S3 write and at most `state_store.max_concurrency` (default 32) store calls are in flight: 32 calls at 0.5 s and at 2 s allow about 64 and 16 writes a second. The reader stalls at `max_inflight_bytes` and Postgres holds the WAL; nothing is lost, and the backlog parks once S3 recovers. This is a v1 limit, recorded in the runbook, and the reason for the segmented S3 layout in v1.1 (section 20, item 3); the inline S3 write of M3.10 is unchanged. The `/status` parked count stayed near 650 from 60 s to 150 s while the S3 proxy accepted about 627 parked writes a second, then rose by about 100,000 in the next three minutes; the approximate count lags the store during a backlog. The report is `u6-t14-brownout.json` in the milestone workspace.
+
+### Drain after an outage: a measured v1 limit
+
+pg-cdc drains a large parked backlog slowly. In an earlier, unbounded run of the outage scenario with the same pg-cdc build (started 13:34 EDT on 2026-10-15, stopped by hand), about 112,000 events on 1,000 keys parked during and after the 60 s outage. Once SNS came back the parked count fell by only about 20 events a second: 112,466 parked at 13:57 and 109,001 at 13:59:37, with the oldest parked event 1,465 s old. At that rate the rest would have taken about 90 minutes to drain. The bounded runs above agree: in the 260 s after each outage ended, S3 saw 658 and 2,241 parked events removed after redelivery, 2.5 and 8.6 events a second, while parking of the remaining backlog was still under way. The chaos run's 47-minute drain of about 45,000 events on three hot keys is the same limit.
+
+Nothing is lost while a backlog drains, and keys without a parked queue keep flowing. But after an outage that parked every key, every key's new events queue behind its backlog, so delivery lags by the drain time. The cause of the rate is under investigation; until it is fixed, plan for about 20 parked events a second of drain after an outage against moto, and alert on `pgcdc.parked.oldest_age`.
+
+The scenarios stop 3 minutes after the writer stops and report what is still parked, the rate at which the parked count fell over those 3 minutes (from the once-a-second `/status` samples) and the time the rest would take at that rate. In both runs above the count was still rising at the deadline, so neither reports a rate or a projection.
+
+### Handover (criterion 5)
+
+Command: `LOAD_SCENARIO=handover mise run load`, pg-cdc release build of commit `dea6918`. A FIFO SNS topic and the S3 state store on moto, two pg-cdc instances with the default leadership settings (`lease_timeout: 6s`, `fence_delay: 10s`, `drain_timeout: 5s`), the writer at 500 events/s over 1,000 keys. Five times: wait 20 s plus a random share of the 2 s standby poll, SIGTERM the active instance, and measure the time to the old instance's exit, the time until the standby's `/readyz` answers 200, and the largest gap between consecutive deliveries around the handover; then start the stopped instance again as the next standby. Deliveries are recorded at the SNS proxy as in the chaos run. After the last round the writer stops, the run settles and the chaos checker reads the evidence.
+
+| Round | SIGTERM to old exit | SIGTERM to new `/readyz` 200 | Largest delivery gap |
+|---|---|---|---|
+| 1 | 0.11 s | 0.21 s | 0.15 s |
+| 2 | 0.21 s | 2.21 s | 2.05 s |
+| 3 | 0.09 s | 0.21 s | 0.19 s |
+| 4 | 0.04 s | 0.21 s | 0.23 s |
+| 5 | 0.15 s | 0.21 s | 0.12 s |
+
+The checker saw 54,100 committed changes, 54,100 delivered, no duplicates, nothing missing, no phantoms and nothing out of order. Criterion 5 passes: every handover was ready in under 10 s (worst 2.21 s), the worst delivery gap was 2.05 s, and nothing was lost. Round 2's extra 2 s matches one standby poll of `pg_replication_slots` (section 12.5, "the drain plus one poll"); in the other rounds the poll fell just after the old instance released the slot. A second run of the scenario on the same build also passed (57,100 changes, worst ready 1.73 s, worst gap 1.83 s). The report is `u6-t14-handover-run1.json` in the milestone workspace.
