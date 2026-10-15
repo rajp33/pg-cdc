@@ -11,7 +11,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::rig::{self, Bench, ConfigSpec, DRAIN_LIMIT, SinkSpec, StoreSpec, inflight_bytes};
+use super::rig::{
+    self, Bench, ConfigSpec, DRAIN_LIMIT, SinkSpec, StoreSpec, inflight_bytes, wait_ready,
+};
 use super::{LoadOptions, Verdict, write_report};
 use crate::cluster::PgCdc;
 use crate::measure::{self, Machine};
@@ -29,7 +31,6 @@ const RSS_PERIOD: Duration = Duration::from_millis(100);
 const BOUND_WAIT: Duration = Duration::from_secs(300);
 const BOUND_OBSERVATION: Duration = Duration::from_secs(30);
 const STATUS_PERIOD: Duration = Duration::from_millis(500);
-const READY_WAIT: Duration = Duration::from_secs(60);
 const TOPIC: &str = "memory";
 const GROWTH_PERCENT: u128 = 110;
 const FIXED_OVERHEAD_FACTOR: u64 = 2;
@@ -197,21 +198,6 @@ fn finish(mode: &'static str, config: String, runs: Vec<SizeRun>) -> ModeReport 
         config,
         runs,
         verdict,
-    }
-}
-
-async fn wait_ready(process: &PgCdc) -> anyhow::Result<()> {
-    let deadline = Instant::now() + READY_WAIT;
-    loop {
-        let status = process.status().await?;
-        if status.get("ready").and_then(serde_json::Value::as_bool) == Some(true) {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "pg-cdc never became ready: {status}"
-        );
-        tokio::time::sleep(STATUS_PERIOD).await;
     }
 }
 

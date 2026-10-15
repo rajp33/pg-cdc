@@ -75,6 +75,7 @@ pub struct ProxyCounts {
     pub injected: u64,
     pub resets: u64,
     pub parked_puts: u64,
+    pub parked_stored: u64,
     pub parked_deletes: u64,
     pub publishes: u64,
 }
@@ -160,6 +161,7 @@ struct Counters {
     injected: AtomicU64,
     resets: AtomicU64,
     parked_puts: AtomicU64,
+    parked_stored: AtomicU64,
     parked_deletes: AtomicU64,
     publishes: AtomicU64,
 }
@@ -172,6 +174,7 @@ impl Counters {
             injected: self.injected.load(Ordering::Relaxed),
             resets: self.resets.load(Ordering::Relaxed),
             parked_puts: self.parked_puts.load(Ordering::Relaxed),
+            parked_stored: self.parked_stored.load(Ordering::Relaxed),
             parked_deletes: self.parked_deletes.load(Ordering::Relaxed),
             publishes: self.publishes.load(Ordering::Relaxed),
         }
@@ -217,6 +220,7 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
     let (parts, body) = request.into_parts();
     let body = body.collect().await.map_err(|_| Dropped)?.to_bytes();
     record_request(&shared, &parts, &body);
+    let parked_put = is_parked_put(&parts);
     let faults = *shared.faults.borrow();
 
     if faults.mode == Mode::Outage {
@@ -236,6 +240,9 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
         return Ok(bad_gateway());
     };
     bump(&shared.counters.forwarded);
+    if parked_put && reply.status().is_success() {
+        bump(&shared.counters.parked_stored);
+    }
     if let Some(tap) = &shared.tap
         && reply.status().is_success()
     {
@@ -251,16 +258,18 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
 fn record_request(shared: &Shared, parts: &request::Parts, body: &Bytes) {
     let counters = &shared.counters;
     bump(&counters.requests);
-    if parts.uri.path().contains("/parked/") {
-        if parts.method == Method::PUT {
-            bump(&counters.parked_puts);
-        } else if parts.method == Method::DELETE {
-            bump(&counters.parked_deletes);
-        }
+    if is_parked_put(parts) {
+        bump(&counters.parked_puts);
+    } else if parts.uri.path().contains("/parked/") && parts.method == Method::DELETE {
+        bump(&counters.parked_deletes);
     }
     if shared.kind == Upstream::Sns && contains(body, b"Action=Publish") {
         bump(&counters.publishes);
     }
+}
+
+fn is_parked_put(parts: &request::Parts) -> bool {
+    parts.method == Method::PUT && parts.uri.path().contains("/parked/")
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -306,12 +315,19 @@ const HOP_BY_HOP: [&str; 6] = [
     "expect",
 ];
 
+async fn connect_upstream(upstream: SocketAddr) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect(upstream).await?;
+    // moto answers Connection: close, so each request needs its own socket, and sockets closed on this side leave 30 s of TIME_WAIT: macOS's 16,383 ephemeral ports run out near 550 requests a second
+    stream.set_zero_linger()?;
+    Ok(stream)
+}
+
 async fn forward(
     shared: &Shared,
     parts: request::Parts,
     body: Bytes,
 ) -> anyhow::Result<ProxyResponse> {
-    let stream = TcpStream::connect(shared.upstream).await?;
+    let stream = connect_upstream(shared.upstream).await?;
     let (mut sender, connection) = client::conn::http1::handshake(TokioIo::new(stream)).await?;
     let driver = tokio::spawn(async move {
         let _ = connection.await;
@@ -396,6 +412,11 @@ mod tests {
                             let (host, probe) = (header("host"), header("x-probe"));
                             let method = request.method().to_string();
                             let path = request.uri().path().to_owned();
+                            let status = if path.ends_with("/exists.json") {
+                                StatusCode::PRECONDITION_FAILED
+                            } else {
+                                StatusCode::CREATED
+                            };
                             let body = request.into_body().collect().await.unwrap().to_bytes();
                             recorded.lock().unwrap().push(Received {
                                 method,
@@ -406,7 +427,7 @@ mod tests {
                             });
                             Ok::<_, std::convert::Infallible>(
                                 Response::builder()
-                                    .status(StatusCode::CREATED)
+                                    .status(status)
                                     .body(Full::new(Bytes::from_static(b"ok")))
                                     .unwrap(),
                             )
@@ -517,6 +538,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_connections_are_reset_on_close_so_they_leave_no_time_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = connect_upstream(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stream.linger().unwrap(), Some(Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn a_parked_put_counts_as_stored_only_when_the_upstream_accepts_it() {
+        let (upstream_addr, _) = upstream().await;
+        let proxy = FaultProxy::start(upstream_addr, Upstream::S3, 1)
+            .await
+            .unwrap();
+        let parked = "/bucket/pre/p/parked/k";
+
+        assert_eq!(
+            answer(&proxy, Method::PUT, &format!("{parked}/new.json"))
+                .await
+                .0,
+            201
+        );
+        assert_eq!(
+            answer(&proxy, Method::PUT, &format!("{parked}/exists.json"))
+                .await
+                .0,
+            412
+        );
+        assert_eq!(
+            answer(&proxy, Method::GET, &format!("{parked}/new.json"))
+                .await
+                .0,
+            201
+        );
+        proxy.set(Faults {
+            mode: Mode::Outage,
+            ..Faults::HEALTHY
+        });
+        assert_eq!(
+            answer(&proxy, Method::PUT, &format!("{parked}/later.json"))
+                .await
+                .0,
+            503
+        );
+
+        let counts = proxy.counts();
+        assert_eq!((counts.parked_puts, counts.parked_stored), (3, 1));
+    }
+
+    #[tokio::test]
     async fn the_proxy_forwards_delays_fails_and_resets_as_told() {
         let (upstream_addr, seen) = upstream().await;
         let proxy = FaultProxy::start(upstream_addr, Upstream::S3, 1)
@@ -603,6 +674,7 @@ mod tests {
                 injected: 3,
                 resets: 1,
                 parked_puts: 1,
+                parked_stored: 1,
                 parked_deletes: 1,
                 publishes: 0,
             }

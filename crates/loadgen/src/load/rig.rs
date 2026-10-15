@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use pg_cdc_testkit::{OtlpReceiver, Postgres, parse_lsn};
+use pg_cdc_testkit::{AwsEmulator, OtlpReceiver, Postgres, parse_lsn};
 use tempfile::TempDir;
 use tokio::time::Instant;
 use tokio_postgres::Client;
@@ -18,8 +18,10 @@ pub(super) const METRIC_EXPORT_INTERVAL: (&str, &str) = ("OTEL_METRIC_EXPORT_INT
 pub(super) const OFFERED_RATE: u32 = 6_000;
 pub(super) const SUSTAINED_WINDOW: Duration = Duration::from_secs(60);
 pub(super) const DRAIN_LIMIT: Duration = Duration::from_secs(600);
+const READY_WAIT: Duration = Duration::from_secs(60);
 
 const POLL: Duration = Duration::from_millis(100);
+const READY_POLL: Duration = Duration::from_millis(500);
 const LAG_PERIOD: Duration = Duration::from_secs(1);
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 const EXPORT_WAIT: Duration = Duration::from_secs(10);
@@ -109,6 +111,55 @@ pub(super) fn render_config(source: &Source, spec: &ConfigSpec) -> String {
     lines.push("  listen: 127.0.0.1:0".to_owned());
     lines.push(String::new());
     lines.join("\n")
+}
+
+pub(super) fn aws_env(sns_endpoint: &str, s3_endpoint: &str) -> Vec<(String, String)> {
+    vec![
+        ("AWS_ENDPOINT_URL_SNS".to_owned(), sns_endpoint.to_owned()),
+        ("AWS_ENDPOINT_URL_S3".to_owned(), s3_endpoint.to_owned()),
+        ("AWS_ACCESS_KEY_ID".to_owned(), "test".to_owned()),
+        ("AWS_SECRET_ACCESS_KEY".to_owned(), "test".to_owned()),
+        ("AWS_REGION".to_owned(), "us-east-1".to_owned()),
+        ("AWS_EC2_METADATA_DISABLED".to_owned(), "true".to_owned()),
+    ]
+}
+
+pub(super) fn aws_error(error: impl std::error::Error) -> anyhow::Error {
+    anyhow::anyhow!("{}", aws_sdk_s3::error::DisplayErrorContext(error))
+}
+
+pub(super) async fn create_bucket(aws: &AwsEmulator, bucket: &str) -> anyhow::Result<()> {
+    aws.s3()
+        .await
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .map_err(aws_error)?;
+    Ok(())
+}
+
+pub(super) async fn create_topic(
+    aws: &AwsEmulator,
+    name: &str,
+    fifo: bool,
+) -> anyhow::Result<String> {
+    let request = aws.sns().await.create_topic();
+    let request = if fifo {
+        request
+            .name(format!("{name}.fifo"))
+            .attributes("FifoTopic", "true")
+    } else {
+        request.name(name)
+    };
+    let arn = request
+        .send()
+        .await
+        .map_err(aws_error)?
+        .topic_arn()
+        .context("CreateTopic returned no ARN")?
+        .to_owned();
+    Ok(arn)
 }
 
 pub(super) fn count_f64(count: u64) -> f64 {
@@ -240,6 +291,21 @@ pub(super) async fn drain(
             "pg-cdc did not confirm LSN {target:#X} within {within:?}; last status: {status}"
         );
         tokio::time::sleep(POLL).await;
+    }
+}
+
+pub(super) async fn wait_ready(process: &PgCdc) -> anyhow::Result<()> {
+    let deadline = Instant::now() + READY_WAIT;
+    loop {
+        let status = process.status().await?;
+        if status.get("ready").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "pg-cdc never became ready: {status}"
+        );
+        tokio::time::sleep(READY_POLL).await;
     }
 }
 

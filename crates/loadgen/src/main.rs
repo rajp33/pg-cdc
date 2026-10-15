@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use pg_cdc_loadgen::chaos::{self, ChaosOptions};
 use pg_cdc_loadgen::load::{self, LoadOptions, Scenario};
+use pg_cdc_loadgen::report;
 use pg_cdc_loadgen::workload::{self, WorkloadConfig};
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +28,15 @@ enum Command {
     Write(WriteArgs),
     Chaos(ChaosArgs),
     Load(LoadArgs),
+    Report(ReportArgs),
+}
+
+#[derive(Debug, Args)]
+struct ReportArgs {
+    #[arg(long, default_value = "target/load")]
+    report_dir: PathBuf,
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -143,6 +153,10 @@ async fn main() -> anyhow::Result<ExitCode> {
             .await?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Report(args) => {
+            report::write_summary(&args.report_dir, &args.out).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Chaos(args) => {
             let report = Box::pin(chaos::run(&ChaosOptions {
                 binary: args.binary,
@@ -221,6 +235,40 @@ async fn write(args: WriteArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_report_command_reads_a_directory_and_writes_a_file() {
+        let cli = Cli::try_parse_from([
+            "loadgen",
+            "report",
+            "--report-dir",
+            "target/load",
+            "--out",
+            "summary.md",
+        ])
+        .unwrap();
+        let Command::Report(args) = cli.command else {
+            panic!("not the report command");
+        };
+        assert_eq!(args.report_dir, PathBuf::from("target/load"));
+        assert_eq!(args.out, PathBuf::from("summary.md"));
+        assert!(Cli::try_parse_from(["loadgen", "report"]).is_err());
+    }
+
+    #[test]
+    fn the_outage_brownout_and_handover_scenarios_are_selectable() {
+        for (name, scenario) in [
+            ("outage", Scenario::Outage),
+            ("brownout", Scenario::Brownout),
+            ("handover", Scenario::Handover),
+        ] {
+            let cli = Cli::try_parse_from(["loadgen", "load", name, "--pg-cdc", "pg-cdc"]).unwrap();
+            let Command::Load(args) = cli.command else {
+                panic!("not the load command");
+            };
+            assert_eq!(args.scenario, scenario);
+        }
+    }
 
     #[test]
     fn transaction_sizes_are_a_min_and_max_pair() {

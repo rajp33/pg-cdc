@@ -4,6 +4,7 @@ pub mod cluster;
 pub mod load;
 pub mod measure;
 pub mod proxy;
+pub mod report;
 #[cfg(test)]
 mod testing;
 pub mod workload;

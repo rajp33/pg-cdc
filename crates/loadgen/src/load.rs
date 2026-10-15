@@ -5,7 +5,9 @@ use anyhow::Context as _;
 use serde::Serialize;
 
 mod ceiling;
+mod handover;
 mod memory;
+mod outage;
 mod overhead;
 mod rig;
 mod sns;
@@ -16,6 +18,9 @@ pub enum Scenario {
     Sns,
     Overhead,
     Memory,
+    Outage,
+    Brownout,
+    Handover,
     All,
 }
 
@@ -28,11 +33,14 @@ pub struct LoadOptions {
     pub real_aws: bool,
 }
 
-const EVERY_SCENARIO: [Scenario; 4] = [
+const EVERY_SCENARIO: [Scenario; 7] = [
     Scenario::Ceiling,
     Scenario::Sns,
     Scenario::Overhead,
     Scenario::Memory,
+    Scenario::Outage,
+    Scenario::Brownout,
+    Scenario::Handover,
 ];
 
 pub async fn run(scenario: Scenario, options: &LoadOptions) -> anyhow::Result<()> {
@@ -41,6 +49,9 @@ pub async fn run(scenario: Scenario, options: &LoadOptions) -> anyhow::Result<()
         Scenario::Sns => Box::pin(sns::run(options)).await,
         Scenario::Overhead => Box::pin(overhead::run(options)).await,
         Scenario::Memory => Box::pin(memory::run(options)).await,
+        Scenario::Outage => Box::pin(outage::run_outage(options)).await,
+        Scenario::Brownout => Box::pin(outage::run_brownout(options)).await,
+        Scenario::Handover => Box::pin(handover::run(options)).await,
         Scenario::All => {
             for each in EVERY_SCENARIO {
                 Box::pin(run(each, options)).await?;
