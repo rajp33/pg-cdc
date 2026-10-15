@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,28 @@ use crate::order::OrderKeyId;
 
 pub const LEADER_LOCK: &str = "leader.lock";
 const CREATE_ATTEMPTS: usize = 3;
+
+type Cancelled<'a> = &'a dyn Fn() -> bool;
+
+struct CancelOnDrop {
+    flag: Arc<AtomicBool>,
+    completed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.flag.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn check(cancelled: Cancelled<'_>) -> Result<(), StoreError> {
+    if cancelled() {
+        return Err(StoreError::Unavailable("cancelled".to_owned()));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct FilesystemStateStore {
@@ -43,7 +66,7 @@ impl FilesystemStateStore {
     async fn blocking<T, F>(&self, operation: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
-        F: FnOnce(&Path) -> Result<T, StoreError> + Send + 'static,
+        F: FnOnce(&Path, Cancelled<'_>) -> Result<T, StoreError> + Send + 'static,
     {
         let _permit = self
             .permits
@@ -56,12 +79,19 @@ impl FilesystemStateStore {
     async fn unbounded<T, F>(&self, operation: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
-        F: FnOnce(&Path) -> Result<T, StoreError> + Send + 'static,
+        F: FnOnce(&Path, Cancelled<'_>) -> Result<T, StoreError> + Send + 'static,
     {
         let root = self.root.clone();
-        tokio::task::spawn_blocking(move || operation(&root))
-            .await
-            .map_err(|error| StoreError::Unavailable(error.to_string()))?
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut guard = CancelOnDrop {
+            flag: Arc::clone(&flag),
+            completed: false,
+        };
+        let joined =
+            tokio::task::spawn_blocking(move || operation(&root, &|| flag.load(Ordering::Acquire)))
+                .await;
+        guard.completed = true;
+        joined.map_err(|error| StoreError::Unavailable(error.to_string()))?
     }
 }
 
@@ -164,8 +194,13 @@ fn key_dir(root: &Path, key: &OrderKeyId) -> PathBuf {
     root.join(PARKED_DIR).join(key.to_string())
 }
 
-fn append(root: &Path, events: &[(OrderKeyId, String, Vec<u8>)]) -> Result<(), StoreError> {
+fn append(
+    root: &Path,
+    events: &[(OrderKeyId, String, Vec<u8>)],
+    cancelled: Cancelled<'_>,
+) -> Result<(), StoreError> {
     for (key, name, bytes) in events {
+        check(cancelled)?;
         create_once(root, &key_dir(root, key), name, bytes)?;
     }
     Ok(())
@@ -235,7 +270,9 @@ fn set_status(
     key: OrderKeyId,
     id: EventId,
     status: ParkStatus,
+    cancelled: Cancelled<'_>,
 ) -> Result<(), StoreError> {
+    check(cancelled)?;
     let dir = key_dir(root, &key);
     let name = format!("{id}.json");
     let path = dir.join(&name);
@@ -252,9 +289,14 @@ fn set_status(
     replace(&dir, &name, &encode_parked(&event)?)
 }
 
-fn remove(root: &Path, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError> {
+fn remove(
+    root: &Path,
+    events: &[(OrderKeyId, EventId)],
+    cancelled: Cancelled<'_>,
+) -> Result<(), StoreError> {
     let parked = root.join(PARKED_DIR);
     for (key, id) in events {
+        check(cancelled)?;
         let dir = key_dir(root, key);
         let path = dir.join(format!("{id}.json"));
         match fs::remove_file(&path) {
@@ -338,11 +380,13 @@ impl StateStore for FilesystemStateStore {
                 encode_parked(event)?,
             ));
         }
-        self.blocking(move |root| append(root, &encoded)).await
+        self.blocking(move |root, cancelled| append(root, &encoded, cancelled))
+            .await
     }
 
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
-        self.blocking(move |root| load_heads(root, partition)).await
+        self.blocking(move |root, _| load_heads(root, partition))
+            .await
     }
 
     async fn read_parked(
@@ -352,7 +396,7 @@ impl StateStore for FilesystemStateStore {
         limit: usize,
     ) -> Result<Vec<ParkedEvent>, StoreError> {
         let (key, after) = (*key, after.copied());
-        self.blocking(move |root| read(root, key, after, limit))
+        self.blocking(move |root, _| read(root, key, after, limit))
             .await
     }
 
@@ -363,7 +407,7 @@ impl StateStore for FilesystemStateStore {
         status: ParkStatus,
     ) -> Result<(), StoreError> {
         let (key, id) = (*key, *id);
-        self.blocking(move |root| set_status(root, key, id, status))
+        self.blocking(move |root, cancelled| set_status(root, key, id, status, cancelled))
             .await
     }
 
@@ -372,11 +416,12 @@ impl StateStore for FilesystemStateStore {
             return Ok(());
         }
         let events = events.to_vec();
-        self.blocking(move |root| remove(root, &events)).await
+        self.blocking(move |root, cancelled| remove(root, &events, cancelled))
+            .await
     }
 
     async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
-        self.unbounded(|root| {
+        self.unbounded(|root, _| {
             Ok(read_leader_file(root)?.map(|file| Versioned {
                 value: file.record,
                 version: Version(file.version.to_string()),
@@ -391,15 +436,17 @@ impl StateStore for FilesystemStateStore {
         expected: Option<&Version>,
     ) -> Result<SwapOutcome, StoreError> {
         let (next, expected) = (next.clone(), expected.cloned());
-        self.unbounded(move |root| swap(root, next, expected.as_ref()))
+        self.unbounded(move |root, _| swap(root, next, expected.as_ref()))
             .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use bytes::Bytes;
     use pg_cdc_decoder::Lsn;
     use tokio::time::timeout;
 
@@ -408,6 +455,56 @@ mod tests {
 
     fn key(n: u8) -> OrderKeyId {
         format!("ab{}{n:02x}", "0".repeat(28)).parse().unwrap()
+    }
+
+    fn event_id(ordinal: u32) -> EventId {
+        EventId::new(Lsn(7), ordinal)
+    }
+
+    fn parked(key: OrderKeyId, ordinal: u32) -> ParkedEvent {
+        ParkedEvent {
+            order_key: key,
+            id: event_id(ordinal),
+            status: ParkStatus::Retrying,
+            attempts: 1,
+            first_failure_ms: 1,
+            last_error: "x".to_owned(),
+            attributes: Vec::new(),
+            body: Bytes::from_static(b"{}"),
+        }
+    }
+
+    fn encoded(key: OrderKeyId, count: u32) -> Vec<(OrderKeyId, String, Vec<u8>)> {
+        (0..count)
+            .map(|n| {
+                let event = parked(key, n);
+                (
+                    key,
+                    format!("{}.json", event.id),
+                    encode_parked(&event).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = match fs::read_dir(dir) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        names.sort_unstable();
+        names
+    }
+
+    fn cancelled_after(allowed: usize) -> impl Fn() -> bool {
+        let calls = AtomicUsize::new(0);
+        move || calls.fetch_add(1, Ordering::SeqCst) >= allowed
+    }
+
+    fn is_cancelled<T: std::fmt::Debug>(result: &Result<T, StoreError>) -> bool {
+        matches!(result, Err(StoreError::Unavailable(message)) if message == "cancelled")
     }
 
     fn record() -> LeaderRecord {
@@ -442,5 +539,82 @@ mod tests {
         )
         .await;
         assert!(parked_read.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_signals_its_blocking_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilesystemStateStore::new(dir.path(), "orders", 2);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (report, reported) = std::sync::mpsc::channel::<bool>();
+        let mut call = Box::pin(store.blocking(move |_, cancelled| {
+            wait.recv().unwrap();
+            report.send(cancelled()).unwrap();
+            Ok(())
+        }));
+        assert!(timeout(Duration::from_millis(50), &mut call).await.is_err());
+        drop(call);
+        release.send(()).unwrap();
+        assert!(reported.recv_timeout(Duration::from_secs(5)).unwrap());
+
+        let completed = store
+            .blocking(|_, cancelled| Ok(cancelled()))
+            .await
+            .unwrap();
+        assert!(!completed);
+    }
+
+    #[test]
+    fn a_cancelled_append_stops_before_its_next_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        let events = encoded(queue, 3);
+        let result = append(&root, &events, &cancelled_after(1));
+        assert!(is_cancelled(&result), "{result:?}");
+        assert_eq!(
+            names(&key_dir(&root, &queue)),
+            vec![format!("{}.json", event_id(0))]
+        );
+
+        let untouched = dir.path().join("untouched");
+        let result = append(&untouched, &events, &cancelled_after(0));
+        assert!(is_cancelled(&result), "{result:?}");
+        assert!(!untouched.exists());
+    }
+
+    #[test]
+    fn a_cancelled_remove_stops_before_its_next_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 3), &|| false).unwrap();
+        let ids: Vec<_> = (0..3).map(|n| (queue, event_id(n))).collect();
+        let result = remove(&root, &ids, &cancelled_after(0));
+        assert!(is_cancelled(&result), "{result:?}");
+        assert_eq!(names(&key_dir(&root, &queue)).len(), 3);
+
+        let result = remove(&root, &ids, &cancelled_after(1));
+        assert!(is_cancelled(&result), "{result:?}");
+        assert_eq!(
+            names(&key_dir(&root, &queue)),
+            vec![
+                format!("{}.json", event_id(1)),
+                format!("{}.json", event_id(2))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_status_change_leaves_the_event_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 1), &|| false).unwrap();
+        let result = set_status(&root, queue, event_id(0), ParkStatus::Dead, &|| true);
+        assert!(is_cancelled(&result), "{result:?}");
+        let stored = read(&root, queue, None, 1).unwrap();
+        assert_eq!(stored[0].status, ParkStatus::Retrying);
+        assert_eq!(names(&key_dir(&root, &queue)).len(), 1);
     }
 }
