@@ -115,10 +115,9 @@ fn claim_stamp_blocking(stamp: &Path, clock: impl FnOnce() -> SystemTime) -> Opt
 }
 
 fn stamped_within_interval(modified: SystemTime, now: SystemTime) -> bool {
-    let distance = now
-        .duration_since(modified)
-        .unwrap_or_else(|ahead| ahead.duration());
-    distance < STAMP_INTERVAL
+    now.duration_since(modified)
+        .ok()
+        .is_none_or(|elapsed| elapsed < STAMP_INTERVAL)
 }
 
 fn lock_stamp(stamp: &Path) -> Result<ReaperLock, TestkitError> {
@@ -286,14 +285,45 @@ mod tests {
         assert_eq!(concurrent_claims(&stamp, later).await, 1);
     }
 
+    fn whole_second_now() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(unix_seconds(SystemTime::now()))
+    }
+
     #[tokio::test]
-    async fn a_stamp_more_than_ten_minutes_ahead_of_the_clock_is_stale() {
+    async fn a_stamp_any_distance_ahead_of_the_clock_is_fresh() {
+        let now = whole_second_now();
+        for ahead in [
+            Duration::from_secs(599),
+            STAMP_INTERVAL,
+            STAMP_INTERVAL + Duration::from_secs(1),
+            Duration::from_hours(24 * 365),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let stamp = dir.path().join("reap");
+            assert!(claim_stamp(&stamp, at(now + ahead)).await.is_some());
+            assert!(
+                claim_stamp(&stamp, at(now)).await.is_none(),
+                "a stamp {ahead:?} ahead of the clock was reclaimed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stamp_expires_exactly_ten_minutes_after_its_claim() {
         let dir = tempfile::tempdir().unwrap();
         let stamp = dir.path().join("reap");
-        let now = SystemTime::now();
-        let ahead = now + STAMP_INTERVAL + Duration::from_secs(1);
-        assert!(claim_stamp(&stamp, at(ahead)).await.is_some());
+        let now = whole_second_now();
         assert!(claim_stamp(&stamp, at(now)).await.is_some());
+        assert!(
+            claim_stamp(&stamp, at(now + Duration::from_secs(599)))
+                .await
+                .is_none()
+        );
+        assert!(
+            claim_stamp(&stamp, at(now + STAMP_INTERVAL))
+                .await
+                .is_some()
+        );
     }
 
     #[test]
