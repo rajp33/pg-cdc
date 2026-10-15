@@ -582,7 +582,7 @@ A task moves from `standby` to `active` to `draining`. The slot is the lock, bec
 
 1. Stop reading the socket.
 2. Give in-flight events `drain_timeout` (5 s) to deliver, then park whatever remains.
-3. Send a final status update.
+3. Send a final status update. If it cannot be sent, the leader record stays `active` and the next holder waits `fence_delay`.
 4. Swap the leader record to `released`, with the confirmed LSN.
 5. Close the replication connection and exit 0.
 
@@ -625,6 +625,7 @@ GRANT rds_iam TO pgcdc;
 - **Self-managed Postgres:** `ALTER ROLE pgcdc REPLICATION` replaces `rds_replication`, and `rds_iam` does not apply.
 - **Aurora:** it also needs `rds.logical_replication=1`, which requires a writer reboot. IAM on replication connections additionally needs `rds.iam_auth_for_replication=1`.
 - **Table privileges:** streaming changes needs none.
+- **A spare WAL sender.** Startup validation briefly opens a replication connection (§13.2), so `max_wal_senders` needs one sender free beyond those in use while a task starts. With none free, the check fails with SQLSTATE 53300, and the new task stays unhealthy and retries until a sender frees.
 
 ### 13.2 Startup validation
 
@@ -634,10 +635,13 @@ At process start, in any role, pg-cdc checks over the control connection that:
 - the slot exists, uses `pgoutput`, belongs to the configured database, and has a `wal_status` other than `lost`;
 - the publication exists.
 
+It then opens a replication connection and closes it without `START_REPLICATION`, to check that the role can log in for replication.
+
 On failure:
 
 - **The task stays unhealthy and retries with backoff.** A misconfigured new task never takes over, and a start-first deploy keeps the old task running.
 - **A `wal_status` of `unreserved` doesn't block.** It logs an error and raises an alert.
+- **A refused replication login is a failure.** SQLSTATE class 28, SQLSTATE 42501 or an authentication method pg-cdc cannot use fails validation, and so does the same refusal when `START_REPLICATION`'s connection opens. Other connection errors retry without changing health.
 
 ### 13.3 Slot loss
 
@@ -782,6 +786,7 @@ With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDE
 Fixed internal values:
 
 - standby poll and lease check: every 2 s;
+- control queries before the slot is acquired (catalog validation, standby poll, start position): 10 s timeout;
 - batch linger: 5 ms;
 - sink retry backoff: 100 ms to 30 s;
 - reconnect backoff: 1 s to 30 s;
@@ -873,6 +878,7 @@ Suggested alerts:
 ### 17.4 Logs and profiles
 
 - **Logs.** `tracing` writes JSON logs with trace and span ids, and they export over OTLP when telemetry is enabled.
+- **Logs never block.** Lines go through a bounded buffer of 8,192 lines to their own writer thread; a line that does not fit is dropped. At exit the buffer is flushed for at most 1 s, and after SIGTERM only within what remains of the shutdown budget (`2 × drain_timeout + 3 s`).
 - **Profiles.** An optional `pprof` build feature, off by default, serves CPU profiles on the admin port for load tests.
 
 ## 18. Testing
