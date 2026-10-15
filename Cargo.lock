@@ -2384,12 +2384,15 @@ name = "pg-cdc-loadgen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-sdk-s3",
+ "aws-sdk-sns",
  "bytes",
  "clap",
  "fastrand",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "pg-cdc-testkit",
  "serde",
  "serde_json",
  "tokio",

@@ -1,9 +1,12 @@
 use std::io::Write as _;
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
+use pg_cdc_loadgen::chaos::{self, ChaosOptions};
 use pg_cdc_loadgen::workload::{self, WorkloadConfig};
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
@@ -21,6 +24,21 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Write(WriteArgs),
+    Chaos(ChaosArgs),
+}
+
+#[derive(Debug, Args)]
+struct ChaosArgs {
+    #[arg(long = "pg-cdc")]
+    binary: PathBuf,
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    #[arg(long, default_value = "15s", value_parser = parse_duration)]
+    duration: Duration,
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    settle: Duration,
+    #[arg(long)]
+    report: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -90,9 +108,24 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     match Cli::parse().command {
-        Command::Write(args) => write(args).await,
+        Command::Write(args) => write(args).await.map(|()| ExitCode::SUCCESS),
+        Command::Chaos(args) => {
+            let report = Box::pin(chaos::run(&ChaosOptions {
+                binary: args.binary,
+                seed: args.seed,
+                duration: args.duration,
+                settle: args.settle,
+                report: args.report,
+            }))
+            .await?;
+            Ok(if report.verdict.passed() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
     }
 }
 

@@ -23,6 +23,13 @@ const STARTUP_TAIL_LINES: usize = 5;
 
 type LogLines = Arc<Mutex<Vec<String>>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedOutput {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 #[derive(Debug)]
 pub struct PgCdc {
     name: String,
@@ -159,6 +166,15 @@ impl PgCdc {
     }
 
     pub async fn parked(&self, binary: &Path, args: &[&str]) -> anyhow::Result<(i32, String)> {
+        let output = self.parked_output(binary, args).await?;
+        Ok((output.code, output.stdout))
+    }
+
+    pub async fn parked_output(
+        &self,
+        binary: &Path,
+        args: &[&str],
+    ) -> anyhow::Result<ParkedOutput> {
         let output = timeout(
             PARKED_TIMEOUT,
             Command::new(binary)
@@ -172,10 +188,11 @@ impl PgCdc {
         )
         .await
         .with_context(|| format!("{}: parked command timed out", self.name))??;
-        Ok((
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-        ))
+        Ok(ParkedOutput {
+            code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
     }
 
     pub async fn sigterm(&self) -> anyhow::Result<()> {
@@ -213,11 +230,6 @@ fn tail(lines: &LogLines) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use bytes::Bytes;
     use http_body_util::Full;
     use hyper::service::service_fn;
@@ -226,6 +238,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::testing::Scratch;
 
     #[test]
     fn the_admin_address_is_read_from_the_log_line() {
@@ -241,27 +254,6 @@ mod tests {
         assert_eq!(admin_address(no_addr), None);
         assert_eq!(admin_address("admin listening"), None);
         assert_eq!(admin_address(""), None);
-    }
-
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new() -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir =
-                std::env::temp_dir().join(format!("pg-cdc-loadgen-{}-{nanos}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 
     async fn status_server() -> SocketAddr {
@@ -295,15 +287,12 @@ mod tests {
     async fn a_spawned_process_is_found_queried_signalled_and_reaped() {
         let admin = status_server().await;
         let scratch = Scratch::new();
-        let script = scratch.0.join("fake-pg-cdc");
-        let mut file = std::fs::File::create(&script).unwrap();
-        write!(
-            file,
-            "#!/bin/sh\ncase \"$1\" in\n  run)\n    echo 'startup noise'\n    echo '{{\"fields\":{{\"message\":\"admin listening\",\"addr\":\"{admin}\"}}}}'\n    exec sleep 60 ;;\n  parked)\n    echo \"$*\"\n    exit 3 ;;\nesac\n"
-        )
-        .unwrap();
-        drop(file);
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = scratch.script(
+            "fake-pg-cdc",
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  run)\n    echo 'startup noise'\n    echo '{{\"fields\":{{\"message\":\"admin listening\",\"addr\":\"{admin}\"}}}}'\n    exec sleep 60 ;;\n  parked)\n    echo \"$*\"\n    echo \"err $*\" >&2\n    exit 3 ;;\nesac\n"
+            ),
+        );
 
         let env = [("PGCDC_TEST".to_owned(), "1".to_owned())];
         let mut process = PgCdc::spawn(&script, Path::new("config.yaml"), &env, "one")
@@ -322,6 +311,16 @@ mod tests {
             stdout.trim(),
             format!("parked list --status dead --addr {admin}")
         );
+        let output = process
+            .parked_output(&script, &["list", "--status", "dead"])
+            .await
+            .unwrap();
+        assert_eq!(output.code, 3);
+        assert_eq!(output.stdout, stdout);
+        assert_eq!(
+            output.stderr.trim(),
+            format!("err parked list --status dead --addr {admin}")
+        );
 
         assert!(
             process
@@ -339,11 +338,7 @@ mod tests {
     #[tokio::test]
     async fn a_process_that_never_reports_its_admin_address_is_an_error() {
         let scratch = Scratch::new();
-        let script = scratch.0.join("silent");
-        let mut file = std::fs::File::create(&script).unwrap();
-        write!(file, "#!/bin/sh\necho 'no listener'\n").unwrap();
-        drop(file);
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = scratch.script("silent", "#!/bin/sh\necho 'no listener'\n");
 
         let error = PgCdc::spawn(&script, Path::new("config.yaml"), &[], "silent")
             .await
@@ -354,15 +349,10 @@ mod tests {
     #[tokio::test]
     async fn sigkill_stops_the_process() {
         let scratch = Scratch::new();
-        let script = scratch.0.join("stubborn");
-        let mut file = std::fs::File::create(&script).unwrap();
-        write!(
-            file,
-            "#!/bin/sh\necho '{{\"fields\":{{\"message\":\"admin listening\",\"addr\":\"127.0.0.1:9\"}}}}'\ntrap '' TERM\nwhile true; do sleep 1; done\n"
-        )
-        .unwrap();
-        drop(file);
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = scratch.script(
+            "stubborn",
+            "#!/bin/sh\necho '{\"fields\":{\"message\":\"admin listening\",\"addr\":\"127.0.0.1:9\"}}'\ntrap '' TERM\nwhile true; do sleep 1; done\n",
+        );
 
         let mut process = PgCdc::spawn(&script, Path::new("config.yaml"), &[], "stubborn")
             .await

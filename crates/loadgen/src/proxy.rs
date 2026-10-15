@@ -21,6 +21,23 @@ const ACCEPT_RETRY: Duration = Duration::from_millis(10);
 const S3_ERROR_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>SlowDown</Code><Message>chaos</Message></Error>"#;
 const SNS_ERROR_BODY: &str = "<ErrorResponse><Error><Type>Receiver</Type><Code>InternalFailure</Code><Message>chaos</Message></Error></ErrorResponse>";
 
+type TapFn = dyn Fn(&[u8]) + Send + Sync;
+
+#[derive(Clone)]
+pub struct Tap(Arc<TapFn>);
+
+impl Tap {
+    pub fn new(tap: impl Fn(&[u8]) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(tap))
+    }
+}
+
+impl fmt::Debug for Tap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Tap")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Upstream {
     S3,
@@ -72,6 +89,15 @@ pub struct FaultProxy {
 
 impl FaultProxy {
     pub async fn start(upstream: SocketAddr, kind: Upstream, seed: u64) -> anyhow::Result<Self> {
+        Self::start_with_tap(upstream, kind, seed, None).await
+    }
+
+    pub async fn start_with_tap(
+        upstream: SocketAddr,
+        kind: Upstream,
+        seed: u64,
+        tap: Option<Tap>,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let (faults, receiver) = watch::channel(Faults::HEALTHY);
@@ -81,6 +107,7 @@ impl FaultProxy {
             faults: receiver,
             rng: Mutex::new(fastrand::Rng::with_seed(seed)),
             counters: Counters::default(),
+            tap,
         });
         let server = tokio::spawn(accept_loop(listener, Arc::clone(&shared)));
         Ok(Self {
@@ -117,6 +144,7 @@ struct Shared {
     faults: watch::Receiver<Faults>,
     rng: Mutex<fastrand::Rng>,
     counters: Counters,
+    tap: Option<Tap>,
 }
 
 impl Shared {
@@ -204,10 +232,15 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
     if let Mode::Brownout(latency) = faults.mode {
         tokio::time::sleep(latency).await;
     }
-    let Ok(reply) = forward(&shared, parts, body).await else {
+    let Ok(reply) = forward(&shared, parts, body.clone()).await else {
         return Ok(bad_gateway());
     };
     bump(&shared.counters.forwarded);
+    if let Some(tap) = &shared.tap
+        && reply.status().is_success()
+    {
+        (tap.0)(&body);
+    }
     if shared.draw(faults.error_after_forward_rate) {
         Ok(injected_error(&shared))
     } else {
@@ -431,6 +464,56 @@ mod tests {
     async fn answer(proxy: &FaultProxy, method: Method, path: &str) -> (u16, String) {
         let (status, _, body) = call(proxy, method, path, "").await.unwrap();
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn the_tap_sees_every_body_the_upstream_accepted_in_order() {
+        let (upstream_addr, _) = upstream().await;
+        let tapped: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let sink = Arc::clone(&tapped);
+        let tap = Tap::new(move |body| sink.lock().unwrap().push(body.to_vec()));
+        let proxy = FaultProxy::start_with_tap(upstream_addr, Upstream::Sns, 1, Some(tap))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            call(&proxy, Method::POST, "/", "first").await.unwrap().0,
+            201
+        );
+        proxy.set(Faults {
+            error_rate: 1.0,
+            ..Faults::HEALTHY
+        });
+        assert_eq!(
+            call(&proxy, Method::POST, "/", "refused").await.unwrap().0,
+            500
+        );
+        proxy.set(Faults {
+            mode: Mode::Outage,
+            ..Faults::HEALTHY
+        });
+        assert_eq!(
+            call(&proxy, Method::POST, "/", "outage").await.unwrap().0,
+            500
+        );
+        proxy.set(Faults {
+            error_after_forward_rate: 1.0,
+            ..Faults::HEALTHY
+        });
+        assert_eq!(
+            call(&proxy, Method::POST, "/", "landed").await.unwrap().0,
+            500
+        );
+        proxy.set(Faults::HEALTHY);
+        assert_eq!(
+            call(&proxy, Method::POST, "/", "last").await.unwrap().0,
+            201
+        );
+
+        assert_eq!(
+            tapped.lock().unwrap().as_slice(),
+            [b"first".to_vec(), b"landed".to_vec(), b"last".to_vec()]
+        );
     }
 
     #[tokio::test]
