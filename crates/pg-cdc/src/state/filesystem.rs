@@ -318,8 +318,10 @@ impl StateStore for FilesystemStateStore {
         if events.is_empty() {
             return Ok(());
         }
-        let mut encoded = Vec::with_capacity(events.len());
-        for event in events {
+        let mut sorted: Vec<&ParkedEvent> = events.iter().collect();
+        sorted.sort_by_key(|event| (event.order_key, event.id));
+        let mut encoded = Vec::with_capacity(sorted.len());
+        for event in sorted {
             encoded.push((
                 event.order_key,
                 format!("{}.json", event.id),

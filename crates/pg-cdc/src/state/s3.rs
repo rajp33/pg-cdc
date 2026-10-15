@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -116,6 +117,18 @@ impl S3StateStore {
         }
     }
 
+    async fn append_queue(
+        &self,
+        key: OrderKeyId,
+        queue: Vec<(EventId, Vec<u8>)>,
+    ) -> Result<(), StoreError> {
+        // A key's events land in id order and stop at its first failure: §10.6 skips replays below the lowest stored id.
+        for (id, bytes) in queue {
+            self.put_new(self.object(&key, &id), bytes).await?;
+        }
+        Ok(())
+    }
+
     async fn get(&self, object: &str) -> Result<Option<(Vec<u8>, Option<String>)>, StoreError> {
         let _permit = self.permit().await?;
         let output = match self
@@ -223,12 +236,18 @@ impl S3StateStore {
 #[async_trait]
 impl StateStore for S3StateStore {
     async fn append_parked(&self, events: &[ParkedEvent]) -> Result<(), StoreError> {
-        let mut tasks = JoinSet::new();
+        let mut queues: BTreeMap<OrderKeyId, Vec<(EventId, Vec<u8>)>> = BTreeMap::new();
         for event in events {
-            let object = self.object(&event.order_key, &event.id);
-            let bytes = encode_parked(event)?;
+            queues
+                .entry(event.order_key)
+                .or_default()
+                .push((event.id, encode_parked(event)?));
+        }
+        let mut tasks = JoinSet::new();
+        for (key, mut queue) in queues {
+            queue.sort_by_key(|(id, _)| *id);
             let store = self.clone();
-            tasks.spawn(async move { store.put_new(object, bytes).await });
+            tasks.spawn(async move { store.append_queue(key, queue).await });
         }
         Self::join(tasks).await.map(drop)
     }

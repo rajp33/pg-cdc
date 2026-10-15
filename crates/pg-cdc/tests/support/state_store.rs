@@ -22,6 +22,7 @@ where
     empty_calls_succeed(store.as_ref()).await?;
     reads_return_ascending_ids_and_respect_after_and_limit(store.as_ref()).await?;
     appends_are_create_only(store.as_ref()).await?;
+    an_append_with_a_malformed_event_is_all_or_nothing(store.as_ref()).await?;
     heads_are_the_lowest_id_per_queue_in_their_partition(store.as_ref()).await?;
     writes_are_durable_across_instances(&open).await?;
     status_changes_rewrite_one_event(store.as_ref(), &open).await?;
@@ -128,6 +129,33 @@ async fn appends_are_create_only(store: &dyn StateStore) -> TestResult {
         store.read_parked(&queue, None, 10).await?,
         vec![original, added]
     );
+    Ok(())
+}
+
+async fn an_append_with_a_malformed_event_is_all_or_nothing(store: &dyn StateStore) -> TestResult {
+    let queue = key(0x31, 1)?;
+    let mut events: Vec<ParkedEvent> = (0..64)
+        .map(|n| event(queue, id(4, n), ParkStatus::Retrying))
+        .collect();
+    events.push(ParkedEvent {
+        body: Bytes::from_static(b"not json"),
+        ..event(queue, id(5, 0), ParkStatus::Retrying)
+    });
+    let stored = match store.append_parked(&events).await {
+        Ok(()) => events.len(),
+        Err(StoreError::Malformed { .. }) => 0,
+        Err(error) => return Err(error.into()),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(store.read_parked(&queue, None, 100).await?.len(), stored);
+    store
+        .remove_parked(
+            &events
+                .iter()
+                .map(|event| (queue, event.id))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
     Ok(())
 }
 
