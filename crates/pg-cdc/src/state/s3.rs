@@ -133,6 +133,10 @@ impl S3StateStore {
 
     async fn get(&self, object: &str) -> Result<Option<(Vec<u8>, Option<String>)>, StoreError> {
         let _permit = self.permit().await?;
+        self.fetch(object).await
+    }
+
+    async fn fetch(&self, object: &str) -> Result<Option<(Vec<u8>, Option<String>)>, StoreError> {
         let output = match self
             .client
             .get_object()
@@ -351,7 +355,7 @@ impl StateStore for S3StateStore {
     }
 
     async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
-        let Some((bytes, etag)) = self.get(&self.leader_object()).await? else {
+        let Some((bytes, etag)) = self.fetch(&self.leader_object()).await? else {
             return Ok(None);
         };
         let version = etag.ok_or_else(|| StoreError::Malformed {
@@ -384,11 +388,7 @@ impl StateStore for S3StateStore {
             Some(version) => request.if_match(&version.0),
             None => request.if_none_match("*"),
         };
-        let sent = {
-            let _permit = self.permit().await?;
-            request.send().await
-        };
-        match sent {
+        match request.send().await {
             Ok(output) => output
                 .e_tag()
                 .map(|etag| SwapOutcome::Swapped(Version(etag.to_owned())))

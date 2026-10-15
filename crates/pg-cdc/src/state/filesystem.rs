@@ -50,6 +50,14 @@ impl FilesystemStateStore {
             .acquire()
             .await
             .map_err(|_| StoreError::Unavailable("the store is closed".to_owned()))?;
+        self.unbounded(operation).await
+    }
+
+    async fn unbounded<T, F>(&self, operation: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Path) -> Result<T, StoreError> + Send + 'static,
+    {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || operation(&root))
             .await
@@ -368,7 +376,7 @@ impl StateStore for FilesystemStateStore {
     }
 
     async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
-        self.blocking(|root| {
+        self.unbounded(|root| {
             Ok(read_leader_file(root)?.map(|file| Versioned {
                 value: file.record,
                 version: Version(file.version.to_string()),
@@ -383,7 +391,56 @@ impl StateStore for FilesystemStateStore {
         expected: Option<&Version>,
     ) -> Result<SwapOutcome, StoreError> {
         let (next, expected) = (next.clone(), expected.cloned());
-        self.blocking(move |root| swap(root, next, expected.as_ref()))
+        self.unbounded(move |root| swap(root, next, expected.as_ref()))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use pg_cdc_decoder::Lsn;
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::state::LeaderState;
+
+    fn key(n: u8) -> OrderKeyId {
+        format!("ab{}{n:02x}", "0".repeat(28)).parse().unwrap()
+    }
+
+    fn record() -> LeaderRecord {
+        LeaderRecord {
+            epoch: 1,
+            holder: "task-a".to_owned(),
+            state: LeaderState::Active,
+            confirmed_lsn: Lsn(0x10),
+            updated_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn leader_calls_bypass_the_permits_parking_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilesystemStateStore::new(dir.path(), "orders", 2);
+        let _held = store.permits.acquire_many(2).await.unwrap();
+        let swapped = timeout(Duration::from_secs(1), store.swap_leader(&record(), None)).await;
+        assert!(
+            matches!(swapped, Ok(Ok(SwapOutcome::Swapped(_)))),
+            "{swapped:?}"
+        );
+        let read = timeout(Duration::from_secs(1), store.read_leader())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.value, record());
+        let parked_read = timeout(
+            Duration::from_millis(100),
+            store.read_parked(&key(1), None, 1),
+        )
+        .await;
+        assert!(parked_read.is_err());
     }
 }

@@ -147,6 +147,7 @@ async fn a_missing_bucket_reports_the_store_unavailable() -> TestResult {
 #[derive(Debug, Default)]
 struct FakeS3 {
     failing: Option<String>,
+    stall: Option<String>,
     active: AtomicUsize,
     peak: AtomicUsize,
     per_key: Mutex<HashMap<String, (usize, usize)>>,
@@ -210,6 +211,17 @@ impl FakeS3 {
         self.leave(queue);
         if method == "DELETE" {
             return "HTTP/1.1 204 No Content\r\n\r\n";
+        }
+        if method == "GET" && path.ends_with("/leader.json") {
+            return "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 60\r\n\r\n<Error><Code>NoSuchKey</Code><Message>none</Message></Error>";
+        }
+        if method == "PUT"
+            && self
+                .stall
+                .as_deref()
+                .is_some_and(|stall| path.contains(stall))
+        {
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
         if method == "PUT"
             && self
@@ -384,5 +396,51 @@ async fn a_malformed_event_fails_the_append_before_any_write() -> TestResult {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(fake.stored(queue), vec![]);
     assert_eq!(fake.peak.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn leader_calls_do_not_wait_behind_parking_traffic() -> TestResult {
+    let parked = key(0x04, 1)?;
+    let other = key(0x04, 2)?;
+    let fake = Arc::new(FakeS3 {
+        stall: Some(format!("/{parked}/")),
+        ..FakeS3::default()
+    });
+    let store = Arc::new(fake_store(&fake, 1).await?);
+    let appending = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            store
+                .append_parked(&[event(parked, id(3, 0), ParkStatus::Retrying)])
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let record = LeaderRecord {
+        epoch: 1,
+        holder: "task-a".to_owned(),
+        state: LeaderState::Active,
+        confirmed_lsn: Lsn(0x10),
+        updated_ms: 1,
+    };
+    let read = tokio::time::timeout(Duration::from_secs(2), store.read_leader()).await;
+    assert!(matches!(read, Ok(Ok(None))), "{read:?}");
+    let swapped =
+        tokio::time::timeout(Duration::from_secs(2), store.swap_leader(&record, None)).await;
+    assert!(
+        matches!(swapped, Ok(Ok(SwapOutcome::Swapped(_)))),
+        "{swapped:?}"
+    );
+    let parked_read = tokio::time::timeout(
+        Duration::from_millis(500),
+        store.read_parked(&other, None, 1),
+    )
+    .await;
+    assert!(
+        parked_read.is_err(),
+        "a parked-event call ran past the held permit"
+    );
+    appending.abort();
     Ok(())
 }
