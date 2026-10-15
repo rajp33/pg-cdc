@@ -41,7 +41,7 @@ pub struct Mark {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Ledger {
     pub committed: Vec<Change>,
-    pub uncertain: Vec<Change>,
+    pub uncertain: Vec<Vec<Change>>,
     pub marks: Vec<Mark>,
     pub transactions: u64,
     pub oversize: u64,
@@ -342,7 +342,7 @@ pub async fn write_events(
             }
             Err(error) => {
                 failures += 1;
-                ledger.uncertain.extend(&changes);
+                ledger.uncertain.push(changes.clone());
                 log(&format!("transaction failed: {error}"));
                 anyhow::ensure!(
                     !client.is_closed() && failures < MAX_CONSECUTIVE_FAILURES,

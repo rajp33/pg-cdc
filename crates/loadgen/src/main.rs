@@ -226,7 +226,7 @@ async fn write(args: WriteArgs) -> anyhow::Result<()> {
 
     let summary = serde_json::json!({
         "committed": ledger.committed.len(),
-        "uncertain": ledger.uncertain.len(),
+        "uncertain": ledger.uncertain.iter().map(Vec::len).sum::<usize>(),
         "transactions": ledger.transactions,
         "oversize": ledger.oversize,
         "last_lsn": ledger.last_lsn,

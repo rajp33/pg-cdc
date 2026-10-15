@@ -21,7 +21,7 @@ pub enum Observed {
 #[derive(Debug, Clone, Default)]
 pub struct Evidence {
     pub committed: Vec<Change>,
-    pub uncertain: Vec<Change>,
+    pub uncertain: Vec<Vec<Change>>,
     pub observed: Vec<Observed>,
     pub stored: Vec<i64>,
     pub discards: BTreeSet<u64>,
@@ -56,7 +56,8 @@ impl Verdict {
 
 pub fn check(evidence: &Evidence) -> Verdict {
     let written = Written::new(evidence);
-    let committed: HashSet<i64> = evidence.committed.iter().map(|change| change.seq).collect();
+    let expected = expected(evidence, &written);
+    let committed: HashSet<i64> = expected.iter().map(|change| change.seq).collect();
 
     let mut deliveries: HashMap<i64, usize> = HashMap::new();
     let mut misrouted = BTreeSet::new();
@@ -89,7 +90,7 @@ pub fn check(evidence: &Evidence) -> Verdict {
         .partition(|seq| evidence.retained_from.is_some_and(|from| *seq >= from));
 
     Verdict {
-        committed: committed.len(),
+        committed: evidence.committed.len(),
         delivered: deliveries.len(),
         duplicates: deliveries.values().map(|count| count - 1).sum(),
         stored: stored.len(),
@@ -97,8 +98,31 @@ pub fn check(evidence: &Evidence) -> Verdict {
         retained: retained.len(),
         missing: missing.into_iter().collect(),
         phantoms: misrouted.into_iter().collect(),
-        out_of_order: order_violations(evidence, &written),
+        out_of_order: order_violations(evidence, &expected, &written),
     }
+}
+
+fn expected(evidence: &Evidence, written: &Written<'_>) -> Vec<Change> {
+    let seen: HashSet<i64> = evidence
+        .observed
+        .iter()
+        .filter_map(|observed| match *observed {
+            Observed::Delivered(delivery) => written
+                .matches(delivery.seq, delivery.key)
+                .then_some(delivery.seq),
+            Observed::DiscardMarker { token, key, seq } => {
+                written.counts_marker(token, key, seq).then_some(seq)
+            }
+        })
+        .chain(evidence.stored.iter().copied())
+        .collect();
+    let mut expected = evidence.committed.clone();
+    for transaction in &evidence.uncertain {
+        if transaction.iter().any(|change| seen.contains(&change.seq)) {
+            expected.extend(transaction);
+        }
+    }
+    expected
 }
 
 struct Written<'a> {
@@ -112,7 +136,7 @@ impl<'a> Written<'a> {
             keys: evidence
                 .committed
                 .iter()
-                .chain(&evidence.uncertain)
+                .chain(evidence.uncertain.iter().flatten())
                 .map(|change| (change.seq, change.key))
                 .collect(),
             discards: &evidence.discards,
@@ -147,9 +171,13 @@ impl KeyProgress {
     }
 }
 
-fn order_violations(evidence: &Evidence, written: &Written<'_>) -> Vec<OrderViolation> {
+fn order_violations(
+    evidence: &Evidence,
+    expected: &[Change],
+    written: &Written<'_>,
+) -> Vec<OrderViolation> {
     let mut keys: HashMap<i32, KeyProgress> = HashMap::new();
-    for change in &evidence.committed {
+    for change in expected {
         keys.entry(change.key)
             .or_default()
             .committed
@@ -405,7 +433,7 @@ mod tests {
     #[test]
     fn uncertain_changes_may_appear_and_unknown_ones_may_not() {
         let base = Evidence {
-            uncertain: vec![change(2, 1)],
+            uncertain: vec![vec![change(2, 1)]],
             ..evidence(&[(1, 1)], vec![delivered(1, 1)])
         };
         assert!(check(&base).passed());
@@ -422,6 +450,48 @@ mod tests {
         });
         assert_eq!(phantom.phantoms, vec![7]);
         assert!(!phantom.passed());
+    }
+
+    #[test]
+    fn an_uncertain_transaction_seen_committed_is_held_to_order_and_presence() {
+        let within = check(&Evidence {
+            uncertain: vec![vec![change(1, 1), change(2, 1)]],
+            ..evidence(&[], vec![delivered(2, 1), delivered(1, 1)])
+        });
+        assert_eq!(within.out_of_order, vec![violation(1, 2, 1)]);
+
+        let across = check(&Evidence {
+            uncertain: vec![vec![change(1, 1)]],
+            ..evidence(&[(2, 1)], vec![delivered(2, 1), delivered(1, 1)])
+        });
+        assert_eq!(across.out_of_order, vec![violation(1, 2, 1)]);
+
+        let partly_seen = check(&Evidence {
+            uncertain: vec![vec![change(1, 1), change(2, 2)]],
+            ..evidence(&[(3, 1)], vec![delivered(2, 2), delivered(3, 1)])
+        });
+        assert_eq!(partly_seen.missing, vec![1]);
+        assert_eq!(partly_seen.out_of_order, vec![violation(1, 3, 1)]);
+
+        let parked = check(&Evidence {
+            uncertain: vec![vec![change(1, 1)]],
+            stored: vec![1],
+            ..evidence(&[(2, 1)], vec![delivered(2, 1)])
+        });
+        assert_eq!(parked.out_of_order, vec![violation(1, 2, 1)]);
+
+        let absent = check(&Evidence {
+            uncertain: vec![vec![change(1, 1), change(2, 2)]],
+            ..evidence(&[(3, 1)], vec![delivered(3, 1)])
+        });
+        assert!(absent.passed(), "{absent:?}");
+
+        let misrouted = check(&Evidence {
+            uncertain: vec![vec![change(1, 1)]],
+            ..evidence(&[(2, 1)], vec![delivered(1, 5), delivered(2, 1)])
+        });
+        assert_eq!(misrouted.phantoms, vec![1]);
+        assert_eq!(misrouted.out_of_order, Vec::<OrderViolation>::new());
     }
 
     #[test]
@@ -445,7 +515,7 @@ mod tests {
         assert!(!one_misrouted.passed());
 
         let uncertain_elsewhere = check(&Evidence {
-            uncertain: vec![change(3, 1)],
+            uncertain: vec![vec![change(3, 1)]],
             ..evidence(
                 &committed,
                 vec![delivered(1, 1), delivered(2, 1), delivered(3, 4)],
