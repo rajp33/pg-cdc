@@ -2,7 +2,7 @@
 
 pg-cdc streams row changes for the tables in one Postgres publication through a logical replication slot to a sink. Delivery is at least once, and pg-cdc never writes to the source database.
 
-Status: milestone 3 of the [design](docs/superpowers/specs/2026-10-14-pg-cdc-design.md). Changes are delivered to SNS, stdout or a discard sink through ordered lanes with retries. An event the sink cannot take within `delivery.park_after` is parked in a state store (S3 or a local directory), so the slot keeps advancing during a sink outage, and parked events are redelivered in order once the sink recovers. Leadership and the admin API arrive in later milestones.
+Status: milestone 4 of the [design](docs/superpowers/specs/2026-10-14-pg-cdc-design.md). Changes are delivered to SNS, stdout or a discard sink through ordered lanes with retries. An event the sink cannot take within `delivery.park_after` is parked in a state store (S3 or a local directory), so the slot keeps advancing during a sink outage, and parked events are redelivered in order once the sink recovers. Tasks coordinate through the replication slot, so a deploy can start the new task before the old one stops and hand the slot over without losing a change. The admin API for parked events arrives in milestone 5.
 
 ## Run
 
@@ -64,9 +64,44 @@ The SNS message limit comes from the topic's `MaximumMessageSize` attribute when
 - **Dead events block their key** until an operator removes them. Until the admin API (milestone 5), stop pg-cdc, delete the dead event's object (`<prefix>/<pipeline>/parked/<order key id>/<event id>.json` in S3, or the same path under `state_store.path`), and start it again.
 - **Oversize events.** An event larger than the sink's message limit is stored in the payload store, and the sink receives a pointer instead: the same envelope without `before`, `after` and `unchanged_toast`, plus `"payload_ref": {"uri": "s3://bucket/prefix/pipeline/payloads/<event id>.json", "bytes": 912345}`. Without a `payload_store`, such an event is parked as dead. A lifecycle rule should expire payloads after your consumers' retention period.
 - **Startup.** Reading starts at once; delivery for an order key waits until the parked queue heads of its partition (the first byte of the order key id, 256 partitions) have loaded. Replayed events below a queue's head are skipped. Store calls are bounded by `state_store.max_concurrency` (default 32, from 1 to 4096), including listing during head loading.
-- **Shutdown.** On SIGTERM, pg-cdc stops reading, gives in-flight events 5 s to deliver, parks whatever remains (another 5 s at most), sends a final status update and exits 0. Events that could neither deliver nor park replay on the next start.
+- **Shutdown.** On SIGTERM, pg-cdc stops reading, gives in-flight events `leadership.drain_timeout` (default 5 s) to deliver, parks whatever remains (another `drain_timeout` at most), sends a final status update and exits 0. Events that could neither deliver nor park replay on the next start. See [Leadership and deploys](#leadership-and-deploys) for the full handover.
 - **Limits.** At `delivery.max_parked_events` (default 10,000,000; `0` is unlimited), or while the state store is unavailable, events stay in flight and the reader stops at `delivery.max_inflight_bytes`. pg-cdc checks that the state store answers before it opens the replication connection.
 - **State stores.** `state_store: { type: s3, bucket, prefix, region }` uses conditional writes and suits active/standby across hosts; the bucket should use default encryption, because parked objects hold row data. `state_store: { type: filesystem, path: /var/lib/pg-cdc }` keeps the same tree on local disk and suits a single host.
+
+## Leadership and deploys
+
+The replication slot is the lock: Postgres allows one walsender per slot, so only one task streams at a time. Every other task waits as a standby and takes over when the slot frees.
+
+```yaml
+leadership:
+  lease_timeout: 6s
+  fence_delay: 10s
+  drain_timeout: 5s
+admin:
+  listen: 127.0.0.1:9187
+```
+
+- **Standby.** A task that finds the slot held logs `waiting as standby`. It holds one control connection, polls `pg_replication_slots` every 2 s, and takes the slot when it frees. If another standby wins the race, it keeps polling. A standby never writes to the sink or the state store.
+- **Takeover.** The new holder reads the leader record (`leader.json` in the state store). A `released` record means the previous holder handed over cleanly, and delivery starts at once. An `active` record means the previous holder crashed or was fenced, and the successor waits `fence_delay` before it writes anything. Each takeover logs `took over the slot` with its `epoch` and its `kind` (`first`, `clean` or `unclean`); the epoch rises by one at every takeover.
+- **`leadership.lease_timeout`** (default 6 s, above 2 s). Every 2 s the active task checks over the control connection that the slot is still held by its own walsender. If no check succeeds for `lease_timeout`, the task fences itself: it stops writing, drops in-flight work, closes the replication connection and returns to standby.
+- **`leadership.fence_delay`** (default 10 s, must exceed `lease_timeout`). What a successor waits after a crash or a fence, so the old holder has stopped writing before the new one starts. A crashed or fenced holder therefore costs its successor `fence_delay`.
+- **`leadership.drain_timeout`** (default 5 s). The window for in-flight events to deliver, and again for parking what remains, during a shutdown.
+- **Shutdown on SIGTERM.** The task stops reading, drains for `drain_timeout`, parks for at most another `drain_timeout`, stops its lanes, marks the leader record `released` with the confirmed LSN, closes the replication connection and exits 0. The whole sequence takes at most `2 x drain_timeout + 3 s`, 13 s at the defaults. A clean handover leaves the successor a gap of the old task's shutdown plus one poll, a few seconds, well under 10 s. If the task was fenced or had to abandon a write, the record stays `active` and the successor waits `fence_delay`.
+- **Admin endpoint.** `admin.listen` is an IP address and port, default `127.0.0.1:9187`; host names are rejected, and port 0 picks a free port that is logged as `admin listening`. The endpoint has no authentication, so keep it on loopback or a private network. Two tasks that share a network namespace, as during a start-first deploy on one host, need distinct ports. A task that cannot bind the address exits 1.
+- **`GET /healthz`** is 200 when the sink preflight, the state store check and startup validation have passed, and, for an active task, the lease is valid; otherwise 503. A standby is healthy. **`GET /readyz`** is 200 only when the task is healthy, active and delivering, so a standby answers 503.
+- **`pg-cdc health [--addr <ip:port>]`** exits 0 only when `/healthz` answers 200 within 2 s, and exits 1 with one line on stderr otherwise. It takes its address from `--addr`, else `PGCDC__ADMIN__LISTEN`, else `127.0.0.1:9187`. Use it as the container health check, since a distroless image has no curl.
+- **Startup validation.** Before a task goes standby or active, it checks `wal_level`, the slot (exists, `pgoutput`, this database, not `lost`) and the publication. A failure keeps the task unhealthy and retrying; it never exits and never creates or drops anything. In a start-first deploy, a misconfigured new task therefore never turns healthy and the old task keeps running.
+
+### ECS settings
+
+- **Deployment:** minimum healthy 100%, maximum 200%, with the deployment circuit breaker on, so the new task starts before the old one stops and a task that never turns healthy rolls the deploy back.
+- **`stopTimeout`:** at least `2 x drain_timeout + 3 s`, which is 15 s at the defaults. A SIGKILL at `stopTimeout` turns the handover into a crash takeover, which is safe but costs `fence_delay`.
+- **Health check:** `pg-cdc health`, with `PGCDC__ADMIN__LISTEN` set if `admin.listen` is not the default.
+- **Desired count:** 1, or 2 for a hot standby.
+
+### Known limit
+
+A process paused for longer than `fence_delay` (a frozen VM, a stopped container) can land writes that were already in flight when it resumes. The result is duplicate deliveries, never loss; consumers should dedupe on the event `id`.
 
 ## Limits in this milestone
 
