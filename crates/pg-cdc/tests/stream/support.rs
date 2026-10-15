@@ -625,12 +625,13 @@ pub(crate) fn commit_lsn(event: &Value) -> TestResult<u64> {
     Ok(pg_cdc_testkit::parse_lsn(text)?)
 }
 
-type Registry = Arc<Mutex<Vec<watch::Sender<bool>>>>;
+type Registry = Arc<Mutex<Vec<Arc<watch::Sender<bool>>>>>;
 
 #[derive(Debug)]
 pub(crate) struct ControlProxy {
     port: u16,
     connections: Registry,
+    armed: Arc<AtomicBool>,
     _accepting: AbortOnDropHandle<()>,
 }
 
@@ -641,20 +642,24 @@ impl ControlProxy {
         let upstream = (pg.host().to_owned(), pg.port());
         let connections = Registry::default();
         let registry = Arc::clone(&connections);
+        let armed = Arc::new(AtomicBool::new(false));
+        let arming = Arc::clone(&armed);
         let accepting = tokio::spawn(async move {
             let mut forwarders = JoinSet::new();
             while let Ok((client, _)) = listener.accept().await {
-                let (freeze, frozen) = watch::channel(false);
+                let freeze = Arc::new(watch::Sender::new(false));
                 registry
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .push(freeze);
-                forwarders.spawn(forward(client, upstream.clone(), frozen));
+                    .push(Arc::clone(&freeze));
+                let at_ready = arming.swap(false, Ordering::SeqCst);
+                forwarders.spawn(forward(client, upstream.clone(), freeze, at_ready));
             }
         });
         Ok(Self {
             port,
             connections,
+            armed,
             _accepting: AbortOnDropHandle::new(accepting),
         })
     }
@@ -664,25 +669,56 @@ impl ControlProxy {
     }
 
     pub(crate) fn freeze(&self, connection: usize) -> TestResult {
-        self.connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(connection)
-            .ok_or("the proxy has not accepted that connection")?
-            .send_replace(true);
+        self.switch(connection)?.send_replace(true);
         Ok(())
+    }
+
+    pub(crate) fn freeze_next_once_ready(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn wait_until_frozen(&self, connection: usize) -> TestResult {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        let switch = loop {
+            if let Ok(switch) = self.switch(connection) {
+                break switch;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("the proxy never accepted that connection".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let mut frozen = switch.subscribe();
+        tokio::time::timeout_at(deadline, frozen.wait_for(|frozen| *frozen)).await??;
+        Ok(())
+    }
+
+    fn switch(&self, connection: usize) -> TestResult<Arc<watch::Sender<bool>>> {
+        Ok(Arc::clone(
+            self.connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(connection)
+                .ok_or("the proxy has not accepted that connection")?,
+        ))
     }
 }
 
-async fn forward(client: TcpStream, upstream: (String, u16), frozen: watch::Receiver<bool>) {
+async fn forward(
+    client: TcpStream,
+    upstream: (String, u16),
+    switch: Arc<watch::Sender<bool>>,
+    at_ready: bool,
+) {
     let Ok(server) = TcpStream::connect(upstream).await else {
         return;
     };
     let (client_read, client_write) = client.into_split();
     let (server_read, server_write) = server.into_split();
+    let freeze_at_ready = at_ready.then(|| Arc::clone(&switch));
     tokio::select! {
-        () = pump(client_read, server_write, frozen.clone()) => {}
-        () = pump(server_read, client_write, frozen) => {}
+        () = pump(client_read, server_write, switch.subscribe(), None) => {}
+        () = pump(server_read, client_write, switch.subscribe(), freeze_at_ready) => {}
     }
 }
 
@@ -690,7 +726,9 @@ async fn pump(
     mut from: tokio::net::tcp::OwnedReadHalf,
     mut to: tokio::net::tcp::OwnedWriteHalf,
     mut frozen: watch::Receiver<bool>,
+    mut freeze_at_ready: Option<Arc<watch::Sender<bool>>>,
 ) {
+    let mut frames = Frames::default();
     let mut buffer = vec![0u8; 16 * 1024];
     loop {
         let Ok(read) = from.read(&mut buffer).await else {
@@ -708,5 +746,47 @@ async fn pump(
         if to.write_all(chunk).await.is_err() {
             return;
         }
+        if freeze_at_ready.is_some()
+            && frames.ends_ready_for_query(chunk)
+            && let Some(switch) = freeze_at_ready.take()
+        {
+            switch.send_replace(true);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Frames {
+    header: Vec<u8>,
+    tag: u8,
+    remaining: usize,
+}
+
+impl Frames {
+    fn ends_ready_for_query(&mut self, mut chunk: &[u8]) -> bool {
+        let mut ready = false;
+        while !chunk.is_empty() {
+            if self.remaining == 0 {
+                let wanted = 5usize.saturating_sub(self.header.len()).min(chunk.len());
+                let (head, rest) = chunk.split_at(wanted);
+                self.header.extend_from_slice(head);
+                chunk = rest;
+                if let [tag, a, b, c, d] = *self.header.as_slice() {
+                    self.tag = tag;
+                    let length = u32::from_be_bytes([a, b, c, d]);
+                    self.remaining = usize::try_from(length)
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(4);
+                    self.header.clear();
+                    ready |= self.remaining == 0 && self.tag == b'Z';
+                }
+            } else {
+                let taken = self.remaining.min(chunk.len());
+                chunk = chunk.get(taken..).unwrap_or_default();
+                self.remaining -= taken;
+                ready |= self.remaining == 0 && self.tag == b'Z';
+            }
+        }
+        ready
     }
 }

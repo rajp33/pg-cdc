@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 
 use pg_cdc::config::{DEFAULT_MAX_PARKED_EVENTS, LeadershipConfig};
 use pg_cdc::health::{Health, Role};
+use pg_cdc::leader::POLL_INTERVAL;
 use pg_cdc::leader::lease::FenceReason;
 use pg_cdc::leader::record::TakeoverError;
 use pg_cdc::order::{OrderBy, OrderKeyId};
-use pg_cdc::session::{HANDOVER_TAIL, SessionConfig, SessionError};
+use pg_cdc::session::{CONTROL_QUERY_TIMEOUT, HANDOVER_TAIL, SessionConfig, SessionError};
 use pg_cdc::state::memory::MemoryStateStore;
 use pg_cdc::state::{LeaderRecord, LeaderState, StateStore, SwapOutcome, Versioned, now_ms};
 use pg_cdc::validate::Invalid;
@@ -832,4 +833,113 @@ async fn a_release_that_cannot_reach_the_store_still_exits_within_the_budget() -
     assert_eq!((record.epoch, record.state), (1, LeaderState::Active));
     pg.wait_for_slot(SLOT, WAIT, |state| !state.active).await?;
     Ok(())
+}
+
+const STOP_PROMPTLY: Duration = Duration::from_secs(1);
+
+#[tokio::test]
+async fn a_shutdown_during_validation_ends_the_attempt_at_once() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let proxy = ControlProxy::start(&pg).await?;
+    proxy.freeze_next_once_ready();
+    let store = RecordingStore::over(memory());
+    let session = support::spawn_in_context(
+        support::params_via(&proxy, &pg),
+        handover(),
+        store.stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    let health = session.health();
+    proxy.wait_until_frozen(0).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let stopping = Instant::now();
+    session.request_stop();
+    let (result, delivered) = session.finished_with_output(STOP_PROMPTLY).await?;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        stopping.elapsed() <= STOP_PROMPTLY,
+        "{:?}",
+        stopping.elapsed()
+    );
+    assert_eq!(delivered, 0);
+    assert!(store.calls().is_empty(), "{:?}", store.calls());
+    assert!(!health.snapshot().validated);
+    let slot = pg.slot_state(SLOT).await?.ok_or("the slot disappeared")?;
+    assert!(!slot.active, "{slot:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_validation_query_that_never_answers_ends_the_attempt() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let proxy = ControlProxy::start(&pg).await?;
+    proxy.freeze_next_once_ready();
+    let session = support::spawn_in_context(
+        support::params_via(&proxy, &pg),
+        handover(),
+        support::memory_stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    let health = session.health();
+    proxy.wait_until_frozen(0).await?;
+    let frozen = Instant::now();
+
+    let result = session
+        .finished(CONTROL_QUERY_TIMEOUT + Duration::from_secs(2))
+        .await?;
+
+    assert!(
+        matches!(result, Err(SessionError::ControlStalled(_))),
+        "{result:?}"
+    );
+    assert!(
+        frozen.elapsed() + Duration::from_millis(500) >= CONTROL_QUERY_TIMEOUT,
+        "{:?}",
+        frozen.elapsed()
+    );
+    assert!(result.is_err_and(|error| !error.is_fatal()));
+    assert!(!health.snapshot().validated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_standby_whose_control_connection_stalls_ends_the_attempt() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let shared = memory();
+    let a = support::spawn_in_context(
+        support::params(&pg),
+        handover(),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    active(&a.health(), WAIT).await?;
+    let proxy = ControlProxy::start(&pg).await?;
+    let b = support::spawn_in_context(
+        support::params_via(&proxy, &pg),
+        handover(),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-b"),
+    );
+    let health_b = b.health();
+    standby_ready(&health_b).await?;
+    tokio::time::sleep(POLL_INTERVAL / 2).await;
+
+    proxy.freeze(0)?;
+    let frozen = Instant::now();
+    let budget = CONTROL_QUERY_TIMEOUT + POLL_INTERVAL + Duration::from_secs(2);
+    let result = b.finished(budget).await?;
+
+    assert!(matches!(result, Err(SessionError::Probe(_))), "{result:?}");
+    assert!(frozen.elapsed() <= budget, "{:?}", frozen.elapsed());
+    assert!(health_b.snapshot().validated);
+    a.stop().await
 }

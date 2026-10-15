@@ -10,7 +10,7 @@ use pg_cdc_replication::{
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinError;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -38,6 +38,7 @@ use crate::validate::{Invalid, ValidationError, validate};
 pub const REPLICATION_BUFFER: usize = 64;
 pub const HANDOVER_TAIL: Duration = Duration::from_secs(3);
 pub const LANE_STOP_GRACE: Duration = Duration::from_secs(1);
+pub const CONTROL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -84,6 +85,8 @@ pub enum SessionError {
     Invalid(#[from] Invalid),
     #[error(transparent)]
     Probe(#[from] ProbeError),
+    #[error("the control connection did not answer within {0:?}")]
+    ControlStalled(Duration),
     #[error("cannot take over the slot: {0}")]
     Takeover(#[from] TakeoverError),
     #[error("lost the slot and fenced: {0}")]
@@ -159,9 +162,13 @@ async fn attempt(
     context: &SessionContext,
     shutdown: &CancellationToken,
 ) -> Result<(), SessionError> {
-    let params = provider.params().await?;
-    let control = Arc::new(connect_control(&params).await?);
-    check_source(&control, config, &context.health).await?;
+    let Some(prepared) = shutdown
+        .run_until_cancelled(prepare(provider, config, &context.health))
+        .await
+    else {
+        return Ok(());
+    };
+    let (params, control) = prepared?;
     context.health.set_role(Role::Standby);
     let probe = Arc::new(ControlProbe {
         control: Arc::clone(&control),
@@ -288,6 +295,22 @@ async fn claimed(
     }
 }
 
+async fn prepare(
+    provider: &dyn ConnectionProvider,
+    config: &SessionConfig,
+    health: &Health,
+) -> Result<(ConnectParams, Arc<ControlConnection>), SessionError> {
+    let params = provider.params().await?;
+    let control = Arc::new(connect_control(&params).await?);
+    timeout(
+        CONTROL_QUERY_TIMEOUT,
+        check_source(&control, config, health),
+    )
+    .await
+    .map_err(|_| SessionError::ControlStalled(CONTROL_QUERY_TIMEOUT))??;
+    Ok((params, control))
+}
+
 async fn check_source(
     control: &ControlConnection,
     config: &SessionConfig,
@@ -318,10 +341,14 @@ async fn acquire_slot(
     shutdown: &CancellationToken,
 ) -> Result<Option<(ReplicationStream, Lsn, Instant)>, SessionError> {
     let start = || async {
-        let start = catalog::slot_confirmed_flush(control.client(), &config.slot)
-            .await
-            .map_err(|error| StartError::Failed(error.into()))?
-            .ok_or_else(|| StartError::Failed(Invalid::SlotMissing(config.slot.clone()).into()))?;
+        let start = timeout(
+            CONTROL_QUERY_TIMEOUT,
+            catalog::slot_confirmed_flush(control.client(), &config.slot),
+        )
+        .await
+        .map_err(|_| StartError::Failed(SessionError::ControlStalled(CONTROL_QUERY_TIMEOUT)))?
+        .map_err(|error| StartError::Failed(error.into()))?
+        .ok_or_else(|| StartError::Failed(Invalid::SlotMissing(config.slot.clone()).into()))?;
         let replication = replication_config(params, config, start)
             .await
             .map_err(|error| StartError::Failed(error.into()))?;
@@ -356,9 +383,13 @@ struct ControlProbe {
 #[async_trait]
 impl SlotProbe for ControlProbe {
     async fn holder(&self) -> Result<SlotHolder, ProbeError> {
-        let activity = catalog::slot_activity(self.control.client(), &self.slot)
-            .await
-            .map_err(|error| ProbeError(error.to_string()))?;
+        let activity = timeout(
+            CONTROL_QUERY_TIMEOUT,
+            catalog::slot_activity(self.control.client(), &self.slot),
+        )
+        .await
+        .map_err(|_| ProbeError(format!("no answer within {CONTROL_QUERY_TIMEOUT:?}")))?
+        .map_err(|error| ProbeError(error.to_string()))?;
         Ok(match activity {
             None => SlotHolder::Missing,
             Some(activity) => activity
