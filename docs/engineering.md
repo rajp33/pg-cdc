@@ -10,7 +10,7 @@ These rules bind every change. `mise run check` enforces most of them.
 
 ## The gate
 
-`mise run check` runs, in order: `cargo fmt --check`, `taplo fmt --check`, `typos`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS="-D warnings"`, `cargo nextest run --workspace --all-features` (Docker-backed integration tests included), `cargo deny check` and `cargo machete`. Work is not done until it passes.
+`mise run check` runs, in order: `cargo fmt --check`, `taplo fmt --check`, `typos`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo clippy -p pg-cdc --no-default-features --lib --bins -- -D warnings` (so the build without the `otel` feature always compiles), `cargo doc --workspace --no-deps --all-features` with `RUSTDOCFLAGS="-D warnings"`, `cargo nextest run --workspace --all-features` (Docker-backed integration tests included), `cargo deny check` and `cargo machete`. Work is not done until it passes.
 
 ## Lints
 
@@ -38,10 +38,12 @@ These rules bind every change. `mise run check` enforces most of them.
 - proptest for property tests; fuzz targets live in `fuzz/`.
 - Tests assert behavior, are deterministic and print nothing on success.
 - Coverage floors, enforced in CI by `mise run cov`: `pg-cdc-decoder` at least 90% of lines; the workspace at least 80%, excluding testkit and loadgen. Both floors are enforced once `crates/decoder` exists; until then `mise run cov` only prints the report.
+- The testkit labels every container it starts `pg-cdc-testkit.created=<Unix seconds>` and, at most once every 10 minutes per machine, removes labeled containers older than an hour, so containers leaked by a killed test run do not pile up.
+- Chaos and load runs stay out of the gate: `mise run chaos-smoke`, `mise run chaos` and `mise run load` (see the README and `docs/load.md`). `crates/loadgen` (package `pg-cdc-loadgen`, binary `loadgen`) is a CLI, uses `anyhow`, and is excluded from coverage.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on pull requests, pushes to `main` and manual dispatch, with one concurrency group per ref and top-level `contents: read`. Third-party actions are pinned to commit SHAs. Jobs: `lint` (the gate minus tests, plus actionlint), `test` (Postgres 17), `pg-matrix` (Postgres 14, 15, 16 and 18), `coverage` and `fuzz-smoke` (60 seconds per target). Dependabot updates cargo and GitHub Actions weekly. The repository is public, so no job needs a secret.
+`.github/workflows/ci.yml` runs on pull requests, pushes to `main` and manual dispatch, with one concurrency group per ref and top-level `contents: read`. Third-party actions are pinned to commit SHAs. Jobs: `lint` (the gate minus tests, plus actionlint), `test` (Postgres 17), `pg-matrix` (Postgres 14, 15, 16 and 18), `coverage`, `chaos-smoke` (the 15-second chaos run, uploading `target/chaos` when it fails) and `fuzz-smoke` (60 seconds per target). `.github/workflows/image.yml` builds the release image for linux/amd64 and linux/arm64 on native runners and smoke-tests each on pull requests; only pushes to `main` and `v*` tags push it to `ghcr.io/rajp33/pg-cdc`, by digest, and merge the multi-arch manifest. Dependabot updates cargo, GitHub Actions and the Dockerfile's base images weekly. The repository is public, so no job needs a secret beyond the workflow's own `GITHUB_TOKEN`, which only the image push uses.
 
 ## Commits
 
