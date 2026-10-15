@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use pg_cdc::catalog::{
     SlotActivity, TypeResolver, key_columns, slot_activity, slot_confirmed_flush,
-    tables_without_full_identity,
+    slot_retained_bytes, tables_without_full_identity,
 };
 use pg_cdc_decoder::Lsn;
 use pg_cdc_decoder::value::TypeKind;
@@ -209,5 +209,32 @@ async fn slot_activity_is_none_for_a_missing_slot() -> TestResult {
     let pg = Postgres::start().await?;
     let client = pg.client().await?;
     assert_eq!(slot_activity(&client, "nope").await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_retained_bytes_tracks_unconsumed_wal() -> TestResult {
+    let pg = Postgres::start().await?;
+    pg.execute("CREATE TABLE backlog (id int PRIMARY KEY, body text)")
+        .await?;
+    pg.create_publication("it_pub", &["backlog"]).await?;
+    pg.create_slot("it_slot").await?;
+    let client = pg.client().await?;
+    let before = slot_retained_bytes(&client, "it_slot")
+        .await?
+        .ok_or("the slot reports no retained WAL")?;
+
+    client
+        .batch_execute(
+            "INSERT INTO backlog SELECT n, repeat('x', 200) FROM generate_series(1, 1000) AS n;
+             SELECT pg_switch_wal();",
+        )
+        .await?;
+    let after = slot_retained_bytes(&client, "it_slot")
+        .await?
+        .ok_or("the slot reports no retained WAL")?;
+    assert!(after > before, "{after} should exceed {before}");
+
+    assert_eq!(slot_retained_bytes(&client, "nope").await?, None);
     Ok(())
 }

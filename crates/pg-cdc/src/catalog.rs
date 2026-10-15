@@ -23,6 +23,9 @@ const SLOT_SQL: &str =
 
 const ACTIVITY_SQL: &str = "SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1";
 
+const RETAINED_SQL: &str = "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint \
+     FROM pg_replication_slots WHERE slot_name = $1";
+
 const IDENTITY_SQL: &str = "SELECT pt.schemaname::text, pt.tablename::text FROM pg_publication_tables pt \
      JOIN pg_namespace n ON n.nspname = pt.schemaname \
      JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename \
@@ -147,6 +150,15 @@ fn checked_pid(slot: &str, pid: i32) -> Result<u32, CatalogError> {
         slot: slot.to_owned(),
         pid,
     })
+}
+
+pub async fn slot_retained_bytes(client: &Client, slot: &str) -> Result<Option<u64>, CatalogError> {
+    let Some(row) = client.query_opt(RETAINED_SQL, &[&slot]).await? else {
+        return Ok(None);
+    };
+    Ok(row
+        .try_get::<_, Option<i64>>(0)?
+        .map(|bytes| u64::try_from(bytes).unwrap_or(0)))
 }
 
 pub async fn tables_without_full_identity(
