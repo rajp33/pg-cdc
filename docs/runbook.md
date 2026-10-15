@@ -82,12 +82,21 @@ Whether an Aurora logical slot survives a writer failover is not documented, and
 - `/healthz` 503 on every task, `/status` `role` `standby` everywhere, no active task in `pgcdc.role`;
 - `pgcdc.status_update.age` and `pgcdc.slot.retained_bytes` stop reporting.
 
-**Recovery:**
+**Recovery.** First tell a missing slot from an invalidated one, which still exists:
+
+```sql
+SELECT slot_name, active, active_pid, wal_status FROM pg_replication_slots WHERE slot_name = 'pgcdc_orders';
+```
+
+No row means the slot is missing. A row with `wal_status` `lost` means it was invalidated. Creating a slot under that name then fails with `replication slot "pgcdc_orders" already exists`, so drop the old slot first.
 
 1. Confirm the publication still exists and lists the tables: `SELECT * FROM pg_publication_tables WHERE pubname = 'pgcdc_orders';`. Recreate it first if it is gone (section 1).
-2. Recreate the slot: `SELECT pg_create_logical_replication_slot('pgcdc_orders', 'pgoutput');`.
-3. Leave the tasks running: validation retries with backoff, passes, and one task logs `took over the slot` and turns ready. Parked events in the state store are kept and drain as usual.
-4. Record the gap. Changes committed between the loss and the recreation are not captured and pg-cdc cannot replay them; backfills that close the gap arrive in v1.1. Until then, reconcile from the source if consumers need those changes.
+2. *Invalidated slot only:* check that it is inactive (`active` is `f`, `active_pid` empty). A pg-cdc task cannot stream from a lost slot, so an active one is held by something else; find that process from `active_pid` in `pg_stat_activity` and stop it before you go on. Then drop the slot: `SELECT pg_drop_replication_slot('pgcdc_orders');`.
+3. Create the slot: `SELECT pg_create_logical_replication_slot('pgcdc_orders', 'pgoutput');`.
+4. Leave the tasks running. Validation retries with backoff, then passes. One task logs `took over the slot` and `/healthz` and `/readyz` turn 200. Check that the slot query above now shows `wal_status` `reserved` and `active` `t`. Parked events in the state store are kept and drain as usual.
+5. Record the gap. Changes committed between the loss and the recreation are not captured, and pg-cdc cannot replay them. Dropping an invalidated slot loses nothing more, because the WAL it needed is already gone. Backfills that close the gap arrive in v1.1. Until then, reconcile from the source if consumers need those changes.
+
+Both procedures were run against Postgres 17 with a pg-cdc task waiting. For a missing slot, the task logged `replication slot pgcdc_orders does not exist` until step 3, then `took over the slot`. For a slot invalidated by `max_slot_wal_keep_size`, it logged `replication slot pgcdc_orders is lost (wal_status lost); recreate it`. A plain create failed with `already exists`, and after the drop and create the task took over and turned ready.
 
 **Before the loss.** A slot whose `wal_status` is `unreserved` is about to lose WAL it needs (validation logs `replication slot wal_status is unreserved: the WAL it needs may be removed at the next checkpoint`). `max_slot_wal_keep_size` invalidates a slot that falls further behind than its value, and Postgres 18's `idle_replication_slot_timeout` invalidates an idle one; leave both unset or larger than the longest outage you expect pg-cdc to sit through, and alert on `pgcdc.slot.retained_bytes` well below it.
 
