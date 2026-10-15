@@ -28,6 +28,7 @@ use pg_cdc::sink::stdout::StdoutSink;
 use pg_cdc::state::StateStore;
 use pg_cdc::state::filesystem::FilesystemStateStore;
 use pg_cdc::state::s3::{S3StateStore, s3_client};
+use pg_cdc::status::Status;
 use pg_cdc::supervisor::{LiveSession, preflight, store_ready, supervise};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -247,7 +248,11 @@ async fn run(config: Config, signalled: Arc<OnceLock<Instant>>) -> anyhow::Resul
         store_concurrency: config.state_store.max_concurrency(),
         leadership: config.leadership,
     };
-    let context = SessionContext { holder, health };
+    let context = SessionContext {
+        holder,
+        health,
+        status: Status::new(),
+    };
     let mut live = LiveSession {
         config: &session,
         context: &context,

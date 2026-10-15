@@ -10,7 +10,7 @@ use pg_cdc_replication::{
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinError;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, MissedTickBehavior, interval, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -33,12 +33,14 @@ use crate::leader::standby::{
 use crate::order::{OrderBy, order_key};
 use crate::sink::{Outbound, Sink};
 use crate::state::StateStore;
+use crate::status::{ParkedAccess, Status};
 use crate::validate::{Invalid, ValidationError, validate};
 
 pub const REPLICATION_BUFFER: usize = 64;
 pub const HANDOVER_TAIL: Duration = Duration::from_secs(3);
 pub const LANE_STOP_GRACE: Duration = Duration::from_secs(1);
 pub const CONTROL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SLOT_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
 const INSUFFICIENT_PRIVILEGE: &str = "42501";
 
@@ -71,6 +73,7 @@ pub struct SessionConfig {
 pub struct SessionContext {
     pub holder: String,
     pub health: Health,
+    pub status: Status,
 }
 
 impl SessionConfig {
@@ -157,10 +160,55 @@ pub async fn run_session(
     shutdown: &CancellationToken,
 ) -> Result<(), SessionError> {
     let result = attempt(config, provider, sink, stores, context, shutdown).await;
+    clear_status(&context.status);
     context.health.set_delivering(false);
     context.health.set_lease_valid(false);
     context.health.set_role(Role::Standby);
     result
+}
+
+fn clear_status(status: &Status) {
+    status.set_parked_access(None);
+    status.set_epoch(None);
+    status.set_confirmed(None);
+    status.set_inflight(0, 0);
+    status.set_status_clock(None);
+    status.set_parked(None);
+    status.set_slot_retained_bytes(None);
+}
+
+fn spawn_slot_poller(
+    control: &Arc<ControlConnection>,
+    slot: &str,
+    status: &Status,
+) -> AbortOnDropHandle<()> {
+    let control = Arc::clone(control);
+    let slot = slot.to_owned();
+    let status = status.clone();
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut ticker = interval(SLOT_METRICS_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let retained = match timeout(
+                CONTROL_QUERY_TIMEOUT,
+                catalog::slot_retained_bytes(control.client(), &slot),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "could not read the slot's retained WAL");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!("the slot's retained WAL query timed out");
+                    None
+                }
+            };
+            status.set_slot_retained_bytes(retained);
+        }
+    }))
 }
 
 async fn attempt(
@@ -172,19 +220,35 @@ async fn attempt(
     shutdown: &CancellationToken,
 ) -> Result<(), SessionError> {
     let Some(prepared) = shutdown
-        .run_until_cancelled(prepare(provider, config, &context.health))
+        .run_until_cancelled(prepare(provider, config, &context.health, &context.status))
         .await
     else {
         return Ok(());
     };
     let (params, control) = prepared?;
     context.health.set_role(Role::Standby);
+    let poller = spawn_slot_poller(&control, &config.slot, &context.status);
+    let result = serve(config, sink, stores, context, shutdown, &params, &control).await;
+    poller.abort();
+    let _ = poller.await;
+    result
+}
+
+async fn serve(
+    config: &SessionConfig,
+    sink: &Arc<dyn Sink>,
+    stores: &Stores,
+    context: &SessionContext,
+    shutdown: &CancellationToken,
+    params: &ConnectParams,
+    control: &Arc<ControlConnection>,
+) -> Result<(), SessionError> {
     let probe = Arc::new(ControlProbe {
-        control: Arc::clone(&control),
+        control: Arc::clone(control),
         slot: config.slot.clone(),
     });
     let Some((stream, start, acquired)) =
-        acquire_slot(probe.as_ref(), &control, &params, config, context, shutdown).await?
+        acquire_slot(probe.as_ref(), control, params, config, context, shutdown).await?
     else {
         return Ok(());
     };
@@ -198,19 +262,28 @@ async fn attempt(
     let permits = Arc::new(Semaphore::new(
         config.sink_concurrency.clamp(1, Semaphore::MAX_PERMITS),
     ));
+    let gated = gated_stores(stores, &gate);
+    let lanes = Lanes::spawn(
+        config.lane_settings(),
+        &gated_sink(sink, &gate),
+        &gated,
+        &permits,
+        &reports,
+    );
+    let status = &context.status;
+    status.set_status_clock(Some(stream.status_clock()));
+    status.set_confirmed(Some(start));
+    status.set_inflight(0, 0);
+    status.set_parked(Some(lanes.gauges()));
     let session = Session {
-        control: &control,
+        control,
         types: TypeResolver::new(),
         relations: HashMap::new(),
         builder: Builder::new(config.pipeline.clone()),
         ack: AckTracker::new(start),
-        lanes: Lanes::spawn(
-            config.lane_settings(),
-            &gated_sink(sink, &gate),
-            &gated_stores(stores, &gate),
-            &permits,
-            &reports,
-        ),
+        lanes,
+        parked_store: gated.state,
+        status,
         order_by: &config.order_by,
         attribute_columns: &config.attribute_columns,
         max_inflight_bytes: config.max_inflight_bytes,
@@ -321,12 +394,13 @@ async fn prepare(
     provider: &dyn ConnectionProvider,
     config: &SessionConfig,
     health: &Health,
+    status: &Status,
 ) -> Result<(ConnectParams, Arc<ControlConnection>), SessionError> {
     let params = provider.params().await?;
     let control = Arc::new(connect_control(&params).await?);
     timeout(
         CONTROL_QUERY_TIMEOUT,
-        check_source(&control, config, health),
+        check_source(&control, config, health, status),
     )
     .await
     .map_err(|_| SessionError::ControlStalled(CONTROL_QUERY_TIMEOUT))??;
@@ -375,6 +449,7 @@ async fn check_source(
     control: &ControlConnection,
     config: &SessionConfig,
     health: &Health,
+    status: &Status,
 ) -> Result<(), SessionError> {
     match validate(control.client(), &config.slot, &config.publication).await {
         Ok(_) => {}
@@ -384,11 +459,12 @@ async fn check_source(
         }
         Err(ValidationError::Catalog(error)) => return Err(error.into()),
     }
-    for (schema, table) in
-        catalog::tables_without_full_identity(control.client(), &config.publication).await?
-    {
+    let unsafe_tables =
+        catalog::tables_without_full_identity(control.client(), &config.publication).await?;
+    for (schema, table) in &unsafe_tables {
         tracing::warn!(%schema, %table, "published table does not use REPLICA IDENTITY FULL");
     }
+    status.set_tables_without_full_identity(u64::try_from(unsafe_tables.len()).unwrap_or(u64::MAX));
     Ok(())
 }
 
@@ -526,6 +602,8 @@ struct Session<'a> {
     builder: Builder,
     ack: AckTracker,
     lanes: Lanes,
+    parked_store: Arc<dyn StateStore>,
+    status: &'a Status,
     order_by: &'a OrderBy,
     attribute_columns: &'a [String],
     max_inflight_bytes: u64,
@@ -558,6 +636,7 @@ impl Session<'_> {
             Ended::Fenced(reason) => return self.fenced(stream, reason).await,
             Ended::Body(result) => result,
         };
+        self.status.set_parked_access(None);
         match result {
             Err(error @ SessionError::Takeover(_)) => {
                 drop(lease);
@@ -618,7 +697,9 @@ impl Session<'_> {
         shutdown: &CancellationToken,
         start: Lsn,
     ) -> Result<(), SessionError> {
-        self.stream(stream, settled, shutdown, start).await?;
+        let streamed = self.stream(stream, settled, shutdown, start).await;
+        self.status.set_parked_access(None);
+        streamed?;
         if self.leadership.claim.is_some() {
             self.health.set_role(Role::Draining);
             self.health.set_delivering(false);
@@ -632,6 +713,7 @@ impl Session<'_> {
         stream: ReplicationStream,
         reason: FenceReason,
     ) -> Result<(), SessionError> {
+        self.status.set_parked_access(None);
         self.leadership.pending = None;
         self.leadership.gate.fence();
         self.lanes.stop(Duration::ZERO).await;
@@ -647,6 +729,11 @@ impl Session<'_> {
         let claim = outcome.unwrap_or(Err(TakeoverError::Conflict))?;
         self.leadership.gate.open();
         self.health.set_delivering(true);
+        self.status.set_epoch(Some(claim.record.epoch));
+        self.status.set_parked_access(Some(ParkedAccess {
+            operator: self.lanes.operator(),
+            store: Arc::clone(&self.parked_store),
+        }));
         tracing::info!(
             epoch = claim.record.epoch,
             kind = %claim.kind,
@@ -677,7 +764,7 @@ impl Session<'_> {
                         return Ok(());
                     };
                     if let Some(lsn) = handled? {
-                        stream.confirm(lsn);
+                        self.confirm(stream, lsn);
                     }
                 }
             }
@@ -733,12 +820,24 @@ impl Session<'_> {
     ) -> Result<(), SessionError> {
         match report {
             Some(Report::Settled(settled)) => {
-                stream.confirm(self.ack.settle(settled)?);
+                let lsn = self.ack.settle(settled)?;
+                self.confirm(stream, lsn);
+                self.publish_inflight();
                 Ok(())
             }
             Some(Report::Fatal(error)) => Err(error.into()),
             None => Err(SessionError::LanesStopped),
         }
+    }
+
+    fn confirm(&self, stream: &ReplicationStream, lsn: Lsn) {
+        stream.confirm(lsn);
+        self.status.set_confirmed(Some(self.ack.confirmed()));
+    }
+
+    fn publish_inflight(&self) {
+        self.status
+            .set_inflight(self.ack.inflight_events(), self.ack.inflight_bytes());
     }
 
     async fn handle(&mut self, event: ReplicationEvent) -> Result<Option<Lsn>, SessionError> {
@@ -849,6 +948,7 @@ impl Session<'_> {
             ticket,
             arrived: Instant::now(),
         })?;
+        self.publish_inflight();
         Ok(())
     }
 }

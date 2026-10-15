@@ -22,6 +22,7 @@ use pg_cdc::state::{
     LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, StateStore, StoreError, SwapOutcome,
     Version, Versioned,
 };
+use pg_cdc::status::Status;
 use pg_cdc_testkit::Postgres;
 use secrecy::SecretString;
 use serde_json::Value;
@@ -106,6 +107,7 @@ pub(crate) fn context_for(holder: &str) -> SessionContext {
     SessionContext {
         holder: holder.to_owned(),
         health,
+        status: Status::new(),
     }
 }
 
@@ -438,6 +440,7 @@ pub(crate) struct Running {
     failures: watch::Receiver<u64>,
     calls: watch::Receiver<u64>,
     health: Health,
+    status: Status,
 }
 
 pub(crate) fn spawn_session(
@@ -489,6 +492,7 @@ pub(crate) fn spawn_in_context(
     });
     let shutdown = CancellationToken::new();
     let health = context.health.clone();
+    let status = context.status.clone();
     let task = spawn_run(params, config, sink, stores, context, shutdown.clone());
     Running {
         shutdown,
@@ -498,6 +502,7 @@ pub(crate) fn spawn_in_context(
         failures,
         calls,
         health,
+        status,
     }
 }
 
@@ -548,6 +553,10 @@ impl Running {
         self.health.clone()
     }
 
+    pub(crate) fn status(&self) -> Status {
+        self.status.clone()
+    }
+
     pub(crate) async fn finished(self, within: Duration) -> TestResult<Result<(), SessionError>> {
         Ok(tokio::time::timeout(within, self.task).await??)
     }
@@ -575,6 +584,12 @@ impl Running {
 
     pub(crate) async fn wait_for_sink_call(&mut self) -> TestResult {
         tokio::time::timeout(WAIT, self.calls.wait_for(|calls| *calls >= 1)).await??;
+        Ok(())
+    }
+
+    pub(crate) async fn wait_for_next_sink_call(&mut self) -> TestResult {
+        let seen = *self.calls.borrow();
+        tokio::time::timeout(WAIT, self.calls.wait_for(|calls| *calls > seen)).await??;
         Ok(())
     }
 
