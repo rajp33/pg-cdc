@@ -425,6 +425,16 @@ async fn release_by(state: &dyn StateStore, claim: &Claim, confirmed_lsn: Lsn, d
     }
 }
 
+async fn finished_claim(
+    pending: PendingClaim,
+) -> Option<Result<Result<Claim, TakeoverError>, JoinError>> {
+    if pending.is_finished() {
+        Some(pending.await)
+    } else {
+        None
+    }
+}
+
 async fn claimed(
     pending: &mut Option<PendingClaim>,
 ) -> Result<Result<Claim, TakeoverError>, JoinError> {
@@ -707,7 +717,11 @@ impl Session<'_> {
 
     async fn hand_over(mut self, stream: ReplicationStream, lease: Lease) {
         let deadline = Instant::now() + HANDOVER_TAIL;
-        self.leadership.pending = None;
+        if let Some(pending) = self.leadership.pending.take()
+            && let Some(Ok(Ok(claim))) = finished_claim(pending).await
+        {
+            self.leadership.claim = Some(claim);
+        }
         let claim = self.leadership.claim.take();
         let grace = if claim.is_some() {
             LANE_STOP_GRACE.min(deadline.saturating_duration_since(Instant::now()))
@@ -1081,6 +1095,30 @@ mod tests {
             fields,
             vec![("epoch", "1"), ("holder", "pod-a"), ("kind", "first")]
         );
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_finished_before_shutdown_is_still_adopted() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let pending = AbortOnDropHandle::new(tokio::spawn(claim_in_span(
+            store,
+            "pod-a".to_owned(),
+            Lsn(0x10),
+            Duration::ZERO,
+            CancellationToken::new(),
+        )));
+        while !pending.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let claim = finished_claim(pending).await.unwrap().unwrap().unwrap();
+        assert_eq!(claim.record.epoch, 1);
+        assert_eq!(claim.record.holder, "pod-a");
+    }
+
+    #[tokio::test]
+    async fn a_claim_still_waiting_out_the_fence_is_not_adopted() {
+        let pending = AbortOnDropHandle::new(tokio::spawn(std::future::pending()));
+        assert!(finished_claim(pending).await.is_none());
     }
 
     #[test]
