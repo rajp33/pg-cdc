@@ -14,20 +14,20 @@ use hyper::{Method, Request, Response, StatusCode, client, server};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 const ACCEPT_RETRY: Duration = Duration::from_millis(10);
 const S3_ERROR_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>SlowDown</Code><Message>chaos</Message></Error>"#;
 const SNS_ERROR_BODY: &str = "<ErrorResponse><Error><Type>Receiver</Type><Code>InternalFailure</Code><Message>chaos</Message></Error></ErrorResponse>";
 
-type TapFn = dyn Fn(&[u8]) + Send + Sync;
+type TapFn = dyn Fn(&[u8], &[u8]) + Send + Sync;
 
 #[derive(Clone)]
 pub struct Tap(Arc<TapFn>);
 
 impl Tap {
-    pub fn new(tap: impl Fn(&[u8]) + Send + Sync + 'static) -> Self {
+    pub fn new(tap: impl Fn(&[u8], &[u8]) + Send + Sync + 'static) -> Self {
         Self(Arc::new(tap))
     }
 }
@@ -109,6 +109,7 @@ impl FaultProxy {
             rng: Mutex::new(fastrand::Rng::with_seed(seed)),
             counters: Counters::default(),
             tap,
+            turn: Semaphore::new(1),
         });
         let server = tokio::spawn(accept_loop(listener, Arc::clone(&shared)));
         Ok(Self {
@@ -146,6 +147,7 @@ struct Shared {
     rng: Mutex<fastrand::Rng>,
     counters: Counters,
     tap: Option<Tap>,
+    turn: Semaphore,
 }
 
 impl Shared {
@@ -236,7 +238,11 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
     if let Mode::Brownout(latency) = faults.mode {
         tokio::time::sleep(latency).await;
     }
-    let Ok(reply) = forward(&shared, parts, body.clone()).await else {
+    let _turn = match shared.tap {
+        Some(_) => Some(shared.turn.acquire().await.map_err(|_| Dropped)?),
+        None => None,
+    };
+    let Ok((reply, reply_body)) = forward(&shared, parts, body.clone()).await else {
         return Ok(bad_gateway());
     };
     bump(&shared.counters.forwarded);
@@ -246,7 +252,7 @@ async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Proxy
     if let Some(tap) = &shared.tap
         && reply.status().is_success()
     {
-        (tap.0)(&body);
+        (tap.0)(&body, &reply_body);
     }
     if shared.draw(faults.error_after_forward_rate) {
         Ok(injected_error(&shared))
@@ -326,7 +332,7 @@ async fn forward(
     shared: &Shared,
     parts: request::Parts,
     body: Bytes,
-) -> anyhow::Result<ProxyResponse> {
+) -> anyhow::Result<(ProxyResponse, Bytes)> {
     let stream = connect_upstream(shared.upstream).await?;
     let (mut sender, connection) = client::conn::http1::handshake(TokioIo::new(stream)).await?;
     let driver = tokio::spawn(async move {
@@ -358,14 +364,15 @@ async fn forward(
         Ok(response) => {
             let (reply_parts, reply_body) = response.into_parts();
             reply_body.collect().await.map(|collected| {
-                let mut reply = Response::new(Full::new(collected.to_bytes()));
+                let bytes = collected.to_bytes();
+                let mut reply = Response::new(Full::new(bytes.clone()));
                 *reply.status_mut() = reply_parts.status;
                 for (name, value) in &reply_parts.headers {
                     if !HOP_BY_HOP.contains(&name.as_str()) {
                         reply.headers_mut().append(name.clone(), value.clone());
                     }
                 }
-                reply
+                (reply, bytes)
             })
         }
         Err(error) => Err(error),
@@ -390,6 +397,7 @@ mod tests {
     }
 
     type Seen = Arc<Mutex<Vec<Received>>>;
+    type Exchange = (Vec<u8>, Vec<u8>);
 
     async fn upstream() -> (SocketAddr, Seen) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -490,9 +498,13 @@ mod tests {
     #[tokio::test]
     async fn the_tap_sees_every_body_the_upstream_accepted_in_order() {
         let (upstream_addr, _) = upstream().await;
-        let tapped: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let tapped: Arc<Mutex<Vec<Exchange>>> = Arc::default();
         let sink = Arc::clone(&tapped);
-        let tap = Tap::new(move |body| sink.lock().unwrap().push(body.to_vec()));
+        let tap = Tap::new(move |request, response| {
+            sink.lock()
+                .unwrap()
+                .push((request.to_vec(), response.to_vec()));
+        });
         let proxy = FaultProxy::start_with_tap(upstream_addr, Upstream::Sns, 1, Some(tap))
             .await
             .unwrap();
@@ -531,10 +543,70 @@ mod tests {
             201
         );
 
+        let accepted = |body: &[u8]| (body.to_vec(), b"ok".to_vec());
         assert_eq!(
             tapped.lock().unwrap().as_slice(),
-            [b"first".to_vec(), b"landed".to_vec(), b"last".to_vec()]
+            [accepted(b"first"), accepted(b"landed"), accepted(b"last")]
         );
+    }
+
+    async fn slow_first_upstream() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let arrived: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorded = Arc::clone(&arrived);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let recorded = Arc::clone(&recorded);
+                        async move {
+                            let body = request.into_body().collect().await.unwrap().to_bytes();
+                            let body = String::from_utf8(body.to_vec()).unwrap();
+                            recorded.lock().unwrap().push(body.clone());
+                            if body == "slow" {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                            }
+                            Ok::<_, std::convert::Infallible>(Response::new(Full::new(
+                                Bytes::from(body),
+                            )))
+                        }
+                    });
+                    let _ = server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (addr, arrived)
+    }
+
+    #[tokio::test]
+    async fn the_tap_order_is_the_order_the_upstream_accepted_requests() {
+        let (upstream_addr, arrived) = slow_first_upstream().await;
+        let tapped: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&tapped);
+        let tap = Tap::new(move |request, _| {
+            sink.lock()
+                .unwrap()
+                .push(String::from_utf8(request.to_vec()).unwrap());
+        });
+        let proxy = FaultProxy::start_with_tap(upstream_addr, Upstream::Sns, 1, Some(tap))
+            .await
+            .unwrap();
+
+        let (slow, fast) = tokio::join!(call(&proxy, Method::POST, "/", "slow"), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            call(&proxy, Method::POST, "/", "fast").await
+        });
+        assert_eq!(slow.unwrap().0, 200);
+        assert_eq!(fast.unwrap().0, 200);
+
+        let arrived = arrived.lock().unwrap().clone();
+        assert_eq!(arrived, ["slow", "fast"]);
+        assert_eq!(*tapped.lock().unwrap(), arrived);
     }
 
     #[tokio::test]

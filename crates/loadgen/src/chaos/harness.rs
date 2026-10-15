@@ -152,7 +152,9 @@ impl Harness {
         let observations = Arc::new(Observations::default());
         let tap = Tap::new({
             let observations = Arc::clone(&observations);
-            move |request| observations.record_publish(request)
+            move |request, response| {
+                observations.record_publish(request, response);
+            }
         });
         let sns_proxy = FaultProxy::start_with_tap(
             upstream,
@@ -365,6 +367,13 @@ impl Harness {
             problems.push(format!(
                 "{unrecognized} queue messages were not understood, for example {:?}",
                 self.observations.unrecognized()
+            ));
+        }
+        let misgrouped = self.observations.misgrouped_count();
+        if misgrouped > 0 {
+            problems.push(format!(
+                "{misgrouped} deliveries were published under a second message group for their key, for example {:?}",
+                self.observations.misgrouped()
             ));
         }
         let observed = self.observations.snapshot();

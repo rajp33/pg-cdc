@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::rig::{self, Bench, ConfigSpec, SinkSpec, StoreSpec};
 use super::{LoadOptions, Verdict, write_report};
-use crate::chaos::evidence::{Observations, published_messages, read_stored};
+use crate::chaos::evidence::{Observations, read_stored};
 use crate::chaos::outstanding;
 use crate::checker::{self, Evidence};
 use crate::cluster::PgCdc;
@@ -85,18 +85,14 @@ struct Deliveries {
 }
 
 impl Deliveries {
-    fn record(&self, form: &[u8]) {
-        let messages = published_messages(form);
-        if messages.is_empty() {
+    fn record(&self, form: &[u8], response: &[u8]) {
+        if self.observations.record_publish(form, response) == 0 {
             return;
         }
         self.times
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(Instant::now());
-        for message in &messages {
-            self.observations.record(message);
-        }
     }
 
     fn times(&self) -> Vec<Instant> {
@@ -284,7 +280,7 @@ async fn prepare<'a>(bench: &'a Bench, options: &'a LoadOptions) -> anyhow::Resu
     let deliveries = Arc::new(Deliveries::default());
     let tap = Tap::new({
         let deliveries = Arc::clone(&deliveries);
-        move |form| deliveries.record(form)
+        move |form, response| deliveries.record(form, response)
     });
     let sns_proxy = FaultProxy::start_with_tap(upstream, Upstream::Sns, 1, Some(tap)).await?;
     let mut spawner = Spawner {
@@ -407,6 +403,13 @@ pub(super) async fn run(options: &LoadOptions) -> anyhow::Result<()> {
     if unrecognized > 0 {
         problems.push(format!(
             "{unrecognized} published messages were not understood"
+        ));
+    }
+    let misgrouped = harness.deliveries.observations.misgrouped_count();
+    if misgrouped > 0 {
+        problems.push(format!(
+            "{misgrouped} deliveries were published under a second message group for their key, for example {:?}",
+            harness.deliveries.observations.misgrouped()
         ));
     }
     let checker = checker::check(&Evidence {
