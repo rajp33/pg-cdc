@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -85,11 +86,15 @@ pub(crate) fn config(status_interval: Duration, buffer: usize) -> SessionConfig 
 }
 
 pub(crate) fn context() -> SessionContext {
+    context_for("test-holder")
+}
+
+pub(crate) fn context_for(holder: &str) -> SessionContext {
     let health = Health::new();
     health.set_sink_ready(true);
     health.set_store_ready(true);
     SessionContext {
-        holder: "test-holder".to_owned(),
+        holder: holder.to_owned(),
         health,
     }
 }
@@ -186,6 +191,8 @@ pub(crate) fn unparkable_stores() -> Stores {
 pub(crate) struct RecordingStore {
     inner: Arc<dyn StateStore>,
     calls: Mutex<Vec<&'static str>>,
+    detach: Mutex<Option<Duration>>,
+    landed: Arc<AtomicUsize>,
 }
 
 impl RecordingStore {
@@ -193,7 +200,37 @@ impl RecordingStore {
         Arc::new(Self {
             inner,
             calls: Mutex::default(),
+            detach: Mutex::default(),
+            landed: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    pub(crate) fn detach_appends(&self, delay: Duration) {
+        *self.detach.lock().unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
+    pub(crate) fn landed_appends(&self) -> usize {
+        self.landed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn wait_for_call(&self, method: &'static str) -> TestResult {
+        tokio::time::timeout(WAIT, async {
+            while !self.calls().contains(&method) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn wait_for_landed(&self, count: usize) -> TestResult {
+        tokio::time::timeout(WAIT, async {
+            while self.landed_appends() < count {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+        Ok(())
     }
 
     pub(crate) fn calls(&self) -> Vec<&'static str> {
@@ -223,7 +260,22 @@ impl RecordingStore {
 impl StateStore for RecordingStore {
     async fn append_parked(&self, events: &[ParkedEvent]) -> Result<(), StoreError> {
         self.record("append_parked");
-        self.inner.append_parked(events).await
+        let delay = *self.detach.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(delay) = delay else {
+            return self.inner.append_parked(events).await;
+        };
+        let inner = Arc::clone(&self.inner);
+        let events = events.to_vec();
+        let landed = Arc::clone(&self.landed);
+        let write = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = inner.append_parked(&events).await;
+            landed.fetch_add(1, Ordering::SeqCst);
+            result
+        });
+        write
+            .await
+            .map_err(|error| StoreError::Unavailable(error.to_string()))?
     }
 
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
@@ -452,6 +504,18 @@ impl Running {
 
     pub(crate) async fn finished(self, within: Duration) -> TestResult<Result<(), SessionError>> {
         Ok(tokio::time::timeout(within, self.task).await??)
+    }
+
+    pub(crate) async fn finished_with_output(
+        mut self,
+        within: Duration,
+    ) -> TestResult<(Result<(), SessionError>, usize)> {
+        let result = tokio::time::timeout(within, &mut self.task).await??;
+        let mut delivered = 0;
+        while self.events.try_recv().is_ok() {
+            delivered += 1;
+        }
+        Ok((result, delivered))
     }
 
     pub(crate) fn set_mode(&self, mode: Mode) {

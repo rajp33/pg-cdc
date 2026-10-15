@@ -13,6 +13,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const WAIT: Duration = Duration::from_secs(30);
 const ADMIN_ANY_PORT: &str = "admin:\n  listen: 127.0.0.1:0\n";
+const LEADERSHIP: &str = "leadership:\n  lease_timeout: 4s\n  fence_delay: 4500ms\n";
 
 struct ConfigFile {
     file: tempfile::NamedTempFile,
@@ -85,7 +86,7 @@ fn write_config_with_sink(
     };
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\n{sections}{state_store}{ADMIN_ANY_PORT}",
+        "pipeline: cli\nsource:\n  host: {host}\n  port: {port}\n  database: {database}\n  user: {user}\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: {slot}\n  publication: cli_pub\n  status_interval: {status_interval}\n{sections}{state_store}{LEADERSHIP}{ADMIN_ANY_PORT}",
         host = pg.host(),
         port = pg.port(),
         database = pg.database(),
@@ -277,7 +278,7 @@ async fn sigterm_while_the_connection_provider_is_built_exits_cleanly() -> TestR
     let mut file = tempfile::NamedTempFile::new()?;
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: aws_rds_iam\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: /nonexistent/pg-cdc\n{ADMIN_ANY_PORT}"
+        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: aws_rds_iam\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: /nonexistent/pg-cdc\n{LEADERSHIP}{ADMIN_ANY_PORT}"
     )?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_pg-cdc"))
         .arg("run")
@@ -651,7 +652,7 @@ async fn run_exits_when_the_admin_address_is_taken() -> TestResult {
     let state = tempfile::tempdir()?;
     write!(
         file,
-        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: password\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: {}\nadmin:\n  listen: {}\n",
+        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: password\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: {}\nleadership:\n  lease_timeout: 4s\n  fence_delay: 4500ms\nadmin:\n  listen: {}\n",
         state.path().display(),
         taken.local_addr()?
     )?;

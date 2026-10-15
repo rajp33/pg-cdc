@@ -9,8 +9,10 @@ use pg_cdc_replication::{
     ReplicationConfig, ReplicationError, ReplicationEvent, ReplicationStream,
 };
 use tokio::sync::{Semaphore, mpsc};
-use tokio::time::Instant;
+use tokio::task::JoinError;
+use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::ack::{AckError, AckTracker};
 use crate::catalog::{self, CatalogError, TypeResolver};
@@ -22,6 +24,8 @@ use crate::connection::{
 use crate::event::{BuildError, Builder, Built, ColumnInfo, RelationInfo};
 use crate::health::{Health, Role};
 use crate::lane::{LaneError, LaneSettings, LaneStopped, Lanes, Pending, Report, Stores};
+use crate::leader::gate::{WriteGate, gated_sink, gated_stores};
+use crate::leader::record::{Claim, TakeoverError, take_over};
 use crate::leader::standby::{
     AcquireError, OBJECT_IN_USE, ProbeError, SlotHolder, SlotProbe, StartError, acquire,
 };
@@ -31,6 +35,7 @@ use crate::validate::{Invalid, ValidationError, validate};
 
 pub const REPLICATION_BUFFER: usize = 64;
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub const HANDOVER_TAIL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -77,6 +82,8 @@ pub enum SessionError {
     Invalid(#[from] Invalid),
     #[error(transparent)]
     Probe(#[from] ProbeError),
+    #[error("cannot take over the slot: {0}")]
+    Takeover(#[from] TakeoverError),
     #[error("replication stream failed: {0}")]
     Replication(#[from] ReplicationError),
     #[error("replication stream ended")]
@@ -116,6 +123,7 @@ impl SessionError {
         matches!(
             self,
             Self::Ack(_)
+                | Self::Takeover(TakeoverError::EpochExhausted)
                 | Self::Encode(_)
                 | Self::Lane(_)
                 | Self::LaneStopped(_)
@@ -155,7 +163,7 @@ async fn attempt(
         control: Arc::clone(&control),
         slot: config.slot.clone(),
     });
-    let Some((mut stream, start, _acquired)) =
+    let Some((stream, start, _acquired)) =
         acquire_slot(probe.as_ref(), &control, &params, config, context, shutdown).await?
     else {
         return Ok(());
@@ -163,31 +171,74 @@ async fn attempt(
     context.health.set_role(Role::Active);
     context.health.set_lease_valid(true);
     tracing::info!(backend_pid = stream.backend_pid(), start_lsn = %start, "acquired the slot");
+    let gate = WriteGate::new();
+    let takeover = spawn_takeover(config, stores, context, start);
     let (reports, mut settled) = mpsc::unbounded_channel();
     let permits = Arc::new(Semaphore::new(
         config.sink_concurrency.clamp(1, Semaphore::MAX_PERMITS),
     ));
-    let mut session = Session {
+    let session = Session {
         control: &control,
         types: TypeResolver::new(),
         relations: HashMap::new(),
         builder: Builder::new(config.pipeline.clone()),
         ack: AckTracker::new(start),
-        lanes: Lanes::spawn(config.lane_settings(), sink, stores, &permits, &reports),
+        lanes: Lanes::spawn(
+            config.lane_settings(),
+            &gated_sink(sink, &gate),
+            &gated_stores(stores, &gate),
+            &permits,
+            &reports,
+        ),
         order_by: &config.order_by,
         attribute_columns: &config.attribute_columns,
         max_inflight_bytes: config.max_inflight_bytes,
+        slot: &config.slot,
+        health: &context.health,
+        leadership: Leadership {
+            gate: Arc::clone(&gate),
+            pending: Some(takeover),
+            claim: None,
+        },
     };
     drop(reports);
-    session
-        .stream(&mut stream, &mut settled, shutdown, start)
-        .await?;
-    session.drain(&stream, &mut settled).await?;
-    session.lanes.stop(Duration::ZERO).await;
-    if let Err(error) = stream.stop().await {
-        tracing::warn!(%error, "replication stream did not stop cleanly");
+    let result = session.run(stream, &mut settled, shutdown, start).await;
+    gate.fence();
+    result
+}
+
+type PendingClaim = AbortOnDropHandle<Result<Claim, TakeoverError>>;
+
+fn spawn_takeover(
+    config: &SessionConfig,
+    stores: &Stores,
+    context: &SessionContext,
+    start: Lsn,
+) -> PendingClaim {
+    let state = Arc::clone(&stores.state);
+    let holder = context.holder.clone();
+    let fence_delay = config.leadership.fence_delay;
+    let token = CancellationToken::new();
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        take_over(state.as_ref(), &holder, start, fence_delay, &token).await
+    }))
+}
+
+async fn stop_within_tail(stream: ReplicationStream) {
+    match timeout(HANDOVER_TAIL, stream.stop()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "replication stream did not stop cleanly"),
+        Err(_) => tracing::warn!("replication stream did not stop within the handover tail"),
     }
-    Ok(())
+}
+
+async fn claimed(
+    pending: &mut Option<PendingClaim>,
+) -> Result<Result<Claim, TakeoverError>, JoinError> {
+    match pending {
+        Some(handle) => handle.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn check_source(
@@ -321,6 +372,12 @@ async fn replication_config(
     })
 }
 
+struct Leadership {
+    gate: Arc<WriteGate>,
+    pending: Option<PendingClaim>,
+    claim: Option<Claim>,
+}
+
 struct Session<'a> {
     control: &'a ControlConnection,
     types: TypeResolver,
@@ -331,9 +388,68 @@ struct Session<'a> {
     order_by: &'a OrderBy,
     attribute_columns: &'a [String],
     max_inflight_bytes: u64,
+    slot: &'a str,
+    health: &'a Health,
+    leadership: Leadership,
 }
 
 impl Session<'_> {
+    async fn run(
+        mut self,
+        mut stream: ReplicationStream,
+        settled: &mut mpsc::UnboundedReceiver<Report>,
+        shutdown: &CancellationToken,
+        start: Lsn,
+    ) -> Result<(), SessionError> {
+        match self.stream(&mut stream, settled, shutdown, start).await {
+            Err(error @ SessionError::Takeover(_)) => {
+                tracing::error!(slot = self.slot, %error, "cannot take over the slot; releasing it");
+                self.leadership.gate.fence();
+                self.lanes.stop(Duration::ZERO).await;
+                stop_within_tail(stream).await;
+                Err(error)
+            }
+            Err(error) => {
+                self.leadership.gate.fence();
+                Err(error)
+            }
+            Ok(()) if self.leadership.claim.is_none() => {
+                self.leadership.pending = None;
+                self.leadership.gate.fence();
+                self.lanes.stop(Duration::ZERO).await;
+                stop_within_tail(stream).await;
+                Ok(())
+            }
+            Ok(()) => {
+                self.drain(&stream, settled).await?;
+                self.lanes.stop(Duration::ZERO).await;
+                if let Err(error) = stream.stop().await {
+                    tracing::warn!(%error, "replication stream did not stop cleanly");
+                }
+                self.leadership.gate.fence();
+                Ok(())
+            }
+        }
+    }
+
+    fn claimed(
+        &mut self,
+        outcome: Result<Result<Claim, TakeoverError>, JoinError>,
+    ) -> Result<(), SessionError> {
+        self.leadership.pending = None;
+        let claim = outcome.unwrap_or(Err(TakeoverError::Conflict))?;
+        self.leadership.gate.open();
+        self.health.set_delivering(true);
+        tracing::info!(
+            epoch = claim.record.epoch,
+            kind = %claim.kind,
+            holder = %claim.record.holder,
+            "took over the slot"
+        );
+        self.leadership.claim = Some(claim);
+        Ok(())
+    }
+
     async fn stream(
         &mut self,
         stream: &mut ReplicationStream,
@@ -347,6 +463,7 @@ impl Session<'_> {
                 biased;
                 () = shutdown.cancelled() => return Ok(()),
                 report = settled.recv() => self.report(report, stream)?,
+                outcome = claimed(&mut self.leadership.pending) => self.claimed(outcome)?,
                 received = stream.recv(), if self.ack.inflight_bytes() < self.max_inflight_bytes => {
                     let event = next_event(received, &mut position)?;
                     let Some(handled) = shutdown.run_until_cancelled(self.handle(event)).await else {
