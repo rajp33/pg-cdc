@@ -1,12 +1,83 @@
 use pg_cdc::validate::{Invalid, ValidationError, Verdict, validate};
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use pg_cdc_testkit::{Postgres, PostgresOptions, WalLevel};
+use tokio_postgres::Client;
+use tracing::field::{Field, Visit};
+use tracing::instrument::WithSubscriber;
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 const SLOT: &str = "it_slot";
 const PUBLICATION: &str = "it_pub";
+
+const UNRESERVED_MESSAGE: &str = "replication slot wal_status is unreserved: the WAL it needs may be removed at the next checkpoint";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Captured {
+    level: Level,
+    message: String,
+    slot: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct Fields {
+    message: String,
+    slot: Option<String>,
+}
+
+impl Visit for Fields {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "slot" {
+            self.slot = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+impl<S: Subscriber> Layer<S> for Capture {
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Captured {
+                level: *event.metadata().level(),
+                message: fields.message,
+                slot: fields.slot,
+            });
+    }
+}
+
+async fn validate_capturing(
+    client: &Client,
+    slot: &str,
+) -> (Result<Verdict, ValidationError>, Vec<Captured>) {
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let result = validate(client, slot, PUBLICATION)
+        .with_subscriber(subscriber)
+        .await;
+    let events = capture
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    (result, events)
+}
 
 async fn slot_names(
     pg: &Postgres,
@@ -72,8 +143,9 @@ async fn a_missing_slot_or_publication_fails_validation_until_created() -> TestR
     pg.execute("CREATE TABLE orders (id int PRIMARY KEY)")
         .await?;
     pg.create_publication(PUBLICATION, &["orders"]).await?;
-    let verdict = validate(&client, SLOT, PUBLICATION).await?;
-    assert_eq!(verdict, Verdict::Valid);
+    let (result, events) = validate_capturing(&client, SLOT).await;
+    assert_eq!(result?, Verdict::Valid);
+    assert_eq!(events, []);
     assert_eq!(slot_names(&pg).await?, [SLOT]);
     Ok(())
 }
@@ -154,9 +226,15 @@ async fn a_lost_slot_fails_validation_and_an_unreserved_slot_only_warns() -> Tes
         state.wal_status.as_deref() == Some("unreserved")
     })
     .await?;
+    let (result, events) = validate_capturing(&client, "lost_slot").await;
+    assert_eq!(result?, Verdict::Unreserved);
     assert_eq!(
-        validate(&client, "lost_slot", PUBLICATION).await?,
-        Verdict::Unreserved
+        events,
+        [Captured {
+            level: Level::ERROR,
+            message: UNRESERVED_MESSAGE.to_owned(),
+            slot: Some("lost_slot".to_owned()),
+        }]
     );
 
     let mut lost = false;

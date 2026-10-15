@@ -128,7 +128,11 @@ pub async fn validate(
     publication: &str,
 ) -> Result<Verdict, ValidationError> {
     let facts = source_facts(client, slot, publication).await?;
-    let verdict = judge(&facts, slot, publication)?;
+    Ok(assess(&facts, slot, publication)?)
+}
+
+fn assess(facts: &SourceFacts, slot: &str, publication: &str) -> Result<Verdict, Invalid> {
+    let verdict = judge(facts, slot, publication)?;
     if verdict == Verdict::Unreserved {
         tracing::error!(
             slot,
@@ -140,6 +144,13 @@ pub async fn validate(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Debug;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
     use super::*;
 
     const SLOT: &str = "s";
@@ -279,5 +290,81 @@ mod tests {
     fn judge_lets_an_unreserved_slot_through() {
         let facts = with_slot(|slot| slot.wal_status = Some("unreserved".to_owned()));
         assert_eq!(judge(&facts, SLOT, PUBLICATION), Ok(Verdict::Unreserved));
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Captured {
+        level: Level,
+        message: String,
+        slot: Option<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct Fields {
+        message: String,
+        slot: Option<String>,
+    }
+
+    impl Visit for Fields {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "slot" {
+                self.slot = Some(value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(Captured {
+                level: *event.metadata().level(),
+                message: fields.message,
+                slot: fields.slot,
+            });
+        }
+    }
+
+    fn assess_capturing(facts: &SourceFacts) -> (Result<Verdict, Invalid>, Vec<Captured>) {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let result =
+            tracing::subscriber::with_default(subscriber, || assess(facts, SLOT, PUBLICATION));
+        let events = capture.0.lock().unwrap().clone();
+        (result, events)
+    }
+
+    #[test]
+    fn assess_logs_an_error_naming_an_unreserved_slot() {
+        let facts = with_slot(|slot| slot.wal_status = Some("unreserved".to_owned()));
+        let (result, events) = assess_capturing(&facts);
+        assert_eq!(result, Ok(Verdict::Unreserved));
+        assert_eq!(
+            events,
+            [Captured {
+                level: Level::ERROR,
+                message: "replication slot wal_status is unreserved: the WAL it needs may be removed at the next checkpoint".to_owned(),
+                slot: Some(SLOT.to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn assess_logs_nothing_for_a_null_reserved_or_extended_slot() {
+        for status in [None, Some("reserved"), Some("extended")] {
+            let facts = with_slot(|slot| slot.wal_status = status.map(str::to_owned));
+            let (result, events) = assess_capturing(&facts);
+            assert_eq!(result, Ok(Verdict::Valid), "{status:?}");
+            assert_eq!(events, [], "{status:?}");
+        }
     }
 }
