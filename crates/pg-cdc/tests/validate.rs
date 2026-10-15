@@ -1,0 +1,131 @@
+use pg_cdc::validate::{Invalid, ValidationError, Verdict, validate};
+use pg_cdc_testkit::{Postgres, PostgresOptions, WalLevel};
+
+type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+const SLOT: &str = "it_slot";
+const PUBLICATION: &str = "it_pub";
+
+async fn slot_names(
+    pg: &Postgres,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let client = pg.client().await?;
+    let rows = client
+        .query(
+            "SELECT slot_name::text FROM pg_replication_slots ORDER BY 1",
+            &[],
+        )
+        .await?;
+    let mut names = Vec::new();
+    for row in &rows {
+        names.push(row.try_get::<_, String>(0)?);
+    }
+    Ok(names)
+}
+
+#[tokio::test]
+async fn a_server_without_logical_wal_level_fails_validation() -> TestResult {
+    let pg = Postgres::start_with(PostgresOptions {
+        wal_level: WalLevel::Replica,
+        ..PostgresOptions::default()
+    })
+    .await?;
+    let client = pg.client().await?;
+    let result = validate(&client, SLOT, PUBLICATION).await;
+    assert!(
+        matches!(
+            &result,
+            Err(ValidationError::Invalid(Invalid::WalLevel(level))) if level == "replica"
+        ),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_missing_slot_or_publication_fails_validation_until_created() -> TestResult {
+    let pg = Postgres::start().await?;
+    let client = pg.client().await?;
+    let result = validate(&client, SLOT, PUBLICATION).await;
+    assert!(
+        matches!(
+            &result,
+            Err(ValidationError::Invalid(Invalid::SlotMissing(slot))) if slot == SLOT
+        ),
+        "{result:?}"
+    );
+    assert_eq!(slot_names(&pg).await?, Vec::<String>::new());
+
+    pg.create_slot(SLOT).await?;
+    let result = validate(&client, SLOT, PUBLICATION).await;
+    assert!(
+        matches!(
+            &result,
+            Err(ValidationError::Invalid(Invalid::PublicationMissing(publication)))
+                if publication == PUBLICATION
+        ),
+        "{result:?}"
+    );
+
+    pg.execute("CREATE TABLE orders (id int PRIMARY KEY)")
+        .await?;
+    pg.create_publication(PUBLICATION, &["orders"]).await?;
+    let verdict = validate(&client, SLOT, PUBLICATION).await?;
+    assert_eq!(verdict, Verdict::Valid);
+    assert_eq!(slot_names(&pg).await?, [SLOT]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_slot_with_the_wrong_plugin_or_database_fails_validation() -> TestResult {
+    let pg = Postgres::start().await?;
+    pg.execute("CREATE TABLE orders (id int PRIMARY KEY)")
+        .await?;
+    pg.create_publication(PUBLICATION, &["orders"]).await?;
+    let client = pg.client().await?;
+
+    client
+        .execute(
+            "SELECT pg_create_logical_replication_slot('decoding_slot', 'test_decoding')",
+            &[],
+        )
+        .await?;
+    let result = validate(&client, "decoding_slot", PUBLICATION).await;
+    assert!(
+        matches!(
+            &result,
+            Err(ValidationError::Invalid(Invalid::SlotPlugin { plugin: Some(plugin), .. }))
+                if plugin == "test_decoding"
+        ),
+        "{result:?}"
+    );
+
+    client.batch_execute("CREATE DATABASE other").await?;
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(pg.host())
+        .port(pg.port())
+        .user(pg.user())
+        .password(pg.password())
+        .dbname("other");
+    let (other, connection) = config.connect(tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    other
+        .execute(
+            "SELECT pg_create_logical_replication_slot('other_slot', 'pgoutput')",
+            &[],
+        )
+        .await?;
+    let result = validate(&client, "other_slot", PUBLICATION).await;
+    assert!(
+        matches!(
+            &result,
+            Err(ValidationError::Invalid(Invalid::SlotDatabase { found: Some(found), expected, .. }))
+                if found == "other" && expected == "postgres"
+        ),
+        "{result:?}"
+    );
+    Ok(())
+}
