@@ -522,9 +522,13 @@ fn spawn_run(
 
 impl Running {
     pub(crate) async fn next_event(&mut self) -> TestResult<Value> {
-        let body = tokio::time::timeout(WAIT, self.events.recv())
-            .await?
-            .ok_or("session output closed")?;
+        let Some(body) = tokio::time::timeout(WAIT, self.events.recv()).await? else {
+            return Err(match (&mut self.task).await {
+                Ok(Ok(())) => "the session ended before delivering the event".into(),
+                Ok(Err(error)) => format!("the session failed: {error}").into(),
+                Err(error) => format!("the session task failed: {error}").into(),
+            });
+        };
         Ok(serde_json::from_slice(&body)?)
     }
 
