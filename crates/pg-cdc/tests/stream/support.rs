@@ -625,7 +625,13 @@ pub(crate) fn commit_lsn(event: &Value) -> TestResult<u64> {
     Ok(pg_cdc_testkit::parse_lsn(text)?)
 }
 
-type Registry = Arc<Mutex<Vec<Arc<watch::Sender<bool>>>>>;
+type Registry = Arc<Mutex<Vec<Link>>>;
+
+#[derive(Debug, Clone)]
+struct Link {
+    switch: Arc<watch::Sender<bool>>,
+    severed: CancellationToken,
+}
 
 #[derive(Debug)]
 pub(crate) struct ControlProxy {
@@ -647,13 +653,16 @@ impl ControlProxy {
         let accepting = tokio::spawn(async move {
             let mut forwarders = JoinSet::new();
             while let Ok((client, _)) = listener.accept().await {
-                let freeze = Arc::new(watch::Sender::new(false));
+                let link = Link {
+                    switch: Arc::new(watch::Sender::new(false)),
+                    severed: CancellationToken::new(),
+                };
                 registry
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .push(Arc::clone(&freeze));
+                    .push(link.clone());
                 let at_ready = arming.swap(false, Ordering::SeqCst);
-                forwarders.spawn(forward(client, upstream.clone(), freeze, at_ready));
+                forwarders.spawn(forward(client, upstream.clone(), link, at_ready));
             }
         });
         Ok(Self {
@@ -669,7 +678,12 @@ impl ControlProxy {
     }
 
     pub(crate) fn freeze(&self, connection: usize) -> TestResult {
-        self.switch(connection)?.send_replace(true);
+        self.link(connection)?.switch.send_replace(true);
+        Ok(())
+    }
+
+    pub(crate) fn sever(&self, connection: usize) -> TestResult {
+        self.link(connection)?.severed.cancel();
         Ok(())
     }
 
@@ -679,44 +693,41 @@ impl ControlProxy {
 
     pub(crate) async fn wait_until_frozen(&self, connection: usize) -> TestResult {
         let deadline = tokio::time::Instant::now() + WAIT;
-        let switch = loop {
-            if let Ok(switch) = self.switch(connection) {
-                break switch;
+        let link = loop {
+            if let Ok(link) = self.link(connection) {
+                break link;
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err("the proxy never accepted that connection".into());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        let mut frozen = switch.subscribe();
+        let mut frozen = link.switch.subscribe();
         tokio::time::timeout_at(deadline, frozen.wait_for(|frozen| *frozen)).await??;
         Ok(())
     }
 
-    fn switch(&self, connection: usize) -> TestResult<Arc<watch::Sender<bool>>> {
-        Ok(Arc::clone(
-            self.connections
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(connection)
-                .ok_or("the proxy has not accepted that connection")?,
-        ))
+    fn link(&self, connection: usize) -> TestResult<Link> {
+        Ok(self
+            .connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(connection)
+            .ok_or("the proxy has not accepted that connection")?
+            .clone())
     }
 }
 
-async fn forward(
-    client: TcpStream,
-    upstream: (String, u16),
-    switch: Arc<watch::Sender<bool>>,
-    at_ready: bool,
-) {
+async fn forward(client: TcpStream, upstream: (String, u16), link: Link, at_ready: bool) {
     let Ok(server) = TcpStream::connect(upstream).await else {
         return;
     };
     let (client_read, client_write) = client.into_split();
     let (server_read, server_write) = server.into_split();
+    let Link { switch, severed } = link;
     let freeze_at_ready = at_ready.then(|| Arc::clone(&switch));
     tokio::select! {
+        () = severed.cancelled() => {}
         () = pump(client_read, server_write, switch.subscribe(), None) => {}
         () = pump(server_read, client_write, switch.subscribe(), freeze_at_ready) => {}
     }

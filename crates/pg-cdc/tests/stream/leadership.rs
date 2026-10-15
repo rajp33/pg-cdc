@@ -943,3 +943,103 @@ async fn a_standby_whose_control_connection_stalls_ends_the_attempt() -> TestRes
     assert!(health_b.snapshot().validated);
     a.stop().await
 }
+
+async fn delivering(health: &Health) -> TestResult {
+    tokio::time::timeout(
+        WAIT,
+        health.subscribe().wait_for(|snapshot| snapshot.delivering),
+    )
+    .await??;
+    Ok(())
+}
+
+async fn wait_for_swaps(store: &RecordingStore, count: usize) -> TestResult {
+    tokio::time::timeout(WAIT, async {
+        while store
+            .calls()
+            .iter()
+            .filter(|call| **call == "swap_leader")
+            .count()
+            < count
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_final_status_update_reaches_the_slot_before_the_release() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let shared = memory();
+    let store = RecordingStore::over(Arc::clone(&shared));
+    let mut config = handover();
+    config.status_interval = Duration::from_secs(60);
+    let mut a = support::spawn_in_context(
+        support::params(&pg),
+        config,
+        store.stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    delivering(&a.health()).await?;
+    store.stall_leader_swaps();
+    pg.execute("INSERT INTO orders VALUES (1, 'a')").await?;
+    let commit = support::commit_lsn(&a.next_event().await?)?;
+    let before = pg.slot_state(SLOT).await?.ok_or("the slot disappeared")?;
+    assert!(
+        before.confirmed_flush_lsn < Some(commit),
+        "{before:?} {commit:#x}"
+    );
+
+    a.request_stop();
+    wait_for_swaps(&store, 2).await?;
+    pg.wait_for_slot(SLOT, Duration::from_secs(1), |state| {
+        state.confirmed_flush_lsn > Some(commit)
+    })
+    .await?;
+    let record = leader(&shared).await?.value;
+    assert_eq!((record.epoch, record.state), (1, LeaderState::Active));
+
+    let (result, _) = a
+        .finished_with_output(HANDOVER_TAIL + Duration::from_secs(1))
+        .await?;
+    assert!(result.is_ok(), "{result:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_final_status_update_that_cannot_be_sent_keeps_the_record_active() -> TestResult {
+    let pg = Postgres::start().await?;
+    orders(&pg).await?;
+    let proxy = ControlProxy::start(&pg).await?;
+    let shared = memory();
+    let mut a = support::spawn_in_context(
+        support::params_via(&proxy, &pg),
+        handover(),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    delivering(&a.health()).await?;
+    a.set_mode(Mode::Hold);
+    pg.execute("INSERT INTO orders VALUES (1, 'a')").await?;
+    a.wait_for_sink_call().await?;
+
+    a.request_stop();
+    proxy.freeze(0)?;
+    proxy.sever(1)?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.set_mode(Mode::Deliver);
+    let budget = HANDOVER_DRAIN * 2 + HANDOVER_TAIL + Duration::from_secs(1);
+    let (result, delivered) = a.finished_with_output(budget).await?;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(delivered, 1);
+    let record = leader(&shared).await?.value;
+    assert_eq!((record.epoch, record.state), (1, LeaderState::Active));
+    assert_eq!(record.holder, "holder-a");
+    Ok(())
+}

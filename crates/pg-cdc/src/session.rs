@@ -268,6 +268,19 @@ async fn stop_by(stream: ReplicationStream, deadline: Instant) {
     }
 }
 
+async fn status_by(stream: &ReplicationStream, deadline: Instant) -> bool {
+    let failure = match timeout_at(deadline, stream.send_status()).await {
+        Ok(Ok(())) => return true,
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => "no time left in the handover tail".to_owned(),
+    };
+    tracing::warn!(
+        %failure,
+        "could not send the final status update; leaving the leader record active"
+    );
+    false
+}
+
 async fn release_by(state: &dyn StateStore, claim: &Claim, confirmed_lsn: Lsn, deadline: Instant) {
     match timeout_at(deadline, release(state, claim, confirmed_lsn)).await {
         Ok(Release::Released) => tracing::info!(
@@ -541,7 +554,7 @@ impl Session<'_> {
                     fenced_by_lease,
                     "leaving the leader record active; the next holder waits fence_delay"
                 );
-            } else {
+            } else if status_by(&stream, deadline).await {
                 let confirmed = self.ack.confirmed();
                 release_by(self.leadership.state.as_ref(), &claim, confirmed, deadline).await;
             }
