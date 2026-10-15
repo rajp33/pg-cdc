@@ -16,6 +16,8 @@ pub enum TestkitError {
     MalformedFixture(String),
     #[error("certificate: {0}")]
     Certificate(#[from] rcgen::Error),
+    #[error("transport: {0}")]
+    Transport(#[from] tonic::transport::Error),
     #[error("docker: {0}")]
     Docker(String),
     #[error("aws: {0}")]

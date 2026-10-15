@@ -269,7 +269,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use pg_cdc_testkit::{OtlpReceiver, blackhole};
+    use pg_cdc_testkit::{OtlpReceiver, Received, Signal, blackhole};
     use serde_json::Value;
 
     use super::*;
@@ -456,6 +456,21 @@ mod tests {
             Telemetry::install(&enabled(endpoint), &identity(), status, health).unwrap()
         }
 
+        fn assert_identity(exports: &Received, signal: Signal) {
+            for (key, value) in [
+                ("service.name", "pg-cdc"),
+                ("service.version", env!("CARGO_PKG_VERSION")),
+                ("service.instance.id", "h-1"),
+                ("pgcdc.pipeline", "p"),
+            ] {
+                assert_eq!(
+                    exports.resource_attribute(signal, key).as_deref(),
+                    Some(value),
+                    "{signal:?} {key}"
+                );
+            }
+        }
+
         fn board() -> (Status, Health) {
             let status = Status::new();
             status.set_epoch(Some(4));
@@ -531,22 +546,7 @@ mod tests {
             );
             assert_eq!(exports.gauge("pgcdc.status_update.age"), None);
             assert_eq!(exports.gauge("pgcdc.slot.retained_bytes"), None);
-            assert_eq!(
-                exports.resource_attribute("service.name").as_deref(),
-                Some("pg-cdc")
-            );
-            assert_eq!(
-                exports.resource_attribute("service.instance.id").as_deref(),
-                Some("h-1")
-            );
-            assert_eq!(
-                exports.resource_attribute("pgcdc.pipeline").as_deref(),
-                Some("p")
-            );
-            assert_eq!(
-                exports.resource_attribute("service.version").as_deref(),
-                Some(env!("CARGO_PKG_VERSION"))
-            );
+            assert_identity(&exports, Signal::Metrics);
             assert!(telemetry.shutdown(FLUSH));
         }
 
@@ -628,6 +628,8 @@ mod tests {
                 .unwrap();
             assert!(exports.span_names().contains("sink_send"));
             assert!(exports.log_bodies().contains(&"hello".to_owned()));
+            assert_identity(&exports, Signal::Spans);
+            assert_identity(&exports, Signal::Logs);
             assert!(telemetry.shutdown(FLUSH));
         }
 
@@ -651,6 +653,75 @@ mod tests {
             let outside = lines.iter().find(|l| message(l) == "outside").unwrap();
             assert!(outside.get("trace_id").is_none(), "{outside}");
             assert!(outside.get("span_id").is_none(), "{outside}");
+            assert!(telemetry.shutdown(FLUSH));
+        }
+
+        fn ids(line: &Value) -> (String, String) {
+            (
+                line["trace_id"].as_str().unwrap_or_default().to_owned(),
+                line["span_id"].as_str().unwrap_or_default().to_owned(),
+            )
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stdout_and_exported_logs_carry_the_ids_of_their_exported_span() {
+            let receiver = OtlpReceiver::start().await.unwrap();
+            let (telemetry, layers) = install(&receiver.endpoint(), &Status::new(), &Health::new());
+            let buffer = Shared::default();
+            let (writer, flush) = crate::logs::non_blocking(buffer.clone(), 64).unwrap();
+            let subscriber = subscriber(writer, EnvFilter::new("info"), layers);
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug_span!(target: "pg_cdc::lane", "sink_send")
+                    .in_scope(|| tracing::info!(target: "pg_cdc::lane", "in debug"));
+                tracing::info_span!(target: "pg_cdc::session", "handover")
+                    .in_scope(|| tracing::info!(target: "pg_cdc::session", "in info"));
+            });
+            assert!(telemetry.flush(FLUSH));
+            let exports = receiver
+                .wait_for(SETTLE, |exports| {
+                    exports.span_ids("sink_send").is_some()
+                        && exports.span_ids("handover").is_some()
+                        && exports.log_ids("in debug").is_some()
+                        && exports.log_ids("in info").is_some()
+                })
+                .await
+                .unwrap();
+            let lines = lines(&buffer, &flush);
+            for (span, body) in [("sink_send", "in debug"), ("handover", "in info")] {
+                let exported = exports.span_ids(span).unwrap();
+                assert_eq!(exported.0.len(), 32, "{exported:?}");
+                assert_eq!(exported.1.len(), 16, "{exported:?}");
+                let line = lines.iter().find(|line| message(line) == body).unwrap();
+                assert_eq!(ids(line), exported, "{line}");
+                assert_eq!(exports.log_ids(body).unwrap(), exported, "{body}");
+            }
+            assert!(telemetry.shutdown(FLUSH));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stdout_lines_in_unsampled_spans_carry_no_ids() {
+            let receiver = OtlpReceiver::start().await.unwrap();
+            let plan = TelemetryPlan::Enabled {
+                endpoint: receiver.endpoint(),
+                sample_ratio: 0.0,
+            };
+            let (telemetry, layers) =
+                Telemetry::install(&plan, &identity(), &Status::new(), &Health::new()).unwrap();
+            let buffer = Shared::default();
+            let (writer, flush) = crate::logs::non_blocking(buffer.clone(), 64).unwrap();
+            let subscriber = subscriber(writer, EnvFilter::new("info"), layers);
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug_span!(target: "pg_cdc::lane", "sink_send")
+                    .in_scope(|| tracing::info!(target: "pg_cdc::lane", "in debug"));
+                tracing::info_span!(target: "pg_cdc::session", "handover")
+                    .in_scope(|| tracing::info!(target: "pg_cdc::session", "in info"));
+            });
+            let lines = lines(&buffer, &flush);
+            assert_eq!(lines.len(), 2);
+            for line in &lines {
+                assert!(line.get("trace_id").is_none(), "{line}");
+                assert!(line.get("span_id").is_none(), "{line}");
+            }
             assert!(telemetry.shutdown(FLUSH));
         }
 

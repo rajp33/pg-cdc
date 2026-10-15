@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::btree_map::Entry;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -25,18 +26,27 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 };
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::metrics::v1::{NumberDataPoint, metric, number_data_point};
+use opentelemetry_proto::tonic::resource::v1::Resource;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
 use crate::error::TestkitError;
+use crate::tls::TestCertificates;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 type SeriesKey = Vec<(String, String)>;
 type HistogramPoint = (Vec<f64>, Vec<u64>, u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Metrics,
+    Spans,
+    Logs,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Received {
@@ -72,6 +82,13 @@ fn text(value: Option<&AnyValue>) -> Option<String> {
         any_value::Value::BoolValue(flag) => Some(flag.to_string()),
         _ => None,
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
 }
 
 fn matches(point: &[KeyValue], wanted: &[(&str, &str)]) -> bool {
@@ -204,28 +221,66 @@ impl Received {
             .collect()
     }
 
-    pub fn resource_attribute(&self, key: &str) -> Option<String> {
-        let metrics = self
-            .metrics
-            .iter()
-            .flat_map(|request| &request.resource_metrics)
-            .filter_map(|resource| resource.resource.as_ref());
-        let spans = self
-            .spans
+    pub fn span_ids(&self, name: &str) -> Option<(String, String)> {
+        self.spans
             .iter()
             .flat_map(|request| &request.resource_spans)
-            .filter_map(|resource| resource.resource.as_ref());
-        let logs = self
-            .logs
+            .flat_map(|resource| &resource.scope_spans)
+            .flat_map(|scope| &scope.spans)
+            .find(|span| span.name == name)
+            .map(|span| (hex(&span.trace_id), hex(&span.span_id)))
+    }
+
+    pub fn log_ids(&self, body: &str) -> Option<(String, String)> {
+        self.logs
             .iter()
             .flat_map(|request| &request.resource_logs)
-            .filter_map(|resource| resource.resource.as_ref());
-        metrics
-            .chain(spans)
-            .chain(logs)
-            .flat_map(|resource| &resource.attributes)
-            .find(|attribute| attribute.key == key)
-            .and_then(|attribute| text(attribute.value.as_ref()))
+            .flat_map(|resource| &resource.scope_logs)
+            .flat_map(|scope| &scope.log_records)
+            .find(|record| text(record.body.as_ref()).as_deref() == Some(body))
+            .map(|record| (hex(&record.trace_id), hex(&record.span_id)))
+    }
+
+    fn resources(&self, signal: Signal) -> Vec<Option<&Resource>> {
+        match signal {
+            Signal::Metrics => self
+                .metrics
+                .iter()
+                .flat_map(|request| &request.resource_metrics)
+                .map(|resource| resource.resource.as_ref())
+                .collect(),
+            Signal::Spans => self
+                .spans
+                .iter()
+                .flat_map(|request| &request.resource_spans)
+                .map(|resource| resource.resource.as_ref())
+                .collect(),
+            Signal::Logs => self
+                .logs
+                .iter()
+                .flat_map(|request| &request.resource_logs)
+                .map(|resource| resource.resource.as_ref())
+                .collect(),
+        }
+    }
+
+    pub fn resource_attribute(&self, signal: Signal, key: &str) -> Option<String> {
+        let values: BTreeSet<Option<String>> = self
+            .resources(signal)
+            .into_iter()
+            .map(|resource| {
+                resource?
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.key == key)
+                    .and_then(|attribute| text(attribute.value.as_ref()))
+            })
+            .collect();
+        let mut values = values.into_iter();
+        match (values.next(), values.next()) {
+            (Some(only), None) => only,
+            _ => None,
+        }
     }
 }
 
@@ -267,22 +322,41 @@ impl LogsService for Collector {
     }
 }
 
+const LOOPBACK: &str = "127.0.0.1";
+
 #[derive(Debug)]
 pub struct OtlpReceiver {
     addr: SocketAddr,
+    ca_pem: Option<String>,
     received: Arc<Mutex<Received>>,
     server: JoinHandle<()>,
 }
 
 impl OtlpReceiver {
     pub async fn start() -> Result<Self, TestkitError> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        Self::serve(None).await
+    }
+
+    pub async fn start_tls() -> Result<Self, TestkitError> {
+        let certificates = TestCertificates::generate_for(LOOPBACK)?;
+        Self::serve(Some(certificates)).await
+    }
+
+    async fn serve(certificates: Option<TestCertificates>) -> Result<Self, TestkitError> {
+        let listener = TcpListener::bind((LOOPBACK, 0)).await?;
         let addr = listener.local_addr()?;
         let received = Arc::new(Mutex::new(Received::default()));
         let collector = Collector {
             received: Arc::clone(&received),
         };
-        let router = Server::builder()
+        let mut builder = Server::builder();
+        if let Some(certificates) = &certificates {
+            builder = builder.tls_config(ServerTlsConfig::new().identity(Identity::from_pem(
+                certificates.server_pem(),
+                certificates.server_key_pem(),
+            )))?;
+        }
+        let router = builder
             .add_service(MetricsServiceServer::new(collector.clone()))
             .add_service(TraceServiceServer::new(collector.clone()))
             .add_service(LogsServiceServer::new(collector));
@@ -293,13 +367,23 @@ impl OtlpReceiver {
         });
         Ok(Self {
             addr,
+            ca_pem: certificates.map(|certificates| certificates.ca_pem().to_owned()),
             received,
             server,
         })
     }
 
     pub fn endpoint(&self) -> String {
-        format!("http://{}", self.addr)
+        let scheme = if self.ca_pem.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{scheme}://{}", self.addr)
+    }
+
+    pub fn ca_pem(&self) -> Option<&str> {
+        self.ca_pem.as_deref()
     }
 
     pub fn received(&self) -> Received {
@@ -352,6 +436,7 @@ mod tests {
     };
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
+    use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 
     use super::*;
 
@@ -452,6 +537,88 @@ mod tests {
             Some(5.0)
         );
         assert_eq!(received.sum("pgcdc.events", &[]), Some(9.0));
+    }
+
+    #[tokio::test]
+    async fn a_tls_receiver_records_exports_from_a_client_that_trusts_its_ca() {
+        let receiver = OtlpReceiver::start_tls().await.unwrap();
+        assert!(receiver.endpoint().starts_with("https://127.0.0.1:"));
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(receiver.ca_pem().unwrap()));
+        let channel = Channel::from_shared(receiver.endpoint())
+            .unwrap()
+            .tls_config(tls)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        MetricsServiceClient::new(channel)
+            .export(one_sum_request(7))
+            .await
+            .unwrap();
+        assert_eq!(receiver.received().metrics.len(), 1);
+    }
+
+    fn with_resource(
+        mut request: ExportMetricsServiceRequest,
+        pipeline: Option<&str>,
+    ) -> ExportMetricsServiceRequest {
+        for resource in &mut request.resource_metrics {
+            resource.resource = Some(Resource {
+                attributes: pipeline
+                    .map(|value| KeyValue {
+                        key: "pgcdc.pipeline".to_owned(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(value.to_owned())),
+                        }),
+                        ..KeyValue::default()
+                    })
+                    .into_iter()
+                    .collect(),
+                ..Resource::default()
+            });
+        }
+        request
+    }
+
+    #[test]
+    fn a_resource_attribute_is_reported_only_when_every_export_of_the_signal_carries_it() {
+        let mut received = Received::default();
+        assert_eq!(
+            received.resource_attribute(Signal::Metrics, "pgcdc.pipeline"),
+            None
+        );
+        received
+            .metrics
+            .push(with_resource(one_sum_request(1), Some("p")));
+        received
+            .metrics
+            .push(with_resource(one_sum_request(2), Some("p")));
+        assert_eq!(
+            received
+                .resource_attribute(Signal::Metrics, "pgcdc.pipeline")
+                .as_deref(),
+            Some("p")
+        );
+        assert_eq!(
+            received.resource_attribute(Signal::Spans, "pgcdc.pipeline"),
+            None
+        );
+        received
+            .metrics
+            .push(with_resource(one_sum_request(3), None));
+        assert_eq!(
+            received.resource_attribute(Signal::Metrics, "pgcdc.pipeline"),
+            None
+        );
+        received.metrics.pop();
+        received
+            .metrics
+            .push(with_resource(one_sum_request(3), Some("q")));
+        assert_eq!(
+            received.resource_attribute(Signal::Metrics, "pgcdc.pipeline"),
+            None
+        );
     }
 
     #[tokio::test]
