@@ -1,3 +1,4 @@
+use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
@@ -213,27 +214,73 @@ fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), StoreError> {
     sync_dir(dir)
 }
 
-fn event_ids(dir: &Path) -> Result<Vec<EventId>, StoreError> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(unavailable(dir, &error)),
+fn queue_entries(dir: &Path) -> Result<Option<fs::ReadDir>, StoreError> {
+    match fs::read_dir(dir) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(unavailable(dir, &error)),
+    }
+}
+
+fn each_event_id(
+    dir: &Path,
+    cancelled: Cancelled<'_>,
+    mut visit: impl FnMut(EventId),
+) -> Result<(), StoreError> {
+    let Some(entries) = queue_entries(dir)? else {
+        return Ok(());
     };
-    let mut ids = Vec::new();
     for entry in entries {
+        check(cancelled)?;
         let entry = entry.map_err(|error| unavailable(dir, &error))?;
-        let name = entry.file_name();
-        let Some(id) = name
+        if let Some(id) = entry
+            .file_name()
             .to_str()
             .and_then(|name| name.strip_suffix(".json"))
             .and_then(|stem| stem.parse::<EventId>().ok())
-        else {
-            continue;
-        };
-        ids.push(id);
+        {
+            visit(id);
+        }
     }
-    ids.sort_unstable();
-    Ok(ids)
+    Ok(())
+}
+
+fn keep_smallest<T: Ord>(kept: &mut BinaryHeap<T>, item: T, keep: usize) {
+    if kept.len() < keep {
+        kept.push(item);
+    } else if kept.peek().is_some_and(|largest| item < *largest) {
+        kept.pop();
+        kept.push(item);
+    }
+}
+
+fn smallest_ids(
+    dir: &Path,
+    after: Option<EventId>,
+    limit: usize,
+    cancelled: Cancelled<'_>,
+) -> Result<Vec<EventId>, StoreError> {
+    let mut kept = BinaryHeap::new();
+    each_event_id(dir, cancelled, |id| {
+        if after.is_none_or(|after| id > after) {
+            keep_smallest(&mut kept, id, limit);
+        }
+    })?;
+    Ok(kept.into_sorted_vec())
+}
+
+fn queue_head(
+    dir: &Path,
+    length_cap: usize,
+    cancelled: Cancelled<'_>,
+) -> Result<Option<(EventId, usize)>, StoreError> {
+    let mut head: Option<EventId> = None;
+    let mut length = 0_usize;
+    each_event_id(dir, cancelled, |id| {
+        head = Some(head.map_or(id, |head| head.min(id)));
+        length = length.saturating_add(1).min(length_cap);
+    })?;
+    Ok(head.map(|head| (head, length)))
 }
 
 fn key_dir(root: &Path, key: &OrderKeyId) -> PathBuf {
@@ -252,7 +299,11 @@ fn append(
     Ok(())
 }
 
-fn load_heads(root: &Path, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
+fn load_heads(
+    root: &Path,
+    partition: u8,
+    cancelled: Cancelled<'_>,
+) -> Result<Vec<ParkedHead>, StoreError> {
     let parked = root.join(PARKED_DIR);
     let entries = match fs::read_dir(&parked) {
         Ok(entries) => entries,
@@ -272,12 +323,11 @@ fn load_heads(root: &Path, partition: u8) -> Result<Vec<ParkedHead>, StoreError>
         if order_key.partition() != partition {
             continue;
         }
-        let ids = event_ids(&entry.path())?;
-        if let Some(head) = ids.first() {
+        if let Some((head, length)) = queue_head(&entry.path(), usize::MAX, cancelled)? {
             heads.push(ParkedHead {
                 order_key,
-                head: *head,
-                length: u64::try_from(ids.len()).unwrap_or(u64::MAX),
+                head,
+                length: u64::try_from(length).unwrap_or(u64::MAX),
             });
         }
     }
@@ -297,8 +347,9 @@ fn list_queues(
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(ParkedQueues::default()),
         Err(error) => return Err(unavailable(&parked, &error)),
     };
-    let mut keys = Vec::new();
+    let mut kept = BinaryHeap::new();
     for entry in entries {
+        check(cancelled)?;
         let entry = entry.map_err(|error| unavailable(&parked, &error))?;
         let Some(order_key) = entry
             .file_name()
@@ -308,21 +359,20 @@ fn list_queues(
             continue;
         };
         if after.is_none_or(|after| order_key > after) {
-            keys.push(order_key);
+            keep_smallest(&mut kept, order_key, limit.saturating_add(1));
         }
     }
-    keys.sort_unstable();
+    let mut keys = kept.into_sorted_vec();
     let more = keys.len() > limit;
     keys.truncate(limit);
     let mut queues = Vec::new();
     for order_key in &keys {
-        check(cancelled)?;
-        let ids = event_ids(&key_dir(root, order_key))?;
-        if let Some(head) = ids.first() {
+        let dir = key_dir(root, order_key);
+        if let Some((head, length)) = queue_head(&dir, length_cap.max(1), cancelled)? {
             queues.push(ParkedHead {
                 order_key: *order_key,
-                head: *head,
-                length: u64::try_from(ids.len().min(length_cap.max(1))).unwrap_or(u64::MAX),
+                head,
+                length: u64::try_from(length).unwrap_or(u64::MAX),
             });
         }
     }
@@ -337,18 +387,13 @@ fn read(
     key: OrderKeyId,
     after: Option<EventId>,
     limit: usize,
+    cancelled: Cancelled<'_>,
 ) -> Result<Vec<ParkedEvent>, StoreError> {
     let dir = key_dir(root, &key);
     let mut events = Vec::new();
-    for id in event_ids(&dir)? {
-        if events.len() >= limit {
-            break;
-        }
-        if after.is_some_and(|after| id <= after) {
-            continue;
-        }
-        let name = format!("{id}.json");
-        let path = dir.join(&name);
+    for id in smallest_ids(&dir, after, limit, cancelled)? {
+        check(cancelled)?;
+        let path = dir.join(format!("{id}.json"));
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
@@ -479,7 +524,7 @@ impl StateStore for FilesystemStateStore {
     }
 
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
-        self.blocking(move |root, _| load_heads(root, partition))
+        self.blocking(move |root, cancelled| load_heads(root, partition, cancelled))
             .await
     }
 
@@ -504,7 +549,7 @@ impl StateStore for FilesystemStateStore {
         limit: usize,
     ) -> Result<Vec<ParkedEvent>, StoreError> {
         let (key, after) = (*key, after.copied());
-        self.blocking(move |root, _| read(root, key, after, limit))
+        self.blocking(move |root, cancelled| read(root, key, after, limit, cancelled))
             .await
     }
 
@@ -781,6 +826,71 @@ mod tests {
         );
     }
 
+    fn backlog(root: &Path, queue: OrderKeyId, count: u32) -> Vec<EventId> {
+        let dir = key_dir(root, &queue);
+        fs::create_dir_all(&dir).unwrap();
+        let mut ordinals: Vec<u32> = (0..count).collect();
+        fastrand::shuffle(&mut ordinals);
+        for ordinal in ordinals {
+            let bytes = encode_parked(&parked(queue, ordinal)).unwrap();
+            fs::write(dir.join(format!("{}.json", event_id(ordinal))), bytes).unwrap();
+        }
+        (0..count).map(event_id).collect()
+    }
+
+    #[test]
+    fn a_listing_stops_inside_a_large_queue_once_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        let ids = backlog(&root, queue, 3000);
+
+        let listed = list_queues(&root, None, 1, 10, &|| false).unwrap();
+        assert_eq!(
+            listed.queues,
+            vec![ParkedHead {
+                order_key: queue,
+                head: ids[0],
+                length: 10,
+            }]
+        );
+        let cancelled = list_queues(&root, None, 1, 10, &cancelled_after(1));
+        assert!(is_cancelled(&cancelled), "{cancelled:?}");
+    }
+
+    #[test]
+    fn reads_from_a_large_queue_keep_only_the_page_and_stop_once_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        let ids = backlog(&root, queue, 3000);
+
+        let read_ids = |after, limit| -> Vec<EventId> {
+            read(&root, queue, after, limit, &|| false)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.id)
+                .collect()
+        };
+        assert_eq!(read_ids(None, 3), ids[..3]);
+        assert_eq!(read_ids(Some(ids[1499]), 2), ids[1500..1502]);
+        assert_eq!(read_ids(Some(ids[2998]), 5), ids[2999..]);
+        let cancelled = read(&root, queue, None, 1, &cancelled_after(1));
+        assert!(is_cancelled(&cancelled), "{cancelled:?}");
+
+        let heads = load_heads(&root, queue.partition(), &|| false).unwrap();
+        assert_eq!(
+            heads,
+            vec![ParkedHead {
+                order_key: queue,
+                head: ids[0],
+                length: 3000,
+            }]
+        );
+        let cancelled = load_heads(&root, queue.partition(), &cancelled_after(1));
+        assert!(is_cancelled(&cancelled), "{cancelled:?}");
+    }
+
     #[test]
     fn a_cancelled_status_change_leaves_the_event_alone() {
         let dir = tempfile::tempdir().unwrap();
@@ -789,7 +899,7 @@ mod tests {
         append(&root, &encoded(queue, 1), &|| false).unwrap();
         let result = set_status(&root, queue, event_id(0), ParkStatus::Dead, &|| true);
         assert!(is_cancelled(&result), "{result:?}");
-        let stored = read(&root, queue, None, 1).unwrap();
+        let stored = read(&root, queue, None, 1, &|| false).unwrap();
         assert_eq!(stored[0].status, ParkStatus::Retrying);
         assert_eq!(names(&key_dir(&root, &queue)).len(), 1);
     }
