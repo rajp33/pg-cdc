@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,6 +27,7 @@ pub const S3_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const S3_LIST_PAGE: i32 = 1000;
 // S3 DeleteObjects accepts at most 1,000 keys per request.
 pub const S3_DELETE_BATCH: usize = 1000;
+pub const S3_READ_AHEAD_IDS: usize = 100_000;
 const JSON: &str = "application/json";
 
 pub async fn s3_client(region: Option<String>) -> Client {
@@ -47,6 +48,80 @@ pub struct S3StateStore {
     bucket: String,
     root: String,
     permits: Arc<Semaphore>,
+    read_ahead: Arc<Mutex<ReadAhead>>,
+}
+
+#[derive(Debug, Default)]
+struct ReadAhead {
+    generation: u64,
+    cached: usize,
+    keys: HashMap<OrderKeyId, VecDeque<EventId>>,
+}
+
+impl ReadAhead {
+    fn take(&self, key: &OrderKeyId, limit: usize) -> Option<Vec<EventId>> {
+        let ids = self.keys.get(key)?;
+        (ids.len() >= limit).then(|| ids.iter().take(limit).copied().collect())
+    }
+
+    fn fill(&mut self, generation: u64, key: OrderKeyId, ids: &[EventId]) {
+        if generation != self.generation {
+            return;
+        }
+        self.forget(&key);
+        let kept: VecDeque<EventId> = ids.iter().take(S3_READ_AHEAD_IDS).copied().collect();
+        if kept.is_empty() {
+            return;
+        }
+        while self.cached + kept.len() > S3_READ_AHEAD_IDS {
+            let Some(evicted) = self.keys.keys().next().copied() else {
+                break;
+            };
+            self.forget(&evicted);
+        }
+        self.cached += kept.len();
+        self.keys.insert(key, kept);
+    }
+
+    fn forget(&mut self, key: &OrderKeyId) {
+        if let Some(ids) = self.keys.remove(key) {
+            self.cached = self.cached.saturating_sub(ids.len());
+        }
+    }
+
+    fn removed(&mut self, key: &OrderKeyId, id: &EventId) {
+        let Some(ids) = self.keys.get_mut(key) else {
+            return;
+        };
+        let before = ids.len();
+        if ids.front() == Some(id) {
+            ids.pop_front();
+        } else {
+            ids.retain(|cached| cached != id);
+        }
+        self.cached = self.cached.saturating_sub(before - ids.len());
+        if ids.is_empty() {
+            self.keys.remove(key);
+        }
+    }
+
+    fn appended(&mut self, key: &OrderKeyId, id: &EventId) {
+        if self
+            .keys
+            .get(key)
+            .and_then(VecDeque::back)
+            .is_some_and(|last| id < last)
+        {
+            self.generation += 1;
+            self.forget(key);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.generation += 1;
+        self.cached = 0;
+        self.keys.clear();
+    }
 }
 
 struct Page {
@@ -93,7 +168,14 @@ impl S3StateStore {
             permits: Arc::new(Semaphore::new(
                 max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
             )),
+            read_ahead: Arc::default(),
         }
+    }
+
+    fn read_ahead(&self) -> MutexGuard<'_, ReadAhead> {
+        self.read_ahead
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     async fn permit(&self) -> Result<SemaphorePermit<'_>, StoreError> {
@@ -339,6 +421,58 @@ impl S3StateStore {
         decode_parked(&super::parked_name(&key, &id), &bytes).map(Some)
     }
 
+    async fn read_events(
+        &self,
+        key: OrderKeyId,
+        ids: Vec<EventId>,
+    ) -> Result<Vec<Option<ParkedEvent>>, StoreError> {
+        let mut tasks = JoinSet::new();
+        for id in ids {
+            let store = self.clone();
+            tasks.spawn(async move { store.read_event(key, id).await });
+        }
+        Self::join(tasks).await
+    }
+
+    async fn list_ahead(&self, key: OrderKeyId, limit: usize) -> Result<Vec<EventId>, StoreError> {
+        let generation = self.read_ahead().generation;
+        let prefix = format!("{}{key}/", self.parked_prefix());
+        let (objects, _) = self.list(&prefix, None, None, S3_LIST_PAGE).await?;
+        let listed: Vec<EventId> = objects
+            .iter()
+            .filter_map(|object| self.parse(object))
+            .map(|(_, id)| id)
+            .collect();
+        self.read_ahead().fill(generation, key, &listed);
+        Ok(listed.into_iter().take(limit).collect())
+    }
+
+    async fn read_ahead_head(
+        &self,
+        key: OrderKeyId,
+        limit: usize,
+    ) -> Result<Option<Vec<ParkedEvent>>, StoreError> {
+        let cached = self.read_ahead().take(&key, limit);
+        let ids = if let Some(ids) = cached {
+            ids
+        } else {
+            self.list_ahead(key, limit).await?
+        };
+        let wanted = ids.len();
+        let mut events: Vec<ParkedEvent> = self
+            .read_events(key, ids)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        if events.len() < wanted {
+            self.read_ahead().forget(&key);
+            return Ok(None);
+        }
+        events.sort_unstable_by_key(|event| event.id);
+        Ok(Some(events))
+    }
+
     async fn join<T: Send + 'static>(
         mut tasks: JoinSet<Result<T, StoreError>>,
     ) -> Result<Vec<T>, StoreError> {
@@ -371,7 +505,12 @@ impl StateStore for S3StateStore {
             let store = self.clone();
             tasks.spawn(async move { store.append_queue(key, queue).await });
         }
-        Self::join(tasks).await.map(drop)
+        let appended = Self::join(tasks).await.map(drop);
+        let mut read_ahead = self.read_ahead();
+        for event in events {
+            read_ahead.appended(&event.order_key, &event.id);
+        }
+        appended
     }
 
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
@@ -427,6 +566,12 @@ impl StateStore for S3StateStore {
         after: Option<&EventId>,
         limit: usize,
     ) -> Result<Vec<ParkedEvent>, StoreError> {
+        if after.is_none()
+            && i32::try_from(limit).is_ok_and(|limit| limit <= S3_LIST_PAGE)
+            && let Some(events) = self.read_ahead_head(*key, limit).await?
+        {
+            return Ok(events);
+        }
         let prefix = format!("{}{key}/", self.parked_prefix());
         let mut start_after = after.map(|after| self.object(key, after));
         let mut ids = Vec::new();
@@ -448,12 +593,12 @@ impl StateStore for S3StateStore {
             }
         }
         ids.truncate(limit);
-        let mut tasks = JoinSet::new();
-        for id in ids {
-            let (store, key) = (self.clone(), *key);
-            tasks.spawn(async move { store.read_event(key, id).await });
-        }
-        let mut events: Vec<ParkedEvent> = Self::join(tasks).await?.into_iter().flatten().collect();
+        let mut events: Vec<ParkedEvent> = self
+            .read_events(*key, ids)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
         events.sort_unstable_by_key(|event| event.id);
         Ok(events)
     }
@@ -490,7 +635,12 @@ impl StateStore for S3StateStore {
             let objects = batch.iter().map(|(key, id)| self.object(key, id)).collect();
             tasks.spawn(async move { store.delete_batch(objects).await });
         }
-        Self::join(tasks).await.map(drop)
+        Self::join(tasks).await?;
+        let mut read_ahead = self.read_ahead();
+        for (key, id) in events {
+            read_ahead.removed(key, id);
+        }
+        Ok(())
     }
 
     async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError> {
@@ -527,7 +677,9 @@ impl StateStore for S3StateStore {
             Some(version) => request.if_match(&version.0),
             None => request.if_none_match("*"),
         };
-        match request.send().await {
+        let sent = request.send().await;
+        self.read_ahead().clear();
+        match sent {
             Ok(output) => output
                 .e_tag()
                 .map(|etag| SwapOutcome::Swapped(Version(etag.to_owned())))
@@ -545,5 +697,62 @@ impl StateStore for S3StateStore {
             }
             Err(error) => Err(unavailable(&error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pg_cdc_decoder::Lsn;
+
+    use super::*;
+
+    fn ids(lsn: u64, count: usize) -> Vec<EventId> {
+        (0..u32::try_from(count).unwrap())
+            .map(|ordinal| EventId::new(Lsn(lsn), ordinal))
+            .collect()
+    }
+
+    fn key(n: u8) -> OrderKeyId {
+        format!("{n:02x}{}", "0".repeat(30)).parse().unwrap()
+    }
+
+    #[test]
+    fn read_ahead_ids_stay_within_their_bound_by_evicting_other_keys() {
+        let mut read_ahead = ReadAhead::default();
+        read_ahead.fill(0, key(1), &ids(1, S3_READ_AHEAD_IDS - 5));
+        read_ahead.fill(0, key(2), &ids(2, 5));
+        assert_eq!(read_ahead.cached, S3_READ_AHEAD_IDS);
+        assert!(read_ahead.take(&key(1), 1).is_some());
+
+        read_ahead.fill(0, key(3), &ids(3, 10));
+        assert!(read_ahead.cached <= S3_READ_AHEAD_IDS);
+        assert_eq!(read_ahead.take(&key(3), 10), Some(ids(3, 10)));
+
+        read_ahead.fill(0, key(4), &ids(4, S3_READ_AHEAD_IDS + 7));
+        assert_eq!(read_ahead.cached, S3_READ_AHEAD_IDS);
+        assert_eq!(read_ahead.keys.len(), 1);
+    }
+
+    #[test]
+    fn removals_and_stale_fills_keep_the_count_exact() {
+        let mut read_ahead = ReadAhead::default();
+        read_ahead.fill(0, key(1), &ids(1, 3));
+        let [first, second, third] = ids(1, 3)[..] else {
+            panic!("three ids");
+        };
+        read_ahead.removed(&key(1), &second);
+        read_ahead.removed(&key(1), &first);
+        assert_eq!(
+            (read_ahead.cached, read_ahead.take(&key(1), 1)),
+            (1, Some(vec![third]))
+        );
+        read_ahead.removed(&key(1), &third);
+        assert_eq!(read_ahead.cached, 0);
+        assert!(read_ahead.keys.is_empty());
+
+        let generation = read_ahead.generation;
+        read_ahead.clear();
+        read_ahead.fill(generation, key(2), &ids(2, 4));
+        assert_eq!((read_ahead.cached, read_ahead.take(&key(2), 1)), (0, None));
     }
 }

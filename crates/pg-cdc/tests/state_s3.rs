@@ -271,6 +271,136 @@ async fn removal_deletes_up_to_a_thousand_objects_per_request() -> TestResult {
     Ok(())
 }
 
+async fn head(store: &S3StateStore, queue: OrderKeyId) -> TestResult<Option<EventId>> {
+    Ok(store
+        .read_parked(&queue, None, 1)
+        .await?
+        .first()
+        .map(|event| event.id))
+}
+
+async fn seeded(
+    s3: &aws_sdk_s3::Client,
+    queue: OrderKeyId,
+    ids: &[EventId],
+) -> TestResult<S3StateStore> {
+    let store = S3StateStore::new(s3.clone(), BUCKET.to_owned(), "", "orders", 8);
+    let events: Vec<ParkedEvent> = ids
+        .iter()
+        .map(|id| event(queue, *id, ParkStatus::Retrying))
+        .collect();
+    store.append_parked(&events).await?;
+    Ok(store)
+}
+
+#[tokio::test]
+async fn draining_a_queue_lists_it_once_and_reads_each_event_by_id() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let queue = key(0x44, 1)?;
+    let ids: Vec<EventId> = (0..5).map(|n| id(3, n)).collect();
+    seeded(&s3, queue, &ids).await?;
+    let requests = Arc::new(Requests::default());
+    let store = S3StateStore::new(counting(&s3, &requests), BUCKET.to_owned(), "", "orders", 8);
+    for expected in &ids {
+        assert_eq!(head(&store, queue).await?, Some(*expected));
+        store.remove_parked(&[(queue, *expected)]).await?;
+    }
+    assert_eq!(requests.listings.load(Ordering::SeqCst), 1);
+    assert_eq!(requests.gets.load(Ordering::SeqCst), 5);
+    assert_eq!(head(&store, queue).await?, None);
+    assert_eq!(requests.listings.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn events_appended_after_the_ids_were_read_ahead_are_found() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let queue = key(0x44, 2)?;
+    let store = seeded(&s3, queue, &[id(3, 0), id(3, 1)]).await?;
+    assert_eq!(head(&store, queue).await?, Some(id(3, 0)));
+    store
+        .append_parked(&[event(queue, id(4, 0), ParkStatus::Retrying)])
+        .await?;
+    for (current, next) in [
+        (id(3, 0), Some(id(3, 1))),
+        (id(3, 1), Some(id(4, 0))),
+        (id(4, 0), None),
+    ] {
+        store.remove_parked(&[(queue, current)]).await?;
+        assert_eq!(head(&store, queue).await?, next);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_append_below_the_read_ahead_ids_is_read_in_order() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let queue = key(0x44, 3)?;
+    let store = seeded(&s3, queue, &[id(3, 0), id(3, 2)]).await?;
+    assert_eq!(head(&store, queue).await?, Some(id(3, 0)));
+    store
+        .append_parked(&[event(queue, id(3, 1), ParkStatus::Retrying)])
+        .await?;
+    let read: Vec<EventId> = store
+        .read_parked(&queue, None, 2)
+        .await?
+        .iter()
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(read, vec![id(3, 0), id(3, 1)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn o3_a_queue_is_never_read_as_empty_while_it_holds_events() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let queue = key(0x44, 4)?;
+    let store = seeded(&s3, queue, &[id(3, 0), id(3, 1), id(3, 2)]).await?;
+    let behind = S3StateStore::new(s3.clone(), BUCKET.to_owned(), "", "orders", 8);
+    assert_eq!(head(&store, queue).await?, Some(id(3, 0)));
+
+    behind
+        .remove_parked(&[(queue, id(3, 0)), (queue, id(3, 1))])
+        .await?;
+    assert_eq!(head(&store, queue).await?, Some(id(3, 2)));
+
+    behind.remove_parked(&[(queue, id(3, 2))]).await?;
+    behind
+        .append_parked(&[event(queue, id(5, 0), ParkStatus::Retrying)])
+        .await?;
+    assert_eq!(head(&store, queue).await?, Some(id(5, 0)));
+
+    behind.remove_parked(&[(queue, id(5, 0))]).await?;
+    assert_eq!(head(&store, queue).await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_leader_claim_starts_with_nothing_read_ahead() -> TestResult {
+    let (_aws, s3) = emulator_with_bucket().await?;
+    let queue = key(0x44, 5)?;
+    seeded(&s3, queue, &[id(3, 0), id(3, 1)]).await?;
+    let requests = Arc::new(Requests::default());
+    let store = S3StateStore::new(counting(&s3, &requests), BUCKET.to_owned(), "", "orders", 8);
+    assert_eq!(head(&store, queue).await?, Some(id(3, 0)));
+    assert_eq!(head(&store, queue).await?, Some(id(3, 0)));
+    assert_eq!(requests.listings.load(Ordering::SeqCst), 1);
+    let record = LeaderRecord {
+        epoch: 1,
+        holder: "task-a".to_owned(),
+        state: LeaderState::Active,
+        confirmed_lsn: Lsn(0x10),
+        updated_ms: 1,
+    };
+    assert!(matches!(
+        store.swap_leader(&record, None).await?,
+        SwapOutcome::Swapped(_)
+    ));
+    assert_eq!(head(&store, queue).await?, Some(id(3, 0)));
+    assert_eq!(requests.listings.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
 #[derive(Debug)]
 struct DrainWhileListed(Vec<String>);
 
