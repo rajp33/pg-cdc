@@ -1,4 +1,5 @@
 mod gauges;
+mod metrics;
 mod model;
 mod offload;
 mod operate;
@@ -497,6 +498,7 @@ impl Harness {
             },
             ticket,
             arrived: Instant::now(),
+            committed_ms: None,
         })
     }
 

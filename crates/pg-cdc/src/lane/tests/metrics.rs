@@ -1,0 +1,223 @@
+use super::*;
+use crate::capture::{Capture, SpanSeen};
+use crate::metrics::{EventOutcome, Measurement, Recorder, SinkOutcome};
+use crate::sink::AttributeValue;
+use tracing::Level;
+use tracing::level_filters::LevelFilter;
+
+#[derive(Debug, Clone, PartialEq)]
+enum Seen {
+    Event {
+        table: String,
+        op: String,
+        outcome: EventOutcome,
+        count: u64,
+    },
+    CommitToDelivery(Duration),
+    Sink(SinkOutcome),
+    Other,
+}
+
+#[derive(Debug)]
+struct Collecting(Arc<Mutex<Vec<Seen>>>);
+
+impl Recorder for Collecting {
+    fn record(&self, measurement: Measurement<'_>) {
+        let seen = match measurement {
+            Measurement::Event {
+                table,
+                op,
+                outcome,
+                count,
+            } => Seen::Event {
+                table: table.to_owned(),
+                op: op.to_owned(),
+                outcome,
+                count,
+            },
+            Measurement::CommitToDelivery(elapsed) => Seen::CommitToDelivery(elapsed),
+            Measurement::Sink { outcome, .. } => Seen::Sink(outcome),
+            _ => Seen::Other,
+        };
+        self.0.lock().unwrap().push(seen);
+    }
+}
+
+fn recording() -> Arc<Mutex<Vec<Seen>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    crate::metrics::install(Box::new(Collecting(Arc::clone(&seen)))).unwrap();
+    seen
+}
+
+fn counted(seen: &Mutex<Vec<Seen>>, table: &str, outcome: EventOutcome) -> u64 {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|entry| match entry {
+            Seen::Event {
+                table: seen_table,
+                outcome: seen_outcome,
+                count,
+                ..
+            } if seen_table == table && *seen_outcome == outcome => *count,
+            _ => 0,
+        })
+        .sum()
+}
+
+fn label(name: &str, value: &str) -> (String, AttributeValue) {
+    (name.to_owned(), AttributeValue::String(value.to_owned()))
+}
+
+fn send_labelled(
+    harness: &mut Harness,
+    ordinal: u32,
+    key: &[u8],
+    table: &str,
+    committed_ms: Option<u64>,
+) {
+    harness.ack.begin().unwrap();
+    let ticket = harness.ack.track(1).unwrap();
+    harness.ack.commit(Lsn(100 + harness.commits)).unwrap();
+    harness.commits += 1;
+    harness
+        .lanes
+        .dispatch(Pending {
+            outbound: Outbound {
+                id: EventId::new(Lsn(0x10), ordinal),
+                order_key: OrderKeyId::of(key),
+                attributes: vec![label("table", table), label("op", "insert")],
+                body: Bytes::from_static(b"x"),
+            },
+            ticket,
+            arrived: Instant::now(),
+            committed_ms,
+        })
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn delivery_records_events_sink_calls_and_commit_latency() {
+    let seen = recording();
+    let mut harness = Harness::new(1, 1, ScriptedSink::delivering()).await;
+    let committed = crate::state::now_ms() - 50;
+    for (ordinal, key) in [(0, b"a"), (1, b"a"), (2, b"b")] {
+        send_labelled(&mut harness, ordinal, key, "orders", Some(committed));
+    }
+    harness.settle(3).await;
+    harness.delivered(3).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let seen = seen.lock().unwrap().clone();
+    let delivered = Seen::Event {
+        table: "orders".to_owned(),
+        op: "insert".to_owned(),
+        outcome: EventOutcome::Delivered,
+        count: 1,
+    };
+    assert_eq!(seen.iter().filter(|entry| **entry == delivered).count(), 3);
+    assert!(seen.contains(&Seen::Sink(SinkOutcome::Delivered)));
+    let latencies: Vec<Duration> = seen
+        .iter()
+        .filter_map(|entry| match entry {
+            Seen::CommitToDelivery(elapsed) => Some(*elapsed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(latencies.len(), 3);
+    assert!(
+        latencies
+            .iter()
+            .all(|elapsed| *elapsed >= Duration::from_millis(50)),
+        "{latencies:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn parking_and_dead_events_are_counted() {
+    let seen = recording();
+    let script: Script = Box::new(|ordinal, _| match ordinal {
+        0 | 1 => Outcome::Retryable(SinkError("throttled".to_owned())),
+        _ => Outcome::Terminal(SinkError("rejected".to_owned())),
+    });
+    let setup = Setup {
+        park_after: Duration::from_secs(1),
+        ..Setup::default()
+    };
+    let mut harness = Harness::start(
+        setup,
+        ScriptedSink::new(LIMITS, script),
+        TestStore::default(),
+    )
+    .await;
+    send_labelled(&mut harness, 0, b"a", "orders", None);
+    send_labelled(&mut harness, 1, b"a", "orders", None);
+    send_labelled(&mut harness, 2, b"b", "payments", None);
+    harness.settle(3).await;
+    assert_eq!(counted(&seen, "orders", EventOutcome::Parked), 2);
+    assert_eq!(counted(&seen, "orders", EventOutcome::Dead), 0);
+    assert_eq!(counted(&seen, "payments", EventOutcome::Parked), 1);
+    assert_eq!(counted(&seen, "payments", EventOutcome::Dead), 1);
+    assert!(
+        seen.lock()
+            .unwrap()
+            .contains(&Seen::Sink(SinkOutcome::Retryable))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn drained_events_count_as_delivered_without_a_latency() {
+    let seen = recording();
+    let store = TestStore::default();
+    store.seed(b"k", 1, ParkStatus::Retrying).await;
+    let harness = Harness::start(Setup::default(), ScriptedSink::delivering(), store).await;
+    harness.delivered(1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(counted(&seen, "unknown", EventOutcome::Delivered), 1);
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| matches!(entry, Seen::CommitToDelivery(_)))
+    );
+}
+
+async fn spans_of_a_delivered_event(level: LevelFilter) -> Vec<SpanSeen> {
+    let (capture, _guard) = Capture::install(level);
+    let mut harness = Harness::new(1, 1, ScriptedSink::delivering()).await;
+    harness.send(0, b"k", 1).unwrap();
+    harness.settle(1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    capture.spans()
+}
+
+#[tokio::test(start_paused = true)]
+async fn hot_path_spans_are_debug_and_disabled_at_info() {
+    let at_info = spans_of_a_delivered_event(LevelFilter::INFO).await;
+    assert!(
+        at_info.iter().all(|span| span.name != "sink_send"),
+        "{at_info:?}"
+    );
+    let at_debug = spans_of_a_delivered_event(LevelFilter::DEBUG).await;
+    let sends: Vec<&SpanSeen> = at_debug
+        .iter()
+        .filter(|span| span.name == "sink_send")
+        .collect();
+    assert_eq!(sends.len(), 1, "{at_debug:?}");
+    assert_eq!(sends[0].level, Level::DEBUG);
+    let fields: Vec<(&str, &str)> = sends[0]
+        .fields
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            ("delivered", "1"),
+            ("retryable", "0"),
+            ("sink", "custom"),
+            ("size", "1"),
+            ("terminal", "0"),
+        ]
+    );
+}

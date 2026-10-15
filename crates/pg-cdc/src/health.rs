@@ -93,7 +93,9 @@ impl Health {
                 return false;
             }
             snapshot.role = role;
-            tracing::info!(%from, to = %role, "role changed");
+            tracing::info_span!("role_change", %from, to = %role).in_scope(|| {
+                tracing::info!(%from, to = %role, "role changed");
+            });
             true
         });
     }
@@ -119,6 +121,9 @@ impl Health {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::Capture;
+    use tracing::Level;
+    use tracing::level_filters::LevelFilter;
 
     fn checked() -> Health {
         let health = Health::new();
@@ -196,6 +201,30 @@ mod tests {
 
         health.set_validated(false);
         assert!(!health.snapshot().ready());
+    }
+
+    #[test]
+    fn a_role_change_is_logged_inside_a_role_change_span() {
+        let (capture, _guard) = Capture::install(LevelFilter::INFO);
+        let health = Health::new();
+        health.set_role(Role::Active);
+        health.set_role(Role::Active);
+        let spans = capture.spans();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].name, "role_change");
+        assert_eq!(spans[0].level, Level::INFO);
+        assert_eq!(
+            spans[0].fields.get("from").map(String::as_str),
+            Some("standby")
+        );
+        assert_eq!(
+            spans[0].fields.get("to").map(String::as_str),
+            Some("active")
+        );
+        let events = capture.events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].message, "role changed");
+        assert_eq!(events[0].span.as_deref(), Some("role_change"));
     }
 
     #[test]

@@ -224,6 +224,10 @@ fn results(
 
 #[async_trait]
 impl Sink for SnsSink {
+    fn name(&self) -> &'static str {
+        "sns"
+    }
+
     fn capabilities(&self) -> SinkCapabilities {
         let max = self
             .topic

@@ -10,6 +10,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
+use tracing::Instrument;
 
 use crate::config::ReplicationConfig;
 use crate::error::ReplicationError;
@@ -266,10 +267,15 @@ impl Worker {
 
     async fn send_status(&mut self) -> Result<(), ReplicationError> {
         let confirmed = Lsn(self.confirmed.load(Ordering::Acquire));
-        status_update(confirmed, pg_time(SystemTime::now()), &mut self.conn.write)?;
-        self.conn.flush().await?;
-        self.clock.record(SystemTime::now());
-        Ok(())
+        let span = tracing::debug_span!("status_update", lsn = %confirmed);
+        async {
+            status_update(confirmed, pg_time(SystemTime::now()), &mut self.conn.write)?;
+            self.conn.flush().await?;
+            self.clock.record(SystemTime::now());
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     async fn shutdown(&mut self) -> Result<(), ReplicationError> {
@@ -352,6 +358,60 @@ mod tests {
             stream.recv().await.unwrap(),
             Some(ReplicationEvent::KeepAlive { wal_end: Lsn(0x50) })
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct StatusSpans(std::sync::Arc<std::sync::Mutex<Vec<(String, tracing::Level, String)>>>);
+
+    struct LsnField(String);
+
+    impl tracing::field::Visit for LsnField {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "lsn" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StatusSpans {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut lsn = LsnField(String::new());
+            attributes.record(&mut lsn);
+            self.0.lock().unwrap().push((
+                attributes.metadata().name().to_owned(),
+                *attributes.metadata().level(),
+                lsn.0,
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_status_update_runs_in_a_debug_span_naming_the_confirmed_lsn() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let spans = StatusSpans::default();
+        let subscriber = tracing_subscriber::registry().with(spans.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (stream, mut server) = fake::started(fake::config()).await;
+        server.read_status().await;
+        stream.confirm(Lsn(0x40));
+        stream.send_status().await.unwrap();
+        server.read_status().await;
+        let seen = spans.0.lock().unwrap().clone();
+        let updates: Vec<&(String, tracing::Level, String)> = seen
+            .iter()
+            .filter(|(name, _, _)| name == "status_update")
+            .collect();
+        assert!(
+            updates
+                .iter()
+                .all(|(_, level, _)| *level == tracing::Level::DEBUG)
+        );
+        assert_eq!(updates.last().map(|(_, _, lsn)| lsn.as_str()), Some("0/40"));
     }
 
     #[tokio::test(start_paused = true)]

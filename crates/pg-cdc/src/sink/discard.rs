@@ -27,6 +27,10 @@ impl DiscardSink {
 
 #[async_trait]
 impl Sink for DiscardSink {
+    fn name(&self) -> &'static str {
+        "discard"
+    }
+
     fn capabilities(&self) -> SinkCapabilities {
         DISCARD_CAPABILITIES
     }

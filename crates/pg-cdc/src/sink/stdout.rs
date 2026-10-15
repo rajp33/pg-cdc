@@ -56,6 +56,10 @@ async fn write_lines<W: AsyncWrite + Unpin>(
 
 #[async_trait]
 impl Sink for StdoutSink {
+    fn name(&self) -> &'static str {
+        "stdout"
+    }
+
     fn capabilities(&self) -> SinkCapabilities {
         STDOUT_CAPABILITIES
     }

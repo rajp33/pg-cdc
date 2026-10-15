@@ -1,6 +1,8 @@
 pub mod ack;
 pub mod admin;
 mod aws;
+#[cfg(test)]
+mod capture;
 pub mod catalog;
 pub mod config;
 pub mod connection;

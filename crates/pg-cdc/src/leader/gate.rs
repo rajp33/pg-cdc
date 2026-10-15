@@ -154,6 +154,10 @@ impl GatedSink {
 
 #[async_trait]
 impl Sink for GatedSink {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
     fn capabilities(&self) -> SinkCapabilities {
         self.inner.capabilities()
     }

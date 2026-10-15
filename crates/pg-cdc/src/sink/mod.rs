@@ -20,6 +20,18 @@ pub struct SinkCapabilities {
     pub max_message_bytes: usize,
 }
 
+pub const UNKNOWN_LABEL: &str = "unknown";
+
+pub fn metric_labels(attributes: &[(String, AttributeValue)]) -> (&str, &str) {
+    let find = |name: &str| {
+        attributes
+            .iter()
+            .find(|(key, _)| key == name)
+            .map_or(UNKNOWN_LABEL, |(_, value)| value.as_str())
+    };
+    (find("table"), find("op"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributeValue {
     String(String),
@@ -149,6 +161,9 @@ pub enum Outcome {
 #[async_trait]
 pub trait Sink: Send + Sync + fmt::Debug {
     fn capabilities(&self) -> SinkCapabilities;
+    fn name(&self) -> &'static str {
+        "custom"
+    }
     async fn preflight(&self) -> Result<(), SinkError>;
     async fn send(&self, batch: &[Outbound]) -> Vec<Outcome>;
 }
@@ -350,6 +365,26 @@ mod tests {
         assert_eq!(kept, vec!["schema", "op", "tenant", "tabbed", "doc"]);
         let escaped = json!({"k": "\u{1}"}).to_string();
         assert_eq!(outbound.attribute("doc"), Some(&string(&escaped)));
+    }
+
+    #[tokio::test]
+    async fn built_in_sinks_name_themselves() {
+        let client = aws_sdk_sns::Client::from_conf(
+            aws_sdk_sns::Config::builder()
+                .behavior_version(aws_sdk_sns::config::BehaviorVersion::latest())
+                .region(aws_sdk_sns::config::Region::new("us-east-1"))
+                .build(),
+        );
+        let sns = sns::SnsSink::new(client, "arn:aws:sns:us-east-1:1:orders".to_owned(), None);
+        assert_eq!(sns.name(), "sns");
+        assert_eq!(discard::DiscardSink::new().name(), "discard");
+        assert_eq!(stdout::StdoutSink::new(tokio::io::sink()).name(), "stdout");
+        let gate = crate::leader::gate::WriteGate::new();
+        let gated = crate::leader::gate::GatedSink::new(
+            std::sync::Arc::new(discard::DiscardSink::new()),
+            gate,
+        );
+        assert_eq!(gated.name(), "discard");
     }
 
     #[test]

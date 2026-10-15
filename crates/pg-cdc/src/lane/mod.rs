@@ -18,13 +18,15 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 use crate::ack::{Settled, Ticket};
 use crate::event::EventId;
+use crate::metrics::{self, EventOutcome, Measurement, SinkOutcome};
 use crate::order::OrderKeyId;
 use crate::payload::PayloadStore;
-use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
-use crate::state::{PARTITIONS, ParkedHead, StateStore};
+use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError, metric_labels};
+use crate::state::{PARTITIONS, ParkedHead, StateStore, now_ms};
 use crate::status::{LaneCounts, ParkedGauges, STATS_INTERVAL};
 use crate::supervisor::Backoff;
 
@@ -40,6 +42,7 @@ pub struct Pending {
     pub outbound: Outbound,
     pub ticket: Ticket,
     pub arrived: Instant,
+    pub committed_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -543,11 +546,23 @@ impl Lane {
             }
         }
         let (permits, sink) = (Arc::clone(&self.permits), Arc::clone(&self.sink));
-        let outcomes = self
+        let span = tracing::debug_span!(
+            "sink_send",
+            sink = sink.name(),
+            size = u64::try_from(batch.len()).unwrap_or(u64::MAX),
+            delivered = tracing::field::Empty,
+            retryable = tracing::field::Empty,
+            terminal = tracing::field::Empty,
+        );
+        let (mut outcomes, elapsed) = self
             .publishing(async {
                 match permits.acquire().await {
-                    Ok(_permit) => sink.send(&batch).await,
-                    Err(_) => Vec::new(),
+                    Ok(_permit) => {
+                        let started = metrics::enabled().then(Instant::now);
+                        let outcomes = sink.send(&batch).instrument(span.clone()).await;
+                        (outcomes, started.map(|started| started.elapsed()))
+                    }
+                    Err(_) => (Vec::new(), None),
                 }
             })
             .await;
@@ -558,12 +573,12 @@ impl Lane {
                 "the sink broke its contract of one outcome per message"
             );
         }
-        let mut outcomes = outcomes.into_iter();
-        for key in keys {
-            let outcome = outcomes.next().unwrap_or_else(|| {
-                Outcome::Retryable(SinkError("the sink returned no outcome".to_owned()))
-            });
-            self.complete(key, &outcome);
+        outcomes.resize_with(keys.len(), || {
+            Outcome::Retryable(SinkError("the sink returned no outcome".to_owned()))
+        });
+        record_sink_call(&span, &outcomes, elapsed);
+        for (key, outcome) in keys.into_iter().zip(&outcomes) {
+            self.complete(key, outcome);
         }
     }
 
@@ -581,6 +596,7 @@ impl Lane {
                 let Some(head) = state.queue.pop_front() else {
                     return;
                 };
+                record_delivered(&head.outbound, head.committed_ms);
                 if let Ok(settled) = head.ticket.settle(outcome) {
                     let _ = self.reports.send(Report::Settled(settled));
                 }
@@ -600,5 +616,50 @@ impl Lane {
                 self.start_parking(key, true);
             }
         }
+    }
+}
+
+fn record_delivered(outbound: &Outbound, committed_ms: Option<u64>) {
+    if !metrics::enabled() {
+        return;
+    }
+    let (table, op) = metric_labels(&outbound.attributes);
+    metrics::record(Measurement::Event {
+        table,
+        op,
+        outcome: EventOutcome::Delivered,
+        count: 1,
+    });
+    if let Some(committed_ms) = committed_ms {
+        metrics::record(Measurement::CommitToDelivery(Duration::from_millis(
+            now_ms().saturating_sub(committed_ms),
+        )));
+    }
+}
+
+fn record_sink_call(span: &tracing::Span, outcomes: &[Outcome], elapsed: Option<Duration>) {
+    if span.is_disabled() && elapsed.is_none() {
+        return;
+    }
+    let (mut delivered, mut retryable, mut terminal) = (0_u64, 0_u64, 0_u64);
+    for outcome in outcomes {
+        match outcome {
+            Outcome::Delivered => delivered += 1,
+            Outcome::Retryable(_) => retryable += 1,
+            Outcome::Terminal(_) => terminal += 1,
+        }
+    }
+    span.record("delivered", delivered);
+    span.record("retryable", retryable);
+    span.record("terminal", terminal);
+    if let Some(elapsed) = elapsed {
+        let outcome = if terminal > 0 {
+            SinkOutcome::Terminal
+        } else if retryable > 0 {
+            SinkOutcome::Retryable
+        } else {
+            SinkOutcome::Delivered
+        };
+        metrics::record(Measurement::Sink { outcome, elapsed });
     }
 }

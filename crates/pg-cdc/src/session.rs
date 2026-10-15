@@ -13,6 +13,7 @@ use tokio::task::JoinError;
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::{Instrument, Span};
 
 use crate::ack::{AckError, AckTracker};
 use crate::catalog::{self, CatalogError, TypeResolver};
@@ -30,9 +31,11 @@ use crate::leader::record::{Claim, Release, TakeoverError, release, take_over};
 use crate::leader::standby::{
     AcquireError, OBJECT_IN_USE, ProbeError, SlotHolder, SlotProbe, StartError, acquire,
 };
+use crate::metrics::{self, EventOutcome, Measurement};
 use crate::order::{OrderBy, order_key};
-use crate::sink::{Outbound, Sink};
+use crate::sink::{Outbound, Sink, metric_labels};
 use crate::state::StateStore;
+use crate::state::instrumented::instrumented;
 use crate::status::{ParkedAccess, Status};
 use crate::validate::{Invalid, ValidationError, validate};
 
@@ -41,6 +44,8 @@ pub const HANDOVER_TAIL: Duration = Duration::from_secs(3);
 pub const LANE_STOP_GRACE: Duration = Duration::from_secs(1);
 pub const CONTROL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SLOT_METRICS_INTERVAL: Duration = Duration::from_secs(10);
+
+const POSTGRES_EPOCH_UNIX_MS: i64 = 946_684_800_000;
 
 const INSUFFICIENT_PRIVILEGE: &str = "42501";
 
@@ -226,9 +231,10 @@ async fn attempt(
         return Ok(());
     };
     let (params, control) = prepared?;
+    let stores = instrumented(stores);
     context.health.set_role(Role::Standby);
     let poller = spawn_slot_poller(&control, &config.slot, &context.status);
-    let result = serve(config, sink, stores, context, shutdown, &params, &control).await;
+    let result = serve(config, sink, &stores, context, shutdown, &params, &control).await;
     poller.abort();
     let _ = poller.await;
     result
@@ -296,6 +302,9 @@ async fn serve(
             claim: None,
         },
         drain_timeout: config.leadership.drain_timeout,
+        committed_ms: None,
+        transaction: Span::none(),
+        transaction_events: 0,
     };
     drop(reports);
     let result = session
@@ -337,9 +346,44 @@ fn spawn_takeover(
     let holder = context.holder.clone();
     let fence_delay = config.leadership.fence_delay;
     let token = CancellationToken::new();
-    AbortOnDropHandle::new(tokio::spawn(async move {
-        take_over(state.as_ref(), &holder, start, fence_delay, &token).await
-    }))
+    AbortOnDropHandle::new(tokio::spawn(claim_in_span(
+        state,
+        holder,
+        start,
+        fence_delay,
+        token,
+    )))
+}
+
+async fn claim_in_span(
+    state: Arc<dyn StateStore>,
+    holder: String,
+    start: Lsn,
+    fence_delay: Duration,
+    token: CancellationToken,
+) -> Result<Claim, TakeoverError> {
+    let span = tracing::info_span!(
+        "takeover",
+        holder = %holder,
+        kind = tracing::field::Empty,
+        epoch = tracing::field::Empty,
+    );
+    let recorded = span.clone();
+    async move {
+        let claim = take_over(state.as_ref(), &holder, start, fence_delay, &token).await?;
+        recorded.record("kind", tracing::field::display(claim.kind));
+        recorded.record("epoch", claim.record.epoch);
+        Ok(claim)
+    }
+    .instrument(span)
+    .await
+}
+
+fn commit_unix_ms(commit_ts: i64) -> Option<u64> {
+    let unix_ms = commit_ts
+        .div_euclid(1000)
+        .checked_add(POSTGRES_EPOCH_UNIX_MS)?;
+    u64::try_from(unix_ms).ok()
 }
 
 async fn stop_by(stream: ReplicationStream, deadline: Instant) {
@@ -611,6 +655,9 @@ struct Session<'a> {
     health: &'a Health,
     leadership: Leadership,
     drain_timeout: Duration,
+    committed_ms: Option<u64>,
+    transaction: Span,
+    transaction_events: u64,
 }
 
 enum Ended {
@@ -727,6 +774,7 @@ impl Session<'_> {
     ) -> Result<(), SessionError> {
         self.leadership.pending = None;
         let claim = outcome.unwrap_or(Err(TakeoverError::Conflict))?;
+        metrics::record(Measurement::Takeover(claim.kind));
         self.leadership.gate.open();
         self.health.set_delivering(true);
         self.status.set_epoch(Some(claim.record.epoch));
@@ -858,11 +906,20 @@ impl Session<'_> {
                     .begin(begin.final_lsn, begin.commit_ts)
                     .map_err(build_error)?;
                 self.ack.begin()?;
-                tracing::debug!(xid = begin.xid, commit_lsn = %begin.final_lsn, "transaction");
+                self.committed_ms = commit_unix_ms(begin.commit_ts);
+                self.transaction_events = 0;
+                self.transaction = tracing::debug_span!(
+                    "transaction",
+                    commit_lsn = %begin.final_lsn,
+                    xid = begin.xid,
+                    events = tracing::field::Empty,
+                );
                 return Ok(None);
             }
             LogicalMessage::Commit(commit) => {
                 self.builder.commit().map_err(build_error)?;
+                self.transaction.record("events", self.transaction_events);
+                self.transaction = Span::none();
                 return Ok(Some(self.ack.commit(commit.end_lsn)?));
             }
             LogicalMessage::Relation(relation) => {
@@ -932,6 +989,9 @@ impl Session<'_> {
 
     fn emit(&mut self, built: &Built) -> Result<(), SessionError> {
         for fallback in &built.fallbacks {
+            metrics::record(Measurement::DecodeFallback {
+                type_oid: fallback.type_oid,
+            });
             tracing::error!(
                 id = %built.envelope.id,
                 column = %fallback.column,
@@ -943,10 +1003,21 @@ impl Session<'_> {
         let outbound = Outbound::encode(&built.envelope, key, self.attribute_columns)?;
         let bytes = u64::try_from(outbound.body.len()).unwrap_or(u64::MAX);
         let ticket = self.ack.track(bytes)?;
+        if metrics::enabled() {
+            let (table, op) = metric_labels(&outbound.attributes);
+            metrics::record(Measurement::Event {
+                table,
+                op,
+                outcome: EventOutcome::Received,
+                count: 1,
+            });
+        }
+        self.transaction_events += 1;
         self.lanes.dispatch(Pending {
             outbound,
             ticket,
             arrived: Instant::now(),
+            committed_ms: self.committed_ms,
         })?;
         self.publish_inflight();
         Ok(())
@@ -966,7 +1037,51 @@ fn known(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::Capture;
     use crate::leader::standby::StartError;
+    use crate::state::memory::MemoryStateStore;
+    use tracing::Level;
+    use tracing::level_filters::LevelFilter;
+
+    #[test]
+    fn commit_timestamps_convert_to_unix_milliseconds() {
+        assert_eq!(commit_unix_ms(0), Some(946_684_800_000));
+        assert_eq!(
+            commit_unix_ms(845_285_183_069_961),
+            Some(946_684_800_000 + 845_285_183_069)
+        );
+        assert_eq!(commit_unix_ms(-946_684_800_000_001), None);
+        assert!(commit_unix_ms(i64::MAX).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_takeover_runs_in_an_info_span_that_records_its_kind_and_epoch() {
+        let (capture, _guard) = Capture::install(LevelFilter::INFO);
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let claim = claim_in_span(
+            store,
+            "pod-a".to_owned(),
+            Lsn(0x10),
+            Duration::ZERO,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claim.record.epoch, 1);
+        let spans = capture.spans();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].name, "takeover");
+        assert_eq!(spans[0].level, Level::INFO);
+        let fields: Vec<(&str, &str)> = spans[0]
+            .fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![("epoch", "1"), ("holder", "pod-a"), ("kind", "first")]
+        );
+    }
 
     #[test]
     fn the_shutdown_budget_is_two_drain_windows_and_the_tail() {

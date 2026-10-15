@@ -26,3 +26,4 @@ tracing.workspace = true
 [dev-dependencies]
 pg-cdc-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tracing-subscriber.workspace = true

@@ -1,15 +1,17 @@
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tracing::Instrument;
 
-use super::{Key, Lane, Report, Stored};
+use super::{Key, Lane, Report, Stored, record_delivered};
 use crate::event::EventId;
+use crate::metrics::{self, EventOutcome, Measurement};
 use crate::order::OrderKeyId;
-use crate::sink::Outcome;
+use crate::sink::{Outcome, UNKNOWN_LABEL, metric_labels};
 use crate::state::{ParkStatus, ParkedEvent, ParkedHead, StoreError, now_ms};
 
 pub(super) const QUEUED_BEHIND: &str = "queued behind a parked event";
@@ -188,13 +190,17 @@ impl Lane {
         }
         self.append_due = None;
         let store = Arc::clone(&self.store);
-        let appended = self.publishing(store.append_parked(&events)).await;
+        let span = tracing::debug_span!("park", events = count);
+        let appended = self
+            .publishing(store.append_parked(&events).instrument(span))
+            .await;
         if let Err(error) = &appended {
             self.store_failed("append", error);
             self.to_append.extend(keys);
             return;
         }
         self.store_succeeded();
+        record_parked(&events);
         self.parked.fetch_add(count, Ordering::SeqCst);
         for key in keys {
             let Some(state) = self.keys.get_mut(&key) else {
@@ -310,6 +316,7 @@ impl Lane {
         self.heads_in_memory = self.heads_in_memory.saturating_sub(1);
         match outcome {
             Outcome::Delivered => {
+                record_delivered(&head, None);
                 state.backoff.reset();
                 state.failure = None;
                 if state
@@ -341,7 +348,14 @@ impl Lane {
     async fn flush_removes(&mut self) {
         let removals = std::mem::take(&mut self.to_remove);
         let store = Arc::clone(&self.store);
-        if let Err(error) = self.publishing(store.remove_parked(&removals)).await {
+        let span = tracing::debug_span!(
+            "drain",
+            events = u64::try_from(removals.len()).unwrap_or(u64::MAX)
+        );
+        let removed = self
+            .publishing(store.remove_parked(&removals).instrument(span))
+            .await;
+        if let Err(error) = removed {
             self.store_failed("remove", &error);
             self.to_remove = removals;
             return;
@@ -379,6 +393,12 @@ impl Lane {
                 self.to_kill.push((key, id));
                 return;
             }
+            metrics::record(Measurement::Event {
+                table: UNKNOWN_LABEL,
+                op: UNKNOWN_LABEL,
+                outcome: EventOutcome::Dead,
+                count: 1,
+            });
             if let Some(stored) = self
                 .keys
                 .get_mut(&key)
@@ -389,5 +409,35 @@ impl Lane {
             }
         }
         self.store_succeeded();
+    }
+}
+
+fn record_parked(events: &[ParkedEvent]) {
+    if !metrics::enabled() {
+        return;
+    }
+    let mut groups: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+    for event in events {
+        *groups.entry(metric_labels(&event.attributes)).or_default() += 1;
+    }
+    for ((table, op), count) in groups {
+        metrics::record(Measurement::Event {
+            table,
+            op,
+            outcome: EventOutcome::Parked,
+            count,
+        });
+    }
+    for event in events
+        .iter()
+        .filter(|event| event.status == ParkStatus::Dead)
+    {
+        let (table, op) = metric_labels(&event.attributes);
+        metrics::record(Measurement::Event {
+            table,
+            op,
+            outcome: EventOutcome::Dead,
+            count: 1,
+        });
     }
 }

@@ -1,4 +1,5 @@
 pub mod filesystem;
+pub mod instrumented;
 pub mod memory;
 pub mod s3;
 
