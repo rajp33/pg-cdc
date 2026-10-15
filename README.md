@@ -91,10 +91,12 @@ admin:
 - **`GET /healthz`** is 200 when the sink preflight, the state store check and startup validation have passed, and, for an active task, the lease is valid; otherwise 503. A standby is healthy. **`GET /readyz`** is 200 only when the task is healthy, active and delivering, so a standby answers 503.
 - **`pg-cdc health [--addr <ip:port>]`** exits 0 only when `/healthz` answers 200 within 2 s, and exits 1 with one line on stderr otherwise. It takes its address from `--addr`, else `PGCDC__ADMIN__LISTEN`, else `127.0.0.1:9187`. Use it as the container health check, since a distroless image has no curl.
 - **Startup validation.** Before a task goes standby or active, it checks `wal_level`, the slot (exists, `pgoutput`, this database, not `lost`) and the publication, then opens and closes a replication connection without starting replication, so a role that cannot authenticate for replication or lacks `REPLICATION` (`rds_replication` on RDS) fails here instead of after the old task stops. A failure keeps the task unhealthy and retrying; it never exits and never creates or drops anything. In a start-first deploy, a misconfigured new task therefore never turns healthy and the old task keeps running.
+- **A spare WAL sender.** The replication login check holds a walsender for a moment, so the source needs one free beyond those in use (`max_wal_senders` minus the rows in `pg_stat_replication`) while a task starts. With none free, the check fails with SQLSTATE 53300 (`number of requested standby connections exceeds max_wal_senders`), and the task stays unhealthy and retries: a start-first deploy rolls back with the old task still streaming, and a new task validates only once a sender frees. Raising `max_wal_senders` needs a Postgres restart, so size it with one spare per task that may start at the same time.
 
 ### ECS settings
 
 - **Deployment:** minimum healthy 100%, maximum 200%, with the deployment circuit breaker on, so the new task starts before the old one stops and a task that never turns healthy rolls the deploy back.
+- **Source capacity:** at least one free WAL sender while the new task starts (see startup validation above).
 - **`stopTimeout`:** at least `2 x drain_timeout + 3 s`, which is 15 s at the defaults. A SIGKILL at `stopTimeout` turns the handover into a crash takeover, which is safe but costs `fence_delay`.
 - **Health check:** `pg-cdc health`, with `PGCDC__ADMIN__LISTEN` set if `admin.listen` is not the default.
 - **Desired count:** 1, or 2 for a hot standby.

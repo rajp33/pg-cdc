@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pg_cdc_testkit::Postgres;
+use pg_cdc_testkit::{Postgres, PostgresOptions};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -43,7 +43,11 @@ impl Deployment {
     }
 
     async fn start_with_sink(sink: &str) -> TestResult<Self> {
-        let pg = Postgres::start().await?;
+        Self::start_on(PostgresOptions::default(), sink).await
+    }
+
+    async fn start_on(options: PostgresOptions, sink: &str) -> TestResult<Self> {
+        let pg = Postgres::start_with(options).await?;
         pg.execute("CREATE TABLE orders (id int PRIMARY KEY, status text)")
             .await?;
         pg.create_publication("handover_pub", &["orders"]).await?;
@@ -653,6 +657,61 @@ async fn a_replacement_without_replication_stays_unhealthy_while_the_holder_stre
         let status = task.exit(SHUTDOWN_BUDGET).await?;
         assert!(status.success(), "{status}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replacement_without_a_spare_wal_sender_stays_unhealthy_until_the_holder_stops()
+-> TestResult {
+    let deployment = Deployment::start_on(
+        PostgresOptions {
+            max_wal_senders: Some(1),
+            ..PostgresOptions::default()
+        },
+        "stdout",
+    )
+    .await?;
+    let mut a = deployment.spawn()?;
+    a.wait_for_log(TOOK_OVER).await?;
+    deployment.insert(1, 1, "one").await?;
+    a.wait_for_row(1, "one").await?;
+    let walsender = deployment.walsender_pid().await?;
+    let mut b = deployment.spawn()?;
+    let failures = b.wait_for_logs(RECONNECTING, 2).await?;
+    for failure in &failures {
+        let error = log_field(failure, "error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.contains("53300") && error.contains("max_wal_senders"),
+            "{error}"
+        );
+    }
+    assert!(
+        !b.health_ok().await?,
+        "a replacement that could not check its replication login must stay unhealthy"
+    );
+    assert!(
+        b.find_log(STANDBY)?.is_none(),
+        "the replacement went standby"
+    );
+    assert!(a.running()?, "the holder exited");
+    assert_eq!(deployment.walsender_pid().await?, walsender);
+    deployment.insert(2, 2, "one").await?;
+    a.wait_for_row(2, "one").await?;
+    assert_eq!(b.events()?.len(), 0);
+    a.sigterm().await?;
+    let status = a.exit(SHUTDOWN_BUDGET).await?;
+    assert!(status.success(), "{status}");
+    let takeover = b.wait_for_log(TOOK_OVER).await?;
+    assert_eq!(log_field(&takeover, "kind"), Some(&Value::from("clean")));
+    assert_eq!(log_field(&takeover, "epoch"), Some(&Value::from(2)));
+    deployment.insert(3, 3, "one").await?;
+    b.wait_for_row(3, "one").await?;
+    assert!(b.health_ok().await?, "the replacement never turned healthy");
+    b.sigterm().await?;
+    let status = b.exit(SHUTDOWN_BUDGET).await?;
+    assert!(status.success(), "{status}");
     Ok(())
 }
 
