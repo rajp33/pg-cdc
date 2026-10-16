@@ -377,7 +377,7 @@ Memory is a third limit. Each order key with a parked queue keeps about 0.5 to 1
 ### 10.6 Startup and takeover
 
 - **Reading starts at once.** Reading and decoding begin as soon as the slot is acquired.
-- **Heads load per partition.** Parked queue heads load one partition at a time, with 256 partitions keyed by the first byte of the order key id. Store calls are bounded by `state_store.max_concurrency`.
+- **Heads load per partition.** Parked queue heads load by partition, with 256 partitions keyed by the first byte of the order key id, up to `state_store.max_concurrency` partitions at once, so a takeover starts with a burst of up to that many listings. Store calls are bounded by `state_store.max_concurrency`.
 - **Delivery waits for its partition.** Delivery for an order key starts only once its partition has loaded, so no live event can overtake a parked one.
 - **Replayed events for parked keys.**
   - A replayed event with an id below its queue's head settled before the restart, so it is skipped. This relies on appends never leaving a gap below a queue's head (§11.3, item 8).
@@ -681,7 +681,7 @@ Each invariant has an enforcement mechanism listed in §14.6. A runtime violatio
 
 - **D1. The message set is closed.** Only protocol version 1 is negotiated, with none of its optional features (§6.2), and the decoder handles every message in that set.
 - **D2. Value decoding is total.** Every type OID maps to typed JSON, or to its Postgres text form as a string.
-  - If a known type fails to parse, the text form is emitted, and `decode_fallback_total` and an error log record it.
+  - If a known type fails to parse, the text form is emitted, and the `pgcdc.decode.fallbacks` counter and an error log record it.
   - No value is dropped.
 - **D3. Malformed input is a transport fault.** Malformed bytes, an unknown message tag, or a tuple of the wrong shape triggers a reconnect and a replay from the confirmed LSN.
   - Three consecutive faults at the same LSN halt the pipeline; it never skips.
@@ -858,7 +858,7 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
   - Logs go to stdout as JSON at INFO.
 - **The `otel` cargo feature** (default on) gates every OpenTelemetry dependency. A build without it is the baseline for criterion 7 (§4).
 - **When enabled:**
-  - Traces, metrics and logs export over OTLP, using gRPC by default.
+  - Traces, metrics and logs export over OTLP/gRPC, the only transport.
   - Head sampling uses `telemetry.trace_sample_ratio`: default 0.01, and 1.0 for load tests.
 
 ### 17.2 Spans

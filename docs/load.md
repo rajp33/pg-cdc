@@ -1,6 +1,6 @@
 # Load and chaos results
 
-The section 4 criteria this milestone measures, as `loadgen report` summarizes the reports recorded below. Criteria 1 and 2 (nothing lost, per-key order) are the chaos checker's, in the next section.
+The section 4 criteria this milestone measures, in the format `loadgen report` writes, from the runs recorded below. Those runs wrote their reports into different report directories, outside the repository, so no single directory regenerates this table. Criteria 1 and 2 (nothing lost, per-key order) are the chaos checker's, in the next section.
 
 | Criterion | Target | Measured | Verdict | Scenario |
 |---|---|---|---|---|
@@ -203,8 +203,8 @@ Draining a parked event used to cost three S3 requests in series: a `ListObjects
 | Measurement | Before | After |
 |---|---|---|
 | Drain probe on moto: 112,000 parked events on 1,000 keys, S3 and SNS behind the fault proxies, 64 lanes, store concurrency 32, no new writes | 21 to 31 events/s (four 60 s windows, commit `dea6918`) | 133 events/s over a 30 s window, 229 to 263 events/s in its last 10 s and still rising (commit `8fd05b1`) |
-| Model S3 at 20 ms per request, 20,000 events on 1,000 keys, 64 lanes, three requests per drained event (`lane::tests::drain`) | 38.6 s at 32 permits (518 events/s) | 5.9 s at 256 (3,390 events/s) |
-| Same model with 1,000 new events/s for 30 s | the parked count doubles, to 40,487 | the parked count falls to 0 |
+| Model S3 at 20 ms per request, 20,000 events on 1,000 keys, 64 lanes (`lane::tests::drain`; it charges a listing and a GET per head read and one request per removed event, with no read-ahead and no batched deletes) | at 32 permits, not drained within 30 s | at 256, drained within 30 s |
+| Same model with 1,000 new events/s for 30 s | at 32, the parked count does not fall below its starting 20,000 | at 256, it falls below a quarter of that |
 | Outage scenario: parked deletes requested per second while the WAL backlog still parks (attempts, including retries and failed requests; measured before `5d3df67`) | 2.5 and 8.6 (whole run after the outage, the outage and brownout runs) | 5.8 (90 s after the writer stopped) |
 
 Moto still bounds what these runs show:

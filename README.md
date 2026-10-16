@@ -6,8 +6,8 @@ Status: every v1 milestone of the [design](docs/superpowers/specs/2026-10-14-pg-
 
 Measured against the design's section 4 ([docs/load.md](docs/load.md)), on one laptop with Postgres and moto in Docker:
 
-- **Passed:** nothing lost and per-key order held under chaos (criteria 1 and 2): a 10-minute run that delivered or discarded every change, and a bounded 5-minute run whose checker found every change delivered, still parked or still retained by the slot; five deploy handovers under load were ready within 1.85 s with nothing lost (criterion 5); memory stayed flat from 50,000 to 500,000-row transactions, at 122 MiB peak with `max_inflight_bytes: 64MiB` and a stalled sink (criterion 6).
-- **Unverified:** 5,000 events/s against SNS with p99 under 1 s (criterion 4) and bounded WAL during a sink outage (criterion 3). In both runs moto's own ceiling (4,364 SNS messages/s, 636 S3 puts/s) was below the load, so they stay unverified until the pre-production runs against a real SNS topic and S3 bucket pass ([runbook](docs/runbook.md#7-pre-production-checklist)). pg-cdc alone drains 228,772 events/s into the discard sink.
+- **Passed:** nothing lost and per-key order held under chaos (criteria 1 and 2): a 10-minute run at commit `932ee1b` that delivered or discarded every change, and a bounded 5-minute run whose checker found every change delivered, still parked or still retained by the slot; five deploy handovers under load were ready within 1.85 s with nothing lost (criterion 5); memory stayed flat from 50,000 to 500,000-row transactions, at 122 MiB peak with `max_inflight_bytes: 64MiB` and a stalled sink (criterion 6).
+- **Unverified:** 5,000 events/s against SNS with p99 under 1 s (criterion 4) and bounded WAL during a sink outage (criterion 3). In both runs moto's own ceiling (4,364 SNS messages/s, 628 S3 puts/s) was below the load, so they stay unverified until the pre-production runs against a real SNS topic and S3 bucket pass ([runbook](docs/runbook.md#7-pre-production-checklist)). pg-cdc alone drains 228,772 events/s into the discard sink.
 - **Not resolved:** telemetry overhead within 1% (criterion 7). Two runs gave +1.71% and -0.73%, with run-to-run spread of 8% to 14% on a shared machine.
 
 ## Run
@@ -103,7 +103,7 @@ admin:
 
 - **Deployment:** minimum healthy 100%, maximum 200%, with the deployment circuit breaker on, so the new task starts before the old one stops and a task that never turns healthy rolls the deploy back.
 - **Source capacity:** at least one free WAL sender while the new task starts (see startup validation above).
-- **`stopTimeout`:** at least `2 x drain_timeout + 3 s`, which is 15 s at the defaults. A SIGKILL at `stopTimeout` turns the handover into a crash takeover, which is safe but costs `fence_delay`.
+- **`stopTimeout`:** at least `2 x drain_timeout + 3 s`, which is 13 s at the defaults; use 15 s or more. A SIGKILL at `stopTimeout` turns the handover into a crash takeover, which is safe but costs `fence_delay`.
 - **Health check:** `["CMD", "/usr/local/bin/pg-cdc", "health"]` in the task definition (ECS ignores the image's `HEALTHCHECK`), with `PGCDC__ADMIN__LISTEN` set if `admin.listen` is not the default.
 - **Desired count:** 1, or 2 for a hot standby.
 
