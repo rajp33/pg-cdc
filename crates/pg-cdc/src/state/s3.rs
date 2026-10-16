@@ -223,7 +223,7 @@ impl S3StateStore {
         key: OrderKeyId,
         queue: Vec<(EventId, Vec<u8>)>,
     ) -> Result<(), StoreError> {
-        // A key's events land in id order and stop at its first failure: §10.6 skips replays below the lowest stored id.
+        // Never parallel and never past a failure: replays below a queue's lowest stored id are skipped, so a gap below a stored event loses it.
         for (id, bytes) in queue {
             self.put_new(self.object(&key, &id), bytes).await?;
         }
