@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 
 use async_trait::async_trait;
@@ -78,9 +78,50 @@ impl LeaderWorker {
     }
 }
 
+fn nonempty(dir: &Path) -> &Path {
+    if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    }
+}
+
+#[derive(Debug, Default)]
+struct RootPath {
+    existing: OnceLock<PathBuf>,
+    durable: AtomicBool,
+}
+
+impl RootPath {
+    fn establish(&self, root: &Path) -> Result<(), StoreError> {
+        if self.durable.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let existing = self.existing.get_or_init(|| {
+            root.ancestors()
+                .map(nonempty)
+                .find(|dir| dir.is_dir())
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
+        fs::create_dir_all(root).map_err(|error| unavailable(root, &error))?;
+        if existing != root {
+            for dir in root.ancestors().skip(1).map(nonempty) {
+                sync_dir(dir)?;
+                if dir == existing {
+                    break;
+                }
+            }
+        }
+        self.durable.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemStateStore {
     root: PathBuf,
+    path: Arc<RootPath>,
     permits: Arc<Semaphore>,
     leader: Arc<LeaderWorker>,
 }
@@ -96,6 +137,7 @@ impl FilesystemStateStore {
     pub fn new(path: &Path, pipeline: &str, max_concurrency: usize) -> Self {
         Self {
             root: path.join(pipeline),
+            path: Arc::default(),
             permits: Arc::new(Semaphore::new(
                 max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
             )),
@@ -149,7 +191,8 @@ fn unavailable(path: &Path, error: &io::Error) -> StoreError {
 }
 
 fn sync_dir(dir: &Path) -> Result<(), StoreError> {
-    File::open(dir)
+    faults::before_sync(dir)
+        .and_then(|()| File::open(dir))
         .and_then(|handle| handle.sync_all())
         .map_err(|error| unavailable(dir, &error))
 }
@@ -161,6 +204,7 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         .open(path)
         .map_err(|error| unavailable(path, &error))?;
     file.write_all(bytes)
+        .and_then(|()| faults::before_sync(path))
         .and_then(|()| file.sync_all())
         .map_err(|error| unavailable(path, &error))
 }
@@ -542,7 +586,6 @@ fn swap(
     next: LeaderRecord,
     expected: Option<&Version>,
 ) -> Result<SwapOutcome, StoreError> {
-    ensure_dir(root, root)?;
     let lock_path = root.join(LEADER_LOCK);
     let lock = OpenOptions::new()
         .create(true)
@@ -590,8 +633,13 @@ impl StateStore for FilesystemStateStore {
                 encode_parked(event)?,
             ));
         }
-        self.blocking(move |root, cancelled| append(root, &encoded, cancelled))
-            .await
+        let path = Arc::clone(&self.path);
+        self.blocking(move |root, cancelled| {
+            check(cancelled)?;
+            path.establish(root)?;
+            append(root, &encoded, cancelled)
+        })
+        .await
     }
 
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
@@ -683,14 +731,71 @@ impl StateStore for FilesystemStateStore {
         expected: Option<&Version>,
     ) -> Result<SwapOutcome, StoreError> {
         let (next, expected) = (next.clone(), expected.cloned());
-        self.leader(move |root| swap(root, next, expected.as_ref()))
-            .await
+        let path = Arc::clone(&self.path);
+        self.leader(move |root| {
+            path.establish(root)?;
+            swap(root, next, expected.as_ref())
+        })
+        .await
+    }
+}
+
+#[cfg(not(test))]
+mod faults {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the test build, which injects fsync failures"
+    )]
+    pub(super) fn before_sync(_: &std::path::Path) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod faults {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+
+    type Fault = Box<dyn FnMut(&Path) -> io::Result<()> + Send>;
+
+    static FAULTS: Mutex<Vec<(PathBuf, Fault)>> = Mutex::new(Vec::new());
+
+    pub(super) fn before_sync(path: &Path) -> io::Result<()> {
+        let mut faults = FAULTS.lock().unwrap_or_else(PoisonError::into_inner);
+        faults
+            .iter_mut()
+            .find(|(scope, _)| path.starts_with(scope))
+            .map_or(Ok(()), |(_, fault)| fault(path))
+    }
+
+    pub(super) struct Injected(PathBuf);
+
+    impl Drop for Injected {
+        fn drop(&mut self) {
+            FAULTS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(scope, _)| *scope != self.0);
+        }
+    }
+
+    pub(super) fn inject(
+        scope: &Path,
+        fault: impl FnMut(&Path) -> io::Result<()> + Send + 'static,
+    ) -> Injected {
+        FAULTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((scope.to_path_buf(), Box::new(fault)));
+        Injected(scope.to_path_buf())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -983,6 +1088,73 @@ mod tests {
         );
         let cancelled = load_heads(&root, queue.partition(), &cancelled_after(1));
         assert!(is_cancelled(&cancelled), "{cancelled:?}");
+    }
+
+    type Synced = Arc<Mutex<Vec<PathBuf>>>;
+
+    fn record_syncs(
+        scope: &Path,
+        mut fail: impl FnMut(&Path) -> bool + Send + 'static,
+    ) -> (faults::Injected, Synced) {
+        let synced = Synced::default();
+        let log = Arc::clone(&synced);
+        let injected = faults::inject(scope, move |path| {
+            log.lock().unwrap().push(path.to_path_buf());
+            if fail(path) {
+                Err(io::Error::other("injected fsync failure"))
+            } else {
+                Ok(())
+            }
+        });
+        (injected, synced)
+    }
+
+    fn fail_once(target: PathBuf) -> impl FnMut(&Path) -> bool + Send + 'static {
+        let mut failed = false;
+        move |path| {
+            let fail = !failed && path == target;
+            failed |= fail;
+            fail
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_path_with_missing_ancestors_is_synced_up_to_the_first_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let (_injected, synced) = record_syncs(base, |_| false);
+
+        let parking = base.join("new").join("deeper");
+        let store = FilesystemStateStore::new(&parking, "orders", 2);
+        store.append_parked(&[parked(key(1), 0)]).await.unwrap();
+        let seen = std::mem::take(&mut *synced.lock().unwrap());
+        for created_in in [base.to_path_buf(), base.join("new"), parking.clone()] {
+            assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
+        }
+
+        let leading = base.join("other").join("deeper");
+        let store = FilesystemStateStore::new(&leading, "orders", 2);
+        store.swap_leader(&record(), None).await.unwrap();
+        let seen = std::mem::take(&mut *synced.lock().unwrap());
+        for created_in in [base.to_path_buf(), base.join("other"), leading.clone()] {
+            assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ancestors_created_before_a_failed_sync_are_synced_by_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let (_injected, synced) = record_syncs(base, fail_once(base.join("new")));
+        let store = FilesystemStateStore::new(&base.join("new").join("deeper"), "orders", 2);
+
+        assert!(store.append_parked(&[parked(key(1), 0)]).await.is_err());
+        synced.lock().unwrap().clear();
+        store.append_parked(&[parked(key(1), 0)]).await.unwrap();
+        let seen = synced.lock().unwrap().clone();
+        for created_in in [base.to_path_buf(), base.join("new")] {
+            assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
+        }
     }
 
     #[test]
