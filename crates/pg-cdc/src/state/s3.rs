@@ -725,25 +725,40 @@ impl StateStore for S3StateStore {
         &self,
         key: &OrderKeyId,
         id: &EventId,
-        status: ParkStatus,
+        next: ParkStatus,
     ) -> Result<(), StoreError> {
-        let mut event = self
-            .read_event(*key, *id)
+        let name = super::parked_name(key, id);
+        let object = self.object(key, id);
+        let (stored, etag) = self
+            .get(&object)
             .await?
-            .ok_or_else(|| StoreError::NotFound(super::parked_name(key, id)))?;
-        event.status = status;
+            .ok_or_else(|| StoreError::NotFound(name.clone()))?;
+        let etag = etag.ok_or_else(|| StoreError::Malformed {
+            key: name.clone(),
+            reason: "the object has no ETag".to_owned(),
+        })?;
+        let mut event = decode_parked(&name, &stored)?;
+        event.status = next;
         let bytes = encode_parked(&event)?;
         let _permit = self.permit().await?;
-        self.client
+        let sent = self
+            .client
             .put_object()
             .bucket(&self.bucket)
-            .key(self.object(key, id))
+            .key(object)
             .content_type(JSON)
+            .if_match(etag)
             .body(ByteStream::from(bytes))
             .send()
-            .await
-            .map(drop)
-            .map_err(|error| unavailable(&error))
+            .await;
+        match sent {
+            Ok(_) => Ok(()),
+            Err(error) if status(&error) == Some(412) => Err(StoreError::Conflict(name)),
+            Err(error) if status(&error) == Some(404) || missing_key(&error) => {
+                Err(StoreError::NotFound(name))
+            }
+            Err(error) => Err(unavailable(&error)),
+        }
     }
 
     async fn remove_parked(&self, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError> {

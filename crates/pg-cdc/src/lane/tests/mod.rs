@@ -159,6 +159,8 @@ struct TestStore {
     reads_at: Mutex<Vec<Instant>>,
     fail_removes: AtomicU32,
     fail_status_changes: AtomicU32,
+    lose_status_changes: AtomicU32,
+    conflict_status_changes: AtomicU32,
     status_changes: AtomicUsize,
     outstanding: Mutex<HashSet<OrderKeyId>>,
     peak_outstanding: AtomicUsize,
@@ -335,6 +337,13 @@ impl StateStore for TestStore {
         tokio::time::sleep(self.status_delay).await;
         if take_failure(&self.fail_status_changes) {
             return Err(outage());
+        }
+        if take_failure(&self.lose_status_changes) {
+            self.inner.remove_parked(&[(*key, *id)]).await?;
+        }
+        if take_failure(&self.conflict_status_changes) {
+            self.inner.set_parked_status(key, id, status).await?;
+            return Err(StoreError::Conflict(id.to_string()));
         }
         self.outstanding.lock().unwrap().remove(key);
         self.inner.set_parked_status(key, id, status).await

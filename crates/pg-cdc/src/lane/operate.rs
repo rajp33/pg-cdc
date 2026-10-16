@@ -114,8 +114,19 @@ impl Lane {
             return Err(OperateError::NotDead { key, head });
         }
         let store = Arc::clone(&self.store);
-        self.publishing(store.set_parked_status(&key, &head, ParkStatus::Retrying))
-            .await?;
+        match self
+            .publishing(store.set_parked_status(&key, &head, ParkStatus::Retrying))
+            .await
+        {
+            Ok(()) => {}
+            Err(error @ (StoreError::NotFound(_) | StoreError::Conflict(_))) => {
+                tracing::warn!(order_key = %key, id = %head, %error, "the dead head changed in the store before the redrive; reloading it");
+                self.to_kill.retain(|kill| !kill.is(key, head));
+                self.reload(key);
+                return Err(OperateError::Loading(key));
+            }
+            Err(error) => return Err(error.into()),
+        }
         if let Some(state) = self.keys.get_mut(&key) {
             if let Some(stored) = state.stored.as_mut() {
                 stored.dead = false;

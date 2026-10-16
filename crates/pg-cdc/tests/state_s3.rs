@@ -1154,3 +1154,112 @@ async fn a_slowdown_storm_past_the_sdk_retries_neither_loses_nor_resends_events(
     assert_eq!(sent, expected);
     Ok(())
 }
+
+#[derive(Debug)]
+struct HoldStatusRewrite {
+    armed: AtomicBool,
+    reached: std::sync::mpsc::Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Intercept for HoldStatusRewrite {
+    fn name(&self) -> &'static str {
+        "HoldStatusRewrite"
+    }
+
+    fn read_before_transmit(
+        &self,
+        context: &BeforeTransmitInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let request = context.request();
+        let rewrite = request.method() == "PUT"
+            && request.uri().contains("/parked/")
+            && request.headers().get("if-none-match").is_none();
+        if rewrite && self.armed.swap(false, Ordering::SeqCst) {
+            self.reached.send(())?;
+            self.resume
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(30))?;
+        }
+        Ok(())
+    }
+}
+
+async fn status_rewrite_held_while(
+    aws: &AwsEmulator,
+    queue: OrderKeyId,
+    target: EventId,
+    status: ParkStatus,
+    meanwhile: impl Future<Output = TestResult>,
+) -> TestResult<Result<(), StoreError>> {
+    let (reached, reached_rx) = std::sync::mpsc::channel();
+    let (resume, resume_rx) = std::sync::mpsc::channel();
+    let fresh = aws.s3().await;
+    let held = aws_sdk_s3::Client::from_conf(
+        fresh
+            .config()
+            .to_builder()
+            .interceptor(HoldStatusRewrite {
+                armed: AtomicBool::new(true),
+                reached,
+                resume: Mutex::new(resume_rx),
+            })
+            .build(),
+    );
+    let store = S3StateStore::new(held, BUCKET.to_owned(), "", "orders", 8);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let rewrite = std::thread::spawn(move || {
+        runtime.block_on(store.set_parked_status(&queue, &target, status))
+    });
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(30))).await??;
+    meanwhile.await?;
+    resume.send(())?;
+    tokio::task::spawn_blocking(move || rewrite.join())
+        .await?
+        .map_err(|_| "the held rewrite panicked".into())
+}
+
+#[tokio::test]
+async fn a_status_rewrite_landing_after_the_event_was_removed_does_not_recreate_it() -> TestResult {
+    let (aws, s3) = emulator_with_bucket().await?;
+    let queue = key(0x42, 1)?;
+    let store = seeded(&s3, queue, &[id(1, 0), id(2, 0)]).await?;
+    let rewritten = status_rewrite_held_while(&aws, queue, id(1, 0), ParkStatus::Dead, async {
+        store.remove_parked(&[(queue, id(1, 0))]).await?;
+        Ok(())
+    })
+    .await?;
+    assert!(
+        matches!(rewritten, Err(StoreError::NotFound(_))),
+        "{rewritten:?}"
+    );
+    assert_eq!(head(&store, queue).await?, Some(id(2, 0)));
+    assert_eq!(parked_objects(&s3).await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_status_rewrite_of_an_event_changed_since_it_was_read_is_rejected() -> TestResult {
+    let (aws, s3) = emulator_with_bucket().await?;
+    let queue = key(0x42, 1)?;
+    let store = seeded(&s3, queue, &[id(1, 0)]).await?;
+    let rewritten = status_rewrite_held_while(&aws, queue, id(1, 0), ParkStatus::Retrying, async {
+        store
+            .set_parked_status(&queue, &id(1, 0), ParkStatus::Dead)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    assert!(
+        matches!(rewritten, Err(StoreError::Conflict(_))),
+        "{rewritten:?}"
+    );
+    let stored = store.read_parked(&queue, None, 10).await?;
+    assert_eq!(stored, vec![event(queue, id(1, 0), ParkStatus::Dead)]);
+    Ok(())
+}

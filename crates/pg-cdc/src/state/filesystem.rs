@@ -22,6 +22,7 @@ use crate::event::EventId;
 use crate::order::OrderKeyId;
 
 pub const LEADER_LOCK: &str = "leader.lock";
+pub const PARKED_LOCK: &str = "parked.lock";
 const TEMP_ABANDONED_AFTER: Duration = Duration::from_hours(1);
 const CREATE_ATTEMPTS: usize = 3;
 const TEMP_PREFIX: &str = ".tmp-";
@@ -593,6 +594,11 @@ fn set_status(
     let name = format!("{id}.json");
     let path = dir.join(&name);
     let object = super::parked_name(&key, &id);
+    let Some(lock) = parked_lock(root)? else {
+        return Err(StoreError::NotFound(object));
+    };
+    lock.lock()
+        .map_err(|error| unavailable(&root.join(PARKED_LOCK), &error))?;
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -602,7 +608,23 @@ fn set_status(
     };
     let mut event = decode_parked(&object, &bytes)?;
     event.status = status;
-    replace(&dir, &name, &encode_parked(&event)?)
+    let encoded = encode_parked(&event)?;
+    check(cancelled)?;
+    replace(&dir, &name, &encoded)
+}
+
+fn parked_lock(root: &Path) -> Result<Option<File>, StoreError> {
+    let path = root.join(PARKED_LOCK);
+    match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(unavailable(&path, &error)),
+    }
 }
 
 fn sync_absence(dir: &Path, parked: &Path) -> Result<(), StoreError> {
@@ -621,6 +643,11 @@ fn remove(
     cancelled: Cancelled<'_>,
 ) -> Result<(), StoreError> {
     let parked = root.join(PARKED_DIR);
+    let lock = parked_lock(root)?;
+    if let Some(lock) = &lock {
+        lock.lock_shared()
+            .map_err(|error| unavailable(&root.join(PARKED_LOCK), &error))?;
+    }
     for (key, id) in events {
         check(cancelled)?;
         let dir = key_dir(root, key);
@@ -830,18 +857,20 @@ mod faults {
 mod faults {
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Arc, Mutex, PoisonError};
 
-    type Fault = Box<dyn FnMut(&Path) -> io::Result<()> + Send>;
+    type Fault = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 
     static FAULTS: Mutex<Vec<(PathBuf, Fault)>> = Mutex::new(Vec::new());
 
     pub(super) fn before_sync(path: &Path) -> io::Result<()> {
-        let mut faults = FAULTS.lock().unwrap_or_else(PoisonError::into_inner);
-        faults
-            .iter_mut()
+        let fault = FAULTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
             .find(|(scope, _)| path.starts_with(scope))
-            .map_or(Ok(()), |(_, fault)| fault(path))
+            .map(|(_, fault)| Arc::clone(fault));
+        fault.map_or(Ok(()), |fault| fault(path))
     }
 
     pub(super) struct Injected(PathBuf);
@@ -857,19 +886,19 @@ mod faults {
 
     pub(super) fn inject(
         scope: &Path,
-        fault: impl FnMut(&Path) -> io::Result<()> + Send + 'static,
+        fault: impl Fn(&Path) -> io::Result<()> + Send + Sync + 'static,
     ) -> Injected {
         FAULTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push((scope.to_path_buf(), Box::new(fault)));
+            .push((scope.to_path_buf(), Arc::new(fault)));
         Injected(scope.to_path_buf())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1169,7 +1198,7 @@ mod tests {
 
     fn record_syncs(
         scope: &Path,
-        mut fail: impl FnMut(&Path) -> bool + Send + 'static,
+        fail: impl Fn(&Path) -> bool + Send + Sync + 'static,
     ) -> (faults::Injected, Synced) {
         let synced = Synced::default();
         let log = Arc::clone(&synced);
@@ -1184,13 +1213,9 @@ mod tests {
         (injected, synced)
     }
 
-    fn fail_once(target: PathBuf) -> impl FnMut(&Path) -> bool + Send + 'static {
-        let mut failed = false;
-        move |path| {
-            let fail = !failed && path == target;
-            failed |= fail;
-            fail
-        }
+    fn fail_once(target: PathBuf) -> impl Fn(&Path) -> bool + Send + Sync + 'static {
+        let failed = AtomicBool::new(false);
+        move |path| path == target && !failed.swap(true, Ordering::SeqCst)
     }
 
     #[tokio::test]
@@ -1292,7 +1317,11 @@ mod tests {
         assert!(swap(&root, record(), None).is_err());
         assert_eq!(
             names(&root),
-            vec![LEADER_LOCK.to_owned(), PARKED_DIR.to_owned()]
+            vec![
+                LEADER_LOCK.to_owned(),
+                PARKED_DIR.to_owned(),
+                PARKED_LOCK.to_owned()
+            ]
         );
     }
 
@@ -1341,6 +1370,43 @@ mod tests {
         assert_eq!(
             names(&root),
             vec![LEADER_OBJECT.to_owned(), LEADER_LOCK.to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_removal_racing_a_status_change_is_never_undone_by_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(dir.path().join("orders"));
+        let queue = key(1);
+        append(&root, &encoded(queue, 2), &|| false).unwrap();
+        let racing = Arc::new(Mutex::new(None));
+        let fired = AtomicBool::new(false);
+        let (_injected, _) = record_syncs(dir.path(), {
+            let (root, racing) = (Arc::clone(&root), Arc::clone(&racing));
+            move |path| {
+                if is_temp(path) && !fired.swap(true, Ordering::SeqCst) {
+                    let root = Arc::clone(&root);
+                    let removal =
+                        thread::spawn(move || remove(&root, &[(queue, event_id(0))], &|| false));
+                    for _ in 0..50 {
+                        if removal.is_finished() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(4));
+                    }
+                    *racing.lock().unwrap() = Some(removal);
+                }
+                false
+            }
+        });
+
+        let changed = set_status(&root, queue, event_id(0), ParkStatus::Dead, &|| false);
+        let removal = racing.lock().unwrap().take().unwrap();
+        removal.join().unwrap().unwrap();
+        assert!(changed.is_ok(), "{changed:?}");
+        assert_eq!(
+            names(&key_dir(&root, &queue)),
+            vec![format!("{}.json", event_id(1))]
         );
     }
 
