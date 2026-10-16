@@ -62,6 +62,7 @@ impl Lane {
                 Some(Key {
                     stored: Some(_), ..
                 }) => self.to_load.push_back(key),
+                Some(_) if self.closing => self.start_parking(key, false),
                 Some(_) => self.make_ready(key),
                 None => {}
             }

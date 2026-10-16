@@ -341,3 +341,21 @@ async fn a_key_whose_append_fails_retries_alone_while_the_other_keys_settle() {
     );
     assert_eq!(harness.ack.inflight_events(), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn park_all_parks_a_live_key_whose_partition_loads_afterwards() {
+    let store = TestStore::default();
+    store.hold(OrderKeyId::of(b"fresh").partition());
+    let mut harness = Harness::start(Setup::default(), ScriptedSink::delivering(), store).await;
+    harness.send(0, b"fresh", 10).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    harness.lanes.park_all();
+    harness.store.release.notify_one();
+    let settled = tokio::time::timeout(Duration::from_secs(60), harness.settle(1)).await;
+    assert_eq!(settled.ok(), Some(Lsn(100)));
+    assert_eq!(
+        harness.store.queue(b"fresh").await,
+        vec![(0, ParkStatus::Retrying)]
+    );
+    assert_eq!(harness.sink.batches(), Vec::<Vec<u32>>::new());
+}
