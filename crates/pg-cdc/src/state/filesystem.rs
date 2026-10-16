@@ -92,6 +92,29 @@ fn nonempty(dir: &Path) -> &Path {
     }
 }
 
+fn absolute(path: &Path) -> Result<PathBuf, StoreError> {
+    let mut existing = nonempty(path);
+    let mut missing = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(resolved) => {
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(resolved, |resolved, name| resolved.join(name)));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return Err(unavailable(existing, &error));
+                };
+                missing.push(name);
+                existing = nonempty(parent);
+            }
+            Err(error) => return Err(unavailable(existing, &error)),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct RootPath {
     durable: AtomicBool,
@@ -102,15 +125,14 @@ impl RootPath {
         if self.durable.load(Ordering::Acquire) {
             return Ok(());
         }
-        fs::create_dir_all(root).map_err(|error| unavailable(root, &error))?;
-        for dir in root.ancestors().skip(1).map(nonempty) {
-            match faults::before_sync(dir).and_then(|()| File::open(dir)) {
-                // pg-cdc creates directories it can read, so one it cannot open was not created by it.
-                Err(error) if error.kind() == ErrorKind::PermissionDenied => break,
-                opened => opened
-                    .and_then(|handle| handle.sync_all())
-                    .map_err(|error| unavailable(dir, &error))?,
-            }
+        let resolved = absolute(root)?;
+        fs::create_dir_all(&resolved).map_err(|error| unavailable(&resolved, &error))?;
+        for dir in resolved.ancestors().skip(1) {
+            sync_dir(dir).map_err(|error| {
+                StoreError::Unavailable(format!(
+                    "cannot make the state store path durable: {error}"
+                ))
+            })?;
         }
         self.durable.store(true, Ordering::Release);
         Ok(())
@@ -1274,14 +1296,14 @@ mod tests {
     #[tokio::test]
     async fn a_store_path_with_missing_ancestors_is_synced_up_to_the_first_existing_one() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        let (_injected, synced) = record_syncs(base, |_| false);
+        let base = dir.path().canonicalize().unwrap();
+        let (_injected, synced) = record_syncs(&base, |_| false);
 
         let parking = base.join("new").join("deeper");
         let store = FilesystemStateStore::new(&parking, "orders", 2);
         store.append_parked(&[parked(key(1), 0)]).await.unwrap();
         let seen = std::mem::take(&mut *synced.lock().unwrap());
-        for created_in in [base.to_path_buf(), base.join("new"), parking.clone()] {
+        for created_in in [base.clone(), base.join("new"), parking.clone()] {
             assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
         }
 
@@ -1289,7 +1311,7 @@ mod tests {
         let store = FilesystemStateStore::new(&leading, "orders", 2);
         store.swap_leader(&record(), None).await.unwrap();
         let seen = std::mem::take(&mut *synced.lock().unwrap());
-        for created_in in [base.to_path_buf(), base.join("other"), leading.clone()] {
+        for created_in in [base.clone(), base.join("other"), leading.clone()] {
             assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
         }
     }
@@ -1297,15 +1319,15 @@ mod tests {
     #[tokio::test]
     async fn ancestors_created_before_a_failed_sync_are_synced_by_the_retry() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        let (_injected, synced) = record_syncs(base, fail_once(base.join("new")));
+        let base = dir.path().canonicalize().unwrap();
+        let (_injected, synced) = record_syncs(&base, fail_once(base.join("new")));
         let store = FilesystemStateStore::new(&base.join("new").join("deeper"), "orders", 2);
 
         assert!(store.append_parked(&[parked(key(1), 0)]).await.is_err());
         synced.lock().unwrap().clear();
         store.append_parked(&[parked(key(1), 0)]).await.unwrap();
         let seen = synced.lock().unwrap().clone();
-        for created_in in [base.to_path_buf(), base.join("new")] {
+        for created_in in [base.clone(), base.join("new")] {
             assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
         }
     }
@@ -1313,8 +1335,8 @@ mod tests {
     #[tokio::test]
     async fn a_store_reopened_after_a_failed_ancestor_sync_syncs_the_ancestors() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        let (_injected, synced) = record_syncs(base, fail_once(base.join("new")));
+        let base = dir.path().canonicalize().unwrap();
+        let (_injected, synced) = record_syncs(&base, fail_once(base.join("new")));
         let parking = base.join("new").join("deeper");
 
         let crashed = FilesystemStateStore::new(&parking, "orders", 2);
@@ -1325,9 +1347,48 @@ mod tests {
         let reopened = FilesystemStateStore::new(&parking, "orders", 2);
         reopened.append_parked(&[parked(key(1), 0)]).await.unwrap();
         let seen = synced.lock().unwrap().clone();
-        for containing in [base.to_path_buf(), base.join("new"), parking.clone()] {
+        for containing in [base.clone(), base.join("new"), parking.clone()] {
             assert!(seen.contains(&containing), "{containing:?} not in {seen:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_ancestor_that_cannot_be_synced_fails_the_store_instead_of_being_skipped() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("wx");
+        fs::create_dir(&unreadable).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o300)).unwrap();
+        if File::open(&unreadable).is_ok() {
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let store = FilesystemStateStore::new(&unreadable.join("new"), "orders", 2);
+        let appended = store.append_parked(&[parked(key(1), 0)]).await;
+        let swapped = store.swap_leader(&record(), None).await;
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        for result in [appended.map(drop), swapped.map(drop)] {
+            assert!(
+                matches!(&result, Err(StoreError::Unavailable(message))
+                    if message.contains(&unreadable.display().to_string())
+                        && message.contains("os error 13")),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_store_path_is_walked_from_its_absolute_location() {
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let relative = Path::new("no-such-dir").join("orders");
+        assert_eq!(absolute(&relative).unwrap(), cwd.join(&relative));
+        assert_eq!(absolute(Path::new("")).unwrap(), cwd);
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            absolute(&dir.path().join("a").join("b")).unwrap(),
+            canonical.join("a").join("b")
+        );
     }
 
     #[test]
