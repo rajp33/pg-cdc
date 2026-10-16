@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -93,7 +93,6 @@ fn nonempty(dir: &Path) -> &Path {
 
 #[derive(Debug, Default)]
 struct RootPath {
-    existing: OnceLock<PathBuf>,
     durable: AtomicBool,
 }
 
@@ -102,20 +101,14 @@ impl RootPath {
         if self.durable.load(Ordering::Acquire) {
             return Ok(());
         }
-        let existing = self.existing.get_or_init(|| {
-            root.ancestors()
-                .map(nonempty)
-                .find(|dir| dir.is_dir())
-                .unwrap_or(Path::new("."))
-                .to_path_buf()
-        });
         fs::create_dir_all(root).map_err(|error| unavailable(root, &error))?;
-        if existing != root {
-            for dir in root.ancestors().skip(1).map(nonempty) {
-                sync_dir(dir)?;
-                if dir == existing {
-                    break;
-                }
+        for dir in root.ancestors().skip(1).map(nonempty) {
+            match faults::before_sync(dir).and_then(|()| File::open(dir)) {
+                // pg-cdc creates directories it can read, so one it cannot open was not created by it.
+                Err(error) if error.kind() == ErrorKind::PermissionDenied => break,
+                opened => opened
+                    .and_then(|handle| handle.sync_all())
+                    .map_err(|error| unavailable(dir, &error))?,
             }
         }
         self.durable.store(true, Ordering::Release);
@@ -1254,6 +1247,26 @@ mod tests {
         let seen = synced.lock().unwrap().clone();
         for created_in in [base.to_path_buf(), base.join("new")] {
             assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_reopened_after_a_failed_ancestor_sync_syncs_the_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let (_injected, synced) = record_syncs(base, fail_once(base.join("new")));
+        let parking = base.join("new").join("deeper");
+
+        let crashed = FilesystemStateStore::new(&parking, "orders", 2);
+        assert!(crashed.append_parked(&[parked(key(1), 0)]).await.is_err());
+        drop(crashed);
+        synced.lock().unwrap().clear();
+
+        let reopened = FilesystemStateStore::new(&parking, "orders", 2);
+        reopened.append_parked(&[parked(key(1), 0)]).await.unwrap();
+        let seen = synced.lock().unwrap().clone();
+        for containing in [base.to_path_buf(), base.join("new"), parking.clone()] {
+            assert!(seen.contains(&containing), "{containing:?} not in {seen:?}");
         }
     }
 
