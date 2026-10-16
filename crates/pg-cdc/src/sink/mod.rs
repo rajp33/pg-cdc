@@ -375,7 +375,12 @@ mod tests {
                 .region(aws_sdk_sns::config::Region::new("us-east-1"))
                 .build(),
         );
-        let sns = sns::SnsSink::new(client, "arn:aws:sns:us-east-1:1:orders".to_owned(), None);
+        let sns = sns::SnsSink::new(
+            client,
+            "orders",
+            "arn:aws:sns:us-east-1:1:orders".to_owned(),
+            None,
+        );
         assert_eq!(sns.name(), "sns");
         assert_eq!(discard::DiscardSink::new().name(), "discard");
         assert_eq!(stdout::StdoutSink::new(tokio::io::sink()).name(), "stdout");

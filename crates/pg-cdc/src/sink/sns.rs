@@ -89,17 +89,29 @@ impl Topic {
 #[derive(Debug)]
 pub struct SnsSink {
     api: Box<dyn SnsApi>,
+    pipeline: String,
     topic_arn: String,
     fair_queue_group: Option<String>,
     topic: OnceLock<Topic>,
 }
 
 impl SnsSink {
-    pub fn new(client: Client, topic_arn: String, fair_queue_group: Option<String>) -> Self {
-        Self::with_api(Box::new(AwsSns(client)), topic_arn, fair_queue_group)
+    pub fn new(
+        client: Client,
+        pipeline: &str,
+        topic_arn: String,
+        fair_queue_group: Option<String>,
+    ) -> Self {
+        Self::with_api(
+            Box::new(AwsSns(client)),
+            pipeline,
+            topic_arn,
+            fair_queue_group,
+        )
     }
 
     pub async fn from_environment(
+        pipeline: &str,
         topic_arn: String,
         region: Option<String>,
         fair_queue_group: Option<String>,
@@ -113,14 +125,21 @@ impl SnsSink {
             );
         Self::new(
             Client::new(&loader.load().await),
+            pipeline,
             topic_arn,
             fair_queue_group,
         )
     }
 
-    fn with_api(api: Box<dyn SnsApi>, topic_arn: String, fair_queue_group: Option<String>) -> Self {
+    fn with_api(
+        api: Box<dyn SnsApi>,
+        pipeline: &str,
+        topic_arn: String,
+        fair_queue_group: Option<String>,
+    ) -> Self {
         Self {
             api,
+            pipeline: pipeline.to_owned(),
             topic_arn,
             fair_queue_group,
             topic: OnceLock::new(),
@@ -133,7 +152,7 @@ impl SnsSink {
         let (group, dedupe) = if topic.fifo {
             (
                 Some(outbound.order_key.to_string()),
-                Some(outbound.id.to_string()),
+                Some(format!("{}:{}", self.pipeline, outbound.id)),
             )
         } else {
             let group = self
@@ -432,14 +451,56 @@ mod tests {
     }
 
     async fn preflighted(fake: FakeSns, fair_queue_group: Option<&str>) -> (SnsSink, Arc<FakeSns>) {
+        preflighted_for("orders", fake, fair_queue_group).await
+    }
+
+    async fn preflighted_for(
+        pipeline: &str,
+        fake: FakeSns,
+        fair_queue_group: Option<&str>,
+    ) -> (SnsSink, Arc<FakeSns>) {
         let fake = Arc::new(fake);
         let sink = SnsSink::with_api(
             Box::new(Arc::clone(&fake)),
+            pipeline,
             "arn:aws:sns:us-east-1:123456789012:orders".to_owned(),
             fair_queue_group.map(str::to_owned),
         );
         sink.preflight().await.unwrap();
         (sink, fake)
+    }
+
+    fn fifo() -> FakeSns {
+        FakeSns {
+            attributes: Some(topic(&[("FifoTopic", "true")])),
+            ..FakeSns::default()
+        }
+    }
+
+    async fn dedupe_id(pipeline: &str, message: &Outbound) -> String {
+        let (sink, fake) = preflighted_for(pipeline, fifo(), None).await;
+        sink.send(std::slice::from_ref(message)).await;
+        let calls = fake.calls.lock().unwrap();
+        calls[0][0].dedupe.clone().unwrap()
+    }
+
+    fn valid_dedupe_id(id: &str) -> bool {
+        (1..=128).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_graphic())
+    }
+
+    #[tokio::test]
+    async fn fifo_dedupe_ids_are_namespaced_by_pipeline_and_stable_across_restarts() {
+        let message = outbound(3, "acme");
+        let orders = dedupe_id("orders", &message).await;
+        let billing = dedupe_id("billing", &message).await;
+        assert_ne!(orders, billing);
+        assert_eq!(dedupe_id("orders", &message).await, orders);
+        assert_eq!(dedupe_id("orders", &outbound(3, "other")).await, orders);
+        assert_ne!(dedupe_id("orders", &outbound(4, "acme")).await, orders);
+        let longest = "p".repeat(63);
+        for id in [orders, billing, dedupe_id(&longest, &message).await] {
+            assert!(valid_dedupe_id(&id), "{id}");
+        }
     }
 
     fn outbound(ordinal: u32, tenant: &str) -> Outbound {
@@ -526,6 +587,7 @@ mod tests {
     async fn preflight_fails_when_the_topic_cannot_be_read() {
         let sink = SnsSink::with_api(
             Box::new(Arc::new(FakeSns::default())),
+            "orders",
             "arn:aws:sns:us-east-1:123456789012:missing".to_owned(),
             None,
         );
@@ -542,7 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fifo_entries_use_the_order_key_as_group_and_the_event_id_as_dedupe_id() {
+    async fn fifo_entries_use_the_order_key_as_group_and_the_pipeline_and_event_id_as_dedupe_id() {
         let (sink, fake) = preflighted(
             FakeSns {
                 attributes: Some(topic(&[("FifoTopic", "true")])),
@@ -564,7 +626,10 @@ mod tests {
             entry.group.as_deref(),
             Some(message.order_key.to_string().as_str())
         );
-        assert_eq!(entry.dedupe.as_deref(), Some("000000001a2b3c4d-00000003"));
+        assert_eq!(
+            entry.dedupe.as_deref(),
+            Some("orders:000000001a2b3c4d-00000003")
+        );
         assert_eq!(entry.attributes, message.attributes);
     }
 

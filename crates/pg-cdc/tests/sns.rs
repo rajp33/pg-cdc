@@ -42,7 +42,7 @@ fn outbound(ordinal: u32, tenant: &str) -> Result<Outbound, serde_json::Error> {
 async fn preflight_reads_the_topic_and_rejects_a_missing_one() -> TestResult {
     let aws = AwsEmulator::start().await?;
     let standard = aws.topic_with_queue("orders", false).await?;
-    let sink = SnsSink::new(aws.sns().await, standard.topic_arn, None);
+    let sink = SnsSink::new(aws.sns().await, "orders", standard.topic_arn, None);
     sink.preflight().await?;
     assert_eq!(
         sink.capabilities(),
@@ -54,6 +54,7 @@ async fn preflight_reads_the_topic_and_rejects_a_missing_one() -> TestResult {
     );
     let missing = SnsSink::new(
         aws.sns().await,
+        "orders",
         "arn:aws:sns:us-east-1:123456789012:missing".to_owned(),
         None,
     );
@@ -66,7 +67,7 @@ async fn preflight_reads_the_topic_and_rejects_a_missing_one() -> TestResult {
 async fn a_standard_topic_delivers_bodies_and_attributes_to_sqs() -> TestResult {
     let aws = AwsEmulator::start().await?;
     let route = aws.topic_with_queue("orders", false).await?;
-    let sink = SnsSink::new(aws.sns().await, route.topic_arn, None);
+    let sink = SnsSink::new(aws.sns().await, "orders", route.topic_arn, None);
     sink.preflight().await?;
     let batch = vec![
         outbound(1, "acme")?,
@@ -113,7 +114,7 @@ async fn a_standard_topic_delivers_bodies_and_attributes_to_sqs() -> TestResult 
 async fn a_fifo_topic_groups_by_order_key_and_deduplicates_by_event_id() -> TestResult {
     let aws = AwsEmulator::start().await?;
     let route = aws.topic_with_queue("orders", true).await?;
-    let sink = SnsSink::new(aws.sns().await, route.topic_arn, None);
+    let sink = SnsSink::new(aws.sns().await, "orders", route.topic_arn, None);
     sink.preflight().await?;
     let batch = vec![outbound(1, "acme")?, outbound(2, "acme")?];
     assert_eq!(sink.send(&batch).await, vec![Outcome::Delivered; 2]);
@@ -131,9 +132,33 @@ async fn a_fifo_topic_groups_by_order_key_and_deduplicates_by_event_id() -> Test
         );
         assert_eq!(
             system.get(&MessageSystemAttributeName::MessageDeduplicationId),
-            Some(&sent.id.to_string())
+            Some(&format!("orders:{}", sent.id))
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_pipelines_sharing_a_fifo_topic_both_deliver_the_same_event_id() -> TestResult {
+    let aws = AwsEmulator::start().await?;
+    let route = aws.topic_with_queue("shared", true).await?;
+    for pipeline in ["orders", "billing"] {
+        let sink = SnsSink::new(aws.sns().await, pipeline, route.topic_arn.clone(), None);
+        sink.preflight().await?;
+        assert_eq!(
+            sink.send(&[outbound(1, pipeline)?]).await,
+            vec![Outcome::Delivered]
+        );
+    }
+    let messages = aws.receive(&route.queue_url, 2, WAIT).await?;
+    let mut tenants: Vec<String> = messages
+        .iter()
+        .filter_map(|message| message.body())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .map(|body| body.map(|body| body["after"]["tenant"].to_string()))
+        .collect::<Result<_, _>>()?;
+    tenants.sort_unstable();
+    assert_eq!(tenants, vec![r#""billing""#, r#""orders""#]);
     Ok(())
 }
 
@@ -141,7 +166,7 @@ async fn a_fifo_topic_groups_by_order_key_and_deduplicates_by_event_id() -> Test
 async fn a_deleted_topic_makes_every_entry_retryable() -> TestResult {
     let aws = AwsEmulator::start().await?;
     let route = aws.topic_with_queue("orders", false).await?;
-    let sink = SnsSink::new(aws.sns().await, route.topic_arn.clone(), None);
+    let sink = SnsSink::new(aws.sns().await, "orders", route.topic_arn.clone(), None);
     sink.preflight().await?;
     aws.sns()
         .await

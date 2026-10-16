@@ -435,7 +435,7 @@ async fn run(
         return Ok(());
     };
     let Some(sink) = shutdown
-        .run_until_cancelled(Box::pin(sink(&config.sink)))
+        .run_until_cancelled(Box::pin(sink(&config.pipeline, &config.sink)))
         .await
     else {
         tracing::info!("pg-cdc stopped cleanly");
@@ -507,12 +507,13 @@ async fn start_admin(listen: SocketAddr, admin: Admin) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn sink(config: &SinkConfig) -> Arc<dyn Sink> {
+async fn sink(pipeline: &str, config: &SinkConfig) -> Arc<dyn Sink> {
     match config {
         SinkConfig::Stdout(_) => Arc::new(StdoutSink::stdout()),
         SinkConfig::Discard(_) => Arc::new(DiscardSink::new()),
         SinkConfig::Sns(sns) => Arc::new(
             SnsSink::from_environment(
+                pipeline,
                 sns.topic_arn.clone(),
                 sns.region.clone(),
                 sns.fair_queue_group.clone(),

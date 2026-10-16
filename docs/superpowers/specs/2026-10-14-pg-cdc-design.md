@@ -259,7 +259,7 @@ The xid is left out of the envelope: it is 32 bits and wraps, and `commit_lsn` a
   - it is unique within a pipeline;
   - it is identical on every replay of the same WAL;
   - lexicographic order equals stream order;
-  - it is a valid SNS FIFO deduplication id.
+  - prefixed with the pipeline name and `:`, it is a valid SNS FIFO deduplication id (§11.2).
 - **Change publications only when caught up.** If the publication's table list changes while transactions are still unacknowledged, those transactions can get different ordinals on replay.
 
 ### 7.3 Key and order key
@@ -453,7 +453,7 @@ v1 sinks:
   - a failed entry with `SenderFault=false` is `Retryable`;
   - request-level failures (throttling, 5xx, timeouts, connection or credential errors, a missing topic) make every entry `Retryable`.
 - **FIFO topics.**
-  - `MessageGroupId` is the order key id, and `MessageDeduplicationId` is the event id.
+  - `MessageGroupId` is the order key id, and `MessageDeduplicationId` is `<pipeline>:<event id>`, at most 89 characters. SNS deduplicates across the whole topic, so pipelines sharing a FIFO topic need distinct `pipeline` names; the same event gets the same id on every replay and after every takeover.
   - SNS FIFO allows 300 messages/s per group and 3,000/s per topic by default, and more in high-throughput mode.
 - **Standard topics.** There is no group id, unless `sink.fair_queue_group: column:<name>` sets one from that column for SQS fair queues. The column must also be listed in `attribute_columns`.
 - **Message attributes.**
