@@ -192,6 +192,8 @@ pub enum StoreError {
     Unavailable(String),
     #[error("{0} is not in the store")]
     NotFound(String),
+    #[error("{0} changed in the store since it was read")]
+    Conflict(String),
     #[error("stored object {key} is malformed: {reason}")]
     Malformed { key: String, reason: String },
 }

@@ -128,6 +128,23 @@ impl Lane {
         false
     }
 
+    pub(super) fn reload(&mut self, key: OrderKeyId) {
+        let Some(stored) = self
+            .keys
+            .get_mut(&key)
+            .and_then(|state| state.stored.as_mut())
+        else {
+            return;
+        };
+        if stored.head.take().is_some() {
+            self.heads_in_memory = self.heads_in_memory.saturating_sub(1);
+        }
+        stored.dead = false;
+        stored.current = None;
+        self.stats_dirty = true;
+        self.to_load.push_back(key);
+    }
+
     fn store_succeeded(&mut self) {
         self.store_backoff.reset();
         self.store_due = None;
@@ -483,13 +500,21 @@ impl Lane {
     async fn flush_kills(&mut self) {
         let store = Arc::clone(&self.store);
         while let Some(kill) = self.to_kill.pop() {
-            if let Err(error) = self
+            match self
                 .publishing(store.set_parked_status(&kill.key, &kill.id, ParkStatus::Dead))
                 .await
             {
-                self.store_failed("mark dead", &error);
-                self.to_kill.push(kill);
-                return;
+                Ok(()) => {}
+                Err(error @ (StoreError::NotFound(_) | StoreError::Conflict(_))) => {
+                    tracing::warn!(order_key = %kill.key, id = %kill.id, %error, "the head changed in the store before it was marked dead; reloading it");
+                    self.reload(kill.key);
+                    continue;
+                }
+                Err(error) => {
+                    self.store_failed("mark dead", &error);
+                    self.to_kill.push(kill);
+                    return;
+                }
             }
             if let Some((table, op)) = &kill.labels {
                 metrics::record(Measurement::Event {

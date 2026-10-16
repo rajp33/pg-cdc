@@ -433,7 +433,10 @@ where
     store
         .set_parked_status(&queue, &id(1, 0), ParkStatus::Retrying)
         .await?;
-    assert_eq!(store.read_parked(&queue, None, 10).await?, vec![head, next]);
+    assert_eq!(
+        store.read_parked(&queue, None, 10).await?,
+        vec![head, next.clone()]
+    );
     let missing = store
         .set_parked_status(&queue, &id(9, 9), ParkStatus::Dead)
         .await;
@@ -448,6 +451,15 @@ where
         matches!(missing, Err(StoreError::NotFound(_))),
         "{missing:?}"
     );
+    store.remove_parked(&[(queue, id(1, 0))]).await?;
+    let removed = store
+        .set_parked_status(&queue, &id(1, 0), ParkStatus::Dead)
+        .await;
+    assert!(
+        matches!(removed, Err(StoreError::NotFound(_))),
+        "{removed:?}"
+    );
+    assert_eq!(store.read_parked(&queue, None, 10).await?, vec![next]);
     Ok(())
 }
 

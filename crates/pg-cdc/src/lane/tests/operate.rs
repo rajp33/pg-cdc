@@ -550,6 +550,19 @@ async fn a_failed_status_change_reports_the_error_and_changes_nothing() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_redrive_that_finds_the_head_changed_reloads_it_instead_of_failing() {
+    let store = TestStore::default();
+    store.conflict_status_changes.store(1, Ordering::SeqCst);
+    let harness = dead_head_behind(2, store).await;
+    assert_eq!(
+        harness.operator().redrive(k()).await,
+        Err(OperateError::Loading(k()))
+    );
+    assert_eq!(harness.delivered(2).await, vec![0, 1]);
+    assert_eq!(harness.store.status_changes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_failed_removal_reports_the_error_and_changes_nothing() {
     let store = TestStore::default();
     store.fail_removes.store(1, Ordering::SeqCst);

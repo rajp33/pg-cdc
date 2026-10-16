@@ -132,6 +132,51 @@ async fn a_terminal_outcome_on_a_parked_head_marks_it_dead() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn marking_dead_a_head_already_gone_from_the_store_reloads_the_key() {
+    let store = TestStore::default();
+    store.seed(b"k", 1, ParkStatus::Retrying).await;
+    store.seed(b"k", 2, ParkStatus::Retrying).await;
+    store.lose_status_changes.store(1, Ordering::SeqCst);
+    let script: Script = Box::new(|ordinal, _| {
+        if ordinal == 1 {
+            Outcome::Terminal(SinkError("rejected".to_owned()))
+        } else {
+            Outcome::Delivered
+        }
+    });
+    let harness = Harness::start(Setup::default(), ScriptedSink::new(LIMITS, script), store).await;
+    assert_eq!(harness.delivered(1).await, vec![2]);
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(harness.store.status_changes.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.store.queue(b"k").await, vec![]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn marking_dead_a_head_changed_in_the_store_reloads_it_as_stored() {
+    let store = TestStore::default();
+    store.seed(b"k", 1, ParkStatus::Retrying).await;
+    store.seed(b"k", 2, ParkStatus::Retrying).await;
+    store.conflict_status_changes.store(1, Ordering::SeqCst);
+    let script: Script = Box::new(|ordinal, _| {
+        if ordinal == 1 {
+            Outcome::Terminal(SinkError("rejected".to_owned()))
+        } else {
+            Outcome::Delivered
+        }
+    });
+    let mut harness =
+        Harness::start(Setup::default(), ScriptedSink::new(LIMITS, script), store).await;
+    assert!(harness.quiet_for(Duration::from_secs(600)).await);
+    assert_eq!(harness.store.status_changes.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.sink.batches(), vec![vec![1]]);
+    assert_eq!(harness.gauges().dead, 1);
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(1, ParkStatus::Dead), (2, ParkStatus::Retrying)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_store_outage_while_draining_resends_nothing_and_resumes() {
     let store = TestStore::default();
     store.seed(b"k", 1, ParkStatus::Retrying).await;

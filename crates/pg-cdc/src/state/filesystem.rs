@@ -1,10 +1,12 @@
 use std::collections::BinaryHeap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -20,7 +22,10 @@ use crate::event::EventId;
 use crate::order::OrderKeyId;
 
 pub const LEADER_LOCK: &str = "leader.lock";
+pub const PARKED_LOCK: &str = "parked.lock";
+const TEMP_ABANDONED_AFTER: Duration = Duration::from_hours(1);
 const CREATE_ATTEMPTS: usize = 3;
+const TEMP_PREFIX: &str = ".tmp-";
 
 type Cancelled<'a> = &'a dyn Fn() -> bool;
 type LeaderJob = Box<dyn FnOnce(&Path) + Send>;
@@ -78,9 +83,50 @@ impl LeaderWorker {
     }
 }
 
+fn nonempty(dir: &Path) -> &Path {
+    if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    }
+}
+
+#[derive(Debug, Default)]
+struct RootPath {
+    existing: OnceLock<PathBuf>,
+    durable: AtomicBool,
+}
+
+impl RootPath {
+    fn establish(&self, root: &Path) -> Result<(), StoreError> {
+        if self.durable.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let existing = self.existing.get_or_init(|| {
+            root.ancestors()
+                .map(nonempty)
+                .find(|dir| dir.is_dir())
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
+        fs::create_dir_all(root).map_err(|error| unavailable(root, &error))?;
+        if existing != root {
+            for dir in root.ancestors().skip(1).map(nonempty) {
+                sync_dir(dir)?;
+                if dir == existing {
+                    break;
+                }
+            }
+        }
+        self.durable.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemStateStore {
     root: PathBuf,
+    path: Arc<RootPath>,
     permits: Arc<Semaphore>,
     leader: Arc<LeaderWorker>,
 }
@@ -96,6 +142,7 @@ impl FilesystemStateStore {
     pub fn new(path: &Path, pipeline: &str, max_concurrency: usize) -> Self {
         Self {
             root: path.join(pipeline),
+            path: Arc::default(),
             permits: Arc::new(Semaphore::new(
                 max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
             )),
@@ -149,7 +196,8 @@ fn unavailable(path: &Path, error: &io::Error) -> StoreError {
 }
 
 fn sync_dir(dir: &Path) -> Result<(), StoreError> {
-    File::open(dir)
+    faults::before_sync(dir)
+        .and_then(|()| File::open(dir))
         .and_then(|handle| handle.sync_all())
         .map_err(|error| unavailable(dir, &error))
 }
@@ -160,13 +208,48 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         .create_new(true)
         .open(path)
         .map_err(|error| unavailable(path, &error))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| unavailable(path, &error))
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| faults::before_sync(path))
+        .and_then(|()| file.sync_all());
+    if let Err(error) = written {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(unavailable(path, &error));
+    }
+    Ok(())
 }
 
 fn temp_path(dir: &Path, name: &str) -> PathBuf {
-    dir.join(format!(".tmp-{name}-{:016x}", fastrand::u64(..)))
+    dir.join(format!("{TEMP_PREFIX}{name}-{:016x}", fastrand::u64(..)))
+}
+
+fn is_temp(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with(TEMP_PREFIX))
+}
+
+fn reclaim_if_abandoned(entry: &fs::DirEntry, cutoff: SystemTime) {
+    if !is_temp(&entry.file_name()) {
+        return;
+    }
+    let abandoned = entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified < cutoff);
+    if abandoned {
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
+fn reclaim_temps(dir: &Path) -> Result<(), StoreError> {
+    for entry in fs::read_dir(dir).map_err(|error| unavailable(dir, &error))? {
+        let entry = entry.map_err(|error| unavailable(dir, &error))?;
+        if is_temp(&entry.file_name()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 fn ensure_dir(root: &Path, dir: &Path) -> Result<(), StoreError> {
@@ -224,10 +307,11 @@ fn queue_entries(dir: &Path) -> Result<Option<fs::ReadDir>, StoreError> {
     }
 }
 
-fn each_event_id(
+fn scan(
     dir: &Path,
     cancelled: Cancelled<'_>,
     mut visit: impl FnMut(EventId),
+    mut stray: impl FnMut(&fs::DirEntry),
 ) -> Result<(), StoreError> {
     let Some(entries) = queue_entries(dir)? else {
         return Ok(());
@@ -235,16 +319,25 @@ fn each_event_id(
     for entry in entries {
         check(cancelled)?;
         let entry = entry.map_err(|error| unavailable(dir, &error))?;
-        if let Some(id) = entry
+        match entry
             .file_name()
             .to_str()
             .and_then(|name| name.strip_suffix(".json"))
             .and_then(|stem| stem.parse::<EventId>().ok())
         {
-            visit(id);
+            Some(id) => visit(id),
+            None => stray(&entry),
         }
     }
     Ok(())
+}
+
+fn each_event_id(
+    dir: &Path,
+    cancelled: Cancelled<'_>,
+    visit: impl FnMut(EventId),
+) -> Result<(), StoreError> {
+    scan(dir, cancelled, visit, |_| {})
 }
 
 fn keep_smallest<T: Ord>(kept: &mut BinaryHeap<T>, item: T, keep: usize) {
@@ -312,6 +405,9 @@ fn load_heads(
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(unavailable(&parked, &error)),
     };
+    let cutoff = SystemTime::now()
+        .checked_sub(TEMP_ABANDONED_AFTER)
+        .unwrap_or(UNIX_EPOCH);
     let mut heads = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| unavailable(&parked, &error))?;
@@ -325,11 +421,22 @@ fn load_heads(
         if order_key.partition() != partition {
             continue;
         }
-        if let Some((head, length)) = queue_head(&entry.path(), usize::MAX, cancelled)? {
+        let mut head: Option<EventId> = None;
+        let mut length = 0_u64;
+        scan(
+            &entry.path(),
+            cancelled,
+            |id| {
+                head = Some(head.map_or(id, |head| head.min(id)));
+                length = length.saturating_add(1);
+            },
+            |stray| reclaim_if_abandoned(stray, cutoff),
+        )?;
+        if let Some(head) = head {
             heads.push(ParkedHead {
                 order_key,
                 head,
-                length: u64::try_from(length).unwrap_or(u64::MAX),
+                length,
             });
         }
     }
@@ -487,6 +594,11 @@ fn set_status(
     let name = format!("{id}.json");
     let path = dir.join(&name);
     let object = super::parked_name(&key, &id);
+    let Some(lock) = parked_lock(root)? else {
+        return Err(StoreError::NotFound(object));
+    };
+    lock.lock()
+        .map_err(|error| unavailable(&root.join(PARKED_LOCK), &error))?;
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -496,7 +608,33 @@ fn set_status(
     };
     let mut event = decode_parked(&object, &bytes)?;
     event.status = status;
-    replace(&dir, &name, &encode_parked(&event)?)
+    let encoded = encode_parked(&event)?;
+    check(cancelled)?;
+    replace(&dir, &name, &encoded)
+}
+
+fn parked_lock(root: &Path) -> Result<Option<File>, StoreError> {
+    let path = root.join(PARKED_LOCK);
+    match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(unavailable(&path, &error)),
+    }
+}
+
+fn sync_absence(dir: &Path, parked: &Path) -> Result<(), StoreError> {
+    if dir.is_dir() {
+        sync_dir(dir)
+    } else if parked.is_dir() {
+        sync_dir(parked)
+    } else {
+        Ok(())
+    }
 }
 
 fn remove(
@@ -505,13 +643,20 @@ fn remove(
     cancelled: Cancelled<'_>,
 ) -> Result<(), StoreError> {
     let parked = root.join(PARKED_DIR);
+    let lock = parked_lock(root)?;
+    if let Some(lock) = &lock {
+        lock.lock_shared()
+            .map_err(|error| unavailable(&root.join(PARKED_LOCK), &error))?;
+    }
     for (key, id) in events {
         check(cancelled)?;
         let dir = key_dir(root, key);
         let path = dir.join(format!("{id}.json"));
         match fs::remove_file(&path) {
             Ok(()) => sync_dir(&dir)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                sync_absence(&dir, &parked)?;
+            }
             Err(error) => return Err(unavailable(&path, &error)),
         }
         if fs::remove_dir(&dir).is_ok() {
@@ -542,7 +687,6 @@ fn swap(
     next: LeaderRecord,
     expected: Option<&Version>,
 ) -> Result<SwapOutcome, StoreError> {
-    ensure_dir(root, root)?;
     let lock_path = root.join(LEADER_LOCK);
     let lock = OpenOptions::new()
         .create(true)
@@ -552,6 +696,7 @@ fn swap(
         .map_err(|error| unavailable(&lock_path, &error))?;
     lock.lock()
         .map_err(|error| unavailable(&lock_path, &error))?;
+    reclaim_temps(root)?;
     let current = read_leader_file(root)?.map(|file| file.version);
     let matches = match (current, expected) {
         (None, None) => true,
@@ -590,8 +735,13 @@ impl StateStore for FilesystemStateStore {
                 encode_parked(event)?,
             ));
         }
-        self.blocking(move |root, cancelled| append(root, &encoded, cancelled))
-            .await
+        let path = Arc::clone(&self.path);
+        self.blocking(move |root, cancelled| {
+            check(cancelled)?;
+            path.establish(root)?;
+            append(root, &encoded, cancelled)
+        })
+        .await
     }
 
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError> {
@@ -683,14 +833,73 @@ impl StateStore for FilesystemStateStore {
         expected: Option<&Version>,
     ) -> Result<SwapOutcome, StoreError> {
         let (next, expected) = (next.clone(), expected.cloned());
-        self.leader(move |root| swap(root, next, expected.as_ref()))
-            .await
+        let path = Arc::clone(&self.path);
+        self.leader(move |root| {
+            path.establish(root)?;
+            swap(root, next, expected.as_ref())
+        })
+        .await
+    }
+}
+
+#[cfg(not(test))]
+mod faults {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the test build, which injects fsync failures"
+    )]
+    pub(super) fn before_sync(_: &std::path::Path) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod faults {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    type Fault = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+
+    static FAULTS: Mutex<Vec<(PathBuf, Fault)>> = Mutex::new(Vec::new());
+
+    pub(super) fn before_sync(path: &Path) -> io::Result<()> {
+        let fault = FAULTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(scope, _)| path.starts_with(scope))
+            .map(|(_, fault)| Arc::clone(fault));
+        fault.map_or(Ok(()), |fault| fault(path))
+    }
+
+    pub(super) struct Injected(PathBuf);
+
+    impl Drop for Injected {
+        fn drop(&mut self) {
+            FAULTS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(scope, _)| *scope != self.0);
+        }
+    }
+
+    pub(super) fn inject(
+        scope: &Path,
+        fault: impl Fn(&Path) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Injected {
+        FAULTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((scope.to_path_buf(), Arc::new(fault)));
+        Injected(scope.to_path_buf())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -983,6 +1192,222 @@ mod tests {
         );
         let cancelled = load_heads(&root, queue.partition(), &cancelled_after(1));
         assert!(is_cancelled(&cancelled), "{cancelled:?}");
+    }
+
+    type Synced = Arc<Mutex<Vec<PathBuf>>>;
+
+    fn record_syncs(
+        scope: &Path,
+        fail: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    ) -> (faults::Injected, Synced) {
+        let synced = Synced::default();
+        let log = Arc::clone(&synced);
+        let injected = faults::inject(scope, move |path| {
+            log.lock().unwrap().push(path.to_path_buf());
+            if fail(path) {
+                Err(io::Error::other("injected fsync failure"))
+            } else {
+                Ok(())
+            }
+        });
+        (injected, synced)
+    }
+
+    fn fail_once(target: PathBuf) -> impl Fn(&Path) -> bool + Send + Sync + 'static {
+        let failed = AtomicBool::new(false);
+        move |path| path == target && !failed.swap(true, Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_store_path_with_missing_ancestors_is_synced_up_to_the_first_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let (_injected, synced) = record_syncs(base, |_| false);
+
+        let parking = base.join("new").join("deeper");
+        let store = FilesystemStateStore::new(&parking, "orders", 2);
+        store.append_parked(&[parked(key(1), 0)]).await.unwrap();
+        let seen = std::mem::take(&mut *synced.lock().unwrap());
+        for created_in in [base.to_path_buf(), base.join("new"), parking.clone()] {
+            assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
+        }
+
+        let leading = base.join("other").join("deeper");
+        let store = FilesystemStateStore::new(&leading, "orders", 2);
+        store.swap_leader(&record(), None).await.unwrap();
+        let seen = std::mem::take(&mut *synced.lock().unwrap());
+        for created_in in [base.to_path_buf(), base.join("other"), leading.clone()] {
+            assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ancestors_created_before_a_failed_sync_are_synced_by_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let (_injected, synced) = record_syncs(base, fail_once(base.join("new")));
+        let store = FilesystemStateStore::new(&base.join("new").join("deeper"), "orders", 2);
+
+        assert!(store.append_parked(&[parked(key(1), 0)]).await.is_err());
+        synced.lock().unwrap().clear();
+        store.append_parked(&[parked(key(1), 0)]).await.unwrap();
+        let seen = synced.lock().unwrap().clone();
+        for created_in in [base.to_path_buf(), base.join("new")] {
+            assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
+        }
+    }
+
+    #[test]
+    fn a_removal_retried_after_a_failed_directory_sync_syncs_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 2), &|| false).unwrap();
+        let queue_dir = key_dir(&root, &queue);
+        let (_injected, synced) = record_syncs(dir.path(), fail_once(queue_dir.clone()));
+
+        let removed = [(queue, event_id(0))];
+        assert!(remove(&root, &removed, &|| false).is_err());
+        assert_eq!(names(&queue_dir), vec![format!("{}.json", event_id(1))]);
+        synced.lock().unwrap().clear();
+        remove(&root, &removed, &|| false).unwrap();
+        assert_eq!(*synced.lock().unwrap(), vec![queue_dir]);
+    }
+
+    #[test]
+    fn a_removal_retried_after_its_emptied_directory_went_unsynced_syncs_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 1), &|| false).unwrap();
+        let parked_dir = root.join(PARKED_DIR);
+        let (_injected, synced) = record_syncs(dir.path(), fail_once(parked_dir.clone()));
+
+        let removed = [(queue, event_id(0))];
+        assert!(remove(&root, &removed, &|| false).is_err());
+        assert!(!key_dir(&root, &queue).exists());
+        synced.lock().unwrap().clear();
+        remove(&root, &removed, &|| false).unwrap();
+        assert_eq!(*synced.lock().unwrap(), vec![parked_dir]);
+    }
+
+    fn is_temp(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".tmp-"))
+    }
+
+    #[test]
+    fn failed_writes_leave_no_temp_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 1), &|| false).unwrap();
+        let (_injected, _) = record_syncs(dir.path(), is_temp);
+
+        for attempt in 1..=3 {
+            assert!(append(&root, &encoded(queue, 2)[1..], &|| false).is_err());
+            assert!(set_status(&root, queue, event_id(0), ParkStatus::Dead, &|| false).is_err());
+            assert_eq!(
+                names(&key_dir(&root, &queue)),
+                vec![format!("{}.json", event_id(0))],
+                "attempt {attempt}"
+            );
+        }
+        assert!(swap(&root, record(), None).is_err());
+        assert_eq!(
+            names(&root),
+            vec![
+                LEADER_LOCK.to_owned(),
+                PARKED_DIR.to_owned(),
+                PARKED_LOCK.to_owned()
+            ]
+        );
+    }
+
+    fn temp_file(dir: &Path, name: &str, age: Duration) -> PathBuf {
+        let path = dir.join(name);
+        let file = File::create(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn loading_heads_reclaims_only_temp_files_abandoned_long_ago() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 1), &|| false).unwrap();
+        let queue_dir = key_dir(&root, &queue);
+        let stale = temp_file(&queue_dir, ".tmp-x.json-1", Duration::from_hours(2));
+        let fresh = temp_file(&queue_dir, ".tmp-x.json-2", Duration::from_secs(60));
+        let other = key(2);
+        let only_temp = key_dir(&root, &other);
+        fs::create_dir_all(&only_temp).unwrap();
+        let orphan = temp_file(&only_temp, ".tmp-y.json-1", Duration::from_hours(2));
+
+        let heads = load_heads(&root, queue.partition(), &|| false).unwrap();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].length, 1);
+        assert!(!stale.exists());
+        assert!(!orphan.exists());
+        assert!(fresh.exists());
+        assert_eq!(names(&queue_dir).len(), 2);
+    }
+
+    #[test]
+    fn a_leader_swap_reclaims_temp_files_left_beside_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        fs::create_dir_all(&root).unwrap();
+        let leftover = temp_file(&root, &format!(".tmp-{LEADER_OBJECT}-1"), Duration::ZERO);
+        assert!(matches!(
+            swap(&root, record(), None),
+            Ok(SwapOutcome::Swapped(_))
+        ));
+        assert!(!leftover.exists());
+        assert_eq!(
+            names(&root),
+            vec![LEADER_OBJECT.to_owned(), LEADER_LOCK.to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_removal_racing_a_status_change_is_never_undone_by_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(dir.path().join("orders"));
+        let queue = key(1);
+        append(&root, &encoded(queue, 2), &|| false).unwrap();
+        let racing = Arc::new(Mutex::new(None));
+        let fired = AtomicBool::new(false);
+        let (_injected, _) = record_syncs(dir.path(), {
+            let (root, racing) = (Arc::clone(&root), Arc::clone(&racing));
+            move |path| {
+                if is_temp(path) && !fired.swap(true, Ordering::SeqCst) {
+                    let root = Arc::clone(&root);
+                    let removal =
+                        thread::spawn(move || remove(&root, &[(queue, event_id(0))], &|| false));
+                    for _ in 0..50 {
+                        if removal.is_finished() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(4));
+                    }
+                    *racing.lock().unwrap() = Some(removal);
+                }
+                false
+            }
+        });
+
+        let changed = set_status(&root, queue, event_id(0), ParkStatus::Dead, &|| false);
+        let removal = racing.lock().unwrap().take().unwrap();
+        removal.join().unwrap().unwrap();
+        assert!(changed.is_ok(), "{changed:?}");
+        assert_eq!(
+            names(&key_dir(&root, &queue)),
+            vec![format!("{}.json", event_id(1))]
+        );
     }
 
     #[test]
