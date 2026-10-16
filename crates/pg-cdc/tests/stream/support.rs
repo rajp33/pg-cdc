@@ -8,7 +8,7 @@ use pg_cdc::config::{
     DEFAULT_DRAIN_TIMEOUT, DEFAULT_MAX_INFLIGHT_BYTES, DEFAULT_MAX_PARKED_EVENTS,
     DEFAULT_PARK_AFTER, LeadershipConfig, TlsMode,
 };
-use pg_cdc::connection::{ConnectParams, PasswordProvider, TlsConfig};
+use pg_cdc::connection::{ConnectParams, ConnectionProvider, PasswordProvider, TlsConfig};
 use pg_cdc::event::EventId;
 use pg_cdc::health::Health;
 use pg_cdc::lane::Stores;
@@ -519,6 +519,22 @@ pub(crate) fn spawn_in_context(
     limits: SinkCapabilities,
     context: SessionContext,
 ) -> Running {
+    spawn_provided(
+        Arc::new(PasswordProvider::new(params)),
+        config,
+        stores,
+        limits,
+        context,
+    )
+}
+
+pub(crate) fn spawn_provided(
+    provider: Arc<dyn ConnectionProvider>,
+    config: SessionConfig,
+    stores: Stores,
+    limits: SinkCapabilities,
+    context: SessionContext,
+) -> Running {
     let (mode, mode_receiver) = watch::channel(Mode::Deliver);
     let (failures_sender, failures) = watch::channel(0);
     let (delivered, events) = mpsc::unbounded_channel();
@@ -533,7 +549,7 @@ pub(crate) fn spawn_in_context(
     let shutdown = CancellationToken::new();
     let health = context.health.clone();
     let status = context.status.clone();
-    let task = spawn_run(params, config, sink, stores, context, shutdown.clone());
+    let task = spawn_run(provider, config, sink, stores, context, shutdown.clone());
     Running {
         shutdown,
         task,
@@ -547,7 +563,7 @@ pub(crate) fn spawn_in_context(
 }
 
 fn spawn_run(
-    params: ConnectParams,
+    provider: Arc<dyn ConnectionProvider>,
     config: SessionConfig,
     sink: Arc<dyn Sink>,
     stores: Stores,
@@ -555,8 +571,15 @@ fn spawn_run(
     shutdown: CancellationToken,
 ) -> JoinHandle<Result<(), SessionError>> {
     tokio::spawn(async move {
-        let provider = PasswordProvider::new(params);
-        run_session(&config, &provider, &sink, &stores, &context, &shutdown).await
+        run_session(
+            &config,
+            provider.as_ref(),
+            &sink,
+            &stores,
+            &context,
+            &shutdown,
+        )
+        .await
     })
 }
 
@@ -672,7 +695,7 @@ pub(crate) fn spawn_stdout_session(
     let shutdown = CancellationToken::new();
     let sink: Arc<dyn Sink> = Arc::new(StdoutSink::new(writer));
     let task = spawn_run(
-        params,
+        Arc::new(PasswordProvider::new(params)),
         config(status_interval, 64),
         sink,
         memory_stores(),

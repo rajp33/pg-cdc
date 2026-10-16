@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use pg_cdc::config::{DEFAULT_MAX_PARKED_EVENTS, LeadershipConfig};
-use pg_cdc::connection::ConnectParams;
+use pg_cdc::connection::{ConnectError, ConnectParams, ConnectionProvider};
 use pg_cdc::health::{Health, Role};
 use pg_cdc::leader::POLL_INTERVAL;
 use pg_cdc::leader::lease::FenceReason;
@@ -994,6 +996,78 @@ async fn a_validation_query_that_never_answers_ends_the_attempt() -> TestResult 
     assert!(result.is_err_and(|error| !error.is_fatal()));
     assert!(!health.snapshot().validated);
     Ok(())
+}
+
+struct RotatingTokens {
+    pg: Arc<Postgres>,
+    issued: AtomicUsize,
+}
+
+impl RotatingTokens {
+    fn issued(&self) -> usize {
+        self.issued.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ConnectionProvider for RotatingTokens {
+    async fn params(&self) -> Result<ConnectParams, ConnectError> {
+        let token = format!("token-{}", self.issued.fetch_add(1, Ordering::SeqCst) + 1);
+        self.pg
+            .execute(&format!("ALTER ROLE rotating PASSWORD '{token}'"))
+            .await
+            .map_err(|error| ConnectError::Token(error.to_string()))?;
+        Ok(ConnectParams {
+            user: "rotating".to_owned(),
+            password: Some(SecretString::from(token)),
+            ..support::params(&self.pg)
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_standby_takes_over_with_credentials_issued_for_that_connection() -> TestResult {
+    let pg = Arc::new(Postgres::start().await?);
+    orders(&pg).await?;
+    pg.execute("CREATE ROLE rotating LOGIN SUPERUSER REPLICATION")
+        .await?;
+    let shared = memory();
+    let mut a = support::spawn_in_context(
+        support::params(&pg),
+        support::config(FAST, BUFFER),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-a"),
+    );
+    pg.execute("INSERT INTO orders VALUES (1, 'a')").await?;
+    a.next_event().await?;
+
+    let tokens = Arc::new(RotatingTokens {
+        pg: Arc::clone(&pg),
+        issued: AtomicUsize::new(0),
+    });
+    let mut b = support::spawn_provided(
+        Arc::clone(&tokens) as Arc<dyn ConnectionProvider>,
+        support::config(FAST, BUFFER),
+        RecordingStore::over(Arc::clone(&shared)).stores(),
+        LIMITS,
+        support::context_for("holder-b"),
+    );
+    let health = b.health();
+    standby_ready(&health).await?;
+    let issued_before_takeover = tokens.issued();
+    pg.execute("ALTER ROLE rotating PASSWORD 'expired'").await?;
+
+    a.stop().await?;
+    pg.execute("INSERT INTO orders VALUES (2, 'b')").await?;
+    active(&health, WAIT).await?;
+    loop {
+        if row(&b.next_event().await?) == 2 {
+            break;
+        }
+    }
+    assert!(tokens.issued() > issued_before_takeover);
+    b.stop().await
 }
 
 #[tokio::test]

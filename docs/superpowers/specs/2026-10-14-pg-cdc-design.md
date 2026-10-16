@@ -560,7 +560,7 @@ pub struct ConnectParams {
 }
 ```
 
-- **Called before every connection attempt,** replication and control alike. The core knows nothing about IAM or Aurora.
+- **Called before every connection attempt,** replication and control alike. That includes the replication login check and every `START_REPLICATION` attempt a standby makes once the slot frees, so a standby that has waited longer than a token's lifetime still presents a fresh one. The core knows nothing about IAM or Aurora.
 - **Failover handling is generic.** A dropped connection backs off (1 s to 30 s, full jitter), calls `params()` again, re-resolves DNS and reconnects.
 - **v1 providers:**
   - `password`: static, with the password taken from the environment only;

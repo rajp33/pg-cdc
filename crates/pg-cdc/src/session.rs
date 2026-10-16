@@ -230,11 +230,11 @@ async fn attempt(
     else {
         return Ok(());
     };
-    let (params, control) = prepared?;
+    let control = prepared?;
     let stores = instrumented(stores);
     context.health.set_role(Role::Standby);
     let poller = spawn_slot_poller(&control, &config.slot, &context.status);
-    let result = serve(config, sink, &stores, context, shutdown, &params, &control).await;
+    let result = serve(config, provider, sink, &stores, context, shutdown, &control).await;
     poller.abort();
     let _ = poller.await;
     result
@@ -242,11 +242,11 @@ async fn attempt(
 
 async fn serve(
     config: &SessionConfig,
+    provider: &dyn ConnectionProvider,
     sink: &Arc<dyn Sink>,
     stores: &Stores,
     context: &SessionContext,
     shutdown: &CancellationToken,
-    params: &ConnectParams,
     control: &Arc<ControlConnection>,
 ) -> Result<(), SessionError> {
     let probe = Arc::new(ControlProbe {
@@ -254,7 +254,7 @@ async fn serve(
         slot: config.slot.clone(),
     });
     let Some((stream, start, acquired)) =
-        acquire_slot(probe.as_ref(), control, params, config, context, shutdown).await?
+        acquire_slot(probe.as_ref(), control, provider, config, context, shutdown).await?
     else {
         return Ok(());
     };
@@ -468,26 +468,25 @@ async fn prepare(
     config: &SessionConfig,
     health: &Health,
     status: &Status,
-) -> Result<(ConnectParams, Arc<ControlConnection>), SessionError> {
-    let params = provider.params().await?;
-    let control = Arc::new(connect_control(&params).await?);
+) -> Result<Arc<ControlConnection>, SessionError> {
+    let control = Arc::new(connect_control(&provider.params().await?).await?);
     timeout(
         CONTROL_QUERY_TIMEOUT,
         check_source(&control, config, health, status),
     )
     .await
     .map_err(|_| SessionError::ControlStalled(CONTROL_QUERY_TIMEOUT))??;
-    check_login(&params, config, health).await?;
+    check_login(provider, config, health).await?;
     health.set_validated(true);
-    Ok((params, control))
+    Ok(control)
 }
 
 async fn check_login(
-    params: &ConnectParams,
+    provider: &dyn ConnectionProvider,
     config: &SessionConfig,
     health: &Health,
 ) -> Result<(), SessionError> {
-    let replication = replication_config(params, config, Lsn(0)).await?;
+    let replication = replication_config(&provider.params().await?, config, Lsn(0)).await?;
     let Err(error) = verify_login(&replication).await else {
         return Ok(());
     };
@@ -544,7 +543,7 @@ async fn check_source(
 async fn acquire_slot(
     probe: &ControlProbe,
     control: &ControlConnection,
-    params: &ConnectParams,
+    provider: &dyn ConnectionProvider,
     config: &SessionConfig,
     context: &SessionContext,
     shutdown: &CancellationToken,
@@ -558,7 +557,11 @@ async fn acquire_slot(
         .map_err(|_| StartError::Failed(SessionError::ControlStalled(CONTROL_QUERY_TIMEOUT)))?
         .map_err(|error| StartError::Failed(error.into()))?
         .ok_or_else(|| StartError::Failed(Invalid::SlotMissing(config.slot.clone()).into()))?;
-        let replication = replication_config(params, config, start)
+        let params = provider
+            .params()
+            .await
+            .map_err(|error| StartError::Failed(error.into()))?;
+        let replication = replication_config(&params, config, start)
             .await
             .map_err(|error| StartError::Failed(error.into()))?;
         let acquired = Instant::now();
