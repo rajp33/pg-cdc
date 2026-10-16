@@ -215,7 +215,7 @@ Moto still bounds what these runs show:
 
 Against real S3 at 20 to 50 ms a request, 256 permits and about 1.1 requests per drained event allow roughly 4,000 to 10,000 events a second, or less while new events of parked keys still need PUTs; this is unmeasured until the pre-production run (runbook section 7).
 
-Nothing is lost while a backlog drains, and keys without a parked queue keep flowing. But after an outage that parked every key, every key's new events queue behind its backlog, so delivery lags by the drain time; alert on `pgcdc.parked.oldest_age`.
+Nothing is lost while a backlog drains, and keys without a parked queue keep flowing as long as the store answers promptly: a lane sends nothing while it waits on a store call. But after an outage that parked every key, every key's new events queue behind its backlog, so delivery lags by the drain time; alert on `pgcdc.parked.oldest_age`.
 
 The outage scenarios stop `--drain-limit` after the writer stops (default 90 s), or earlier once no key is parked and lag is under 16 MiB. They report what is still parked, the rate at which the parked count fell over that window (from the once-a-second `/status` samples), the parked events removed per second (`parked_removed`: the parked objects the S3 proxy saw the upstream confirm deleted, each counted once; since `5d3df67`, so the delete figures above, measured before it, count requests instead) and the time the rest would take at the falling rate. The report's `drain.complete` is true only when the last sample was caught up, and the summary row reads "drain complete" or "drain incomplete at the N s limit".
 

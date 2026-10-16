@@ -300,7 +300,7 @@ When the encoded message (body plus attributes) exceeds the sink's `max_message_
 - **Lanes own their keys.** A lane holds the per-key queues, retry timers, parked state and batching for its order keys, so per-key state needs no locks.
 - **One event per key in flight.** At most one event per order key is in flight, and a batch holds at most one event per order key.
 - **Batching.** Batches are filled from ready keys up to the sink's message and byte limits, lingering up to 5 ms when not full.
-- **Retries don't block the lane.** A key whose head is waiting on a retry is not ready, and the lane's other keys keep flowing.
+- **Retries don't block the lane.** A key whose head is waiting on a retry is not ready, and the lane's other keys keep flowing. Store calls do block it: parking, head loading, removals and admin operations run inside the lane, so the lane sends nothing while it waits on the store (a v1 limit).
 - **Per-key throughput.** One key moves at most one event per sink round trip, roughly 20–50 events/s for SNS. `order_by: pipeline` therefore trades throughput for total order.
 
 ## 9. Delivery and acknowledgement
