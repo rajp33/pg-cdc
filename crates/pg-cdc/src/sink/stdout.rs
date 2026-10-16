@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdout_accepts_messages_of_any_size_after_a_trivial_preflight() {
+    async fn stdout_preflight_passes_and_reports_an_unbounded_message_limit() {
         let sink = StdoutSink::new(tokio::io::sink());
         sink.preflight().await.unwrap();
         assert_eq!(sink.capabilities(), STDOUT_CAPABILITIES);

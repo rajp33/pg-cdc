@@ -1149,7 +1149,7 @@ async fn reply_time_ms(pg: &Postgres) -> TestResult<i64> {
 }
 
 #[tokio::test]
-async fn l1_a_closed_gate_reads_within_the_inflight_bound_and_confirms_nothing() -> TestResult {
+async fn l1_a_closed_gate_reads_within_the_inflight_bound_and_confirms_no_commit() -> TestResult {
     const ROWS: i64 = 30_000;
     let pg = Postgres::start().await?;
     orders(&pg).await?;
