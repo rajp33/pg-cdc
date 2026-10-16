@@ -223,6 +223,7 @@ struct Key {
     stored: Option<Stored>,
     offloaded: Option<Outbound>,
     reserved: u64,
+    counted: u64,
 }
 
 impl Key {
@@ -234,6 +235,7 @@ impl Key {
             stored: None,
             offloaded: None,
             reserved: 0,
+            counted: 0,
         }
     }
 }

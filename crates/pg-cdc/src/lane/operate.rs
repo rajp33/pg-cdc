@@ -208,6 +208,7 @@ impl Lane {
                 Some(parked.saturating_sub(1))
             });
         if let Some(state) = self.keys.get_mut(&key) {
+            state.counted = state.counted.saturating_sub(1);
             state.failure = None;
             state.backoff.reset();
             if let Some(stored) = state.stored.as_mut() {

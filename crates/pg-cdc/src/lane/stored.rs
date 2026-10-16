@@ -24,6 +24,7 @@ impl Lane {
     pub(super) fn accept_head(&mut self, head: ParkedHead) {
         let key = head.order_key;
         let state = self.keys.entry(key).or_insert_with(Key::new);
+        state.counted = state.counted.saturating_add(head.length);
         state.stored = Some(Stored {
             floor: Some(head.head),
             current: Some(head.head),
@@ -45,6 +46,7 @@ impl Lane {
         }
         let freed = dropped.min(state.reserved);
         state.reserved -= freed;
+        state.counted = state.counted.saturating_sub(freed);
         if !state.queue.is_empty() {
             self.to_append.insert(key);
         }
@@ -237,9 +239,11 @@ impl Lane {
         };
         let wanted = u64::try_from(state.queue.len()).unwrap_or(u64::MAX);
         let held = state.reserved.min(wanted);
-        let allowed = held.saturating_add(self.reserve(wanted - held));
+        let granted = self.reserve(wanted - held);
+        let allowed = held.saturating_add(granted);
         if let Some(state) = self.keys.get_mut(&key) {
             state.reserved = allowed;
+            state.counted = state.counted.saturating_add(granted);
         }
         (wanted, allowed)
     }
@@ -393,7 +397,8 @@ impl Lane {
         };
         self.stats_dirty = true;
         let Some(head) = head else {
-            let reserved = std::mem::take(&mut state.reserved);
+            state.reserved = 0;
+            let counted = std::mem::take(&mut state.counted);
             state.stored = None;
             state.backoff.reset();
             state.failure = None;
@@ -403,7 +408,7 @@ impl Lane {
             } else {
                 self.make_ready(key);
             }
-            self.release(reserved);
+            self.release(counted);
             return;
         };
         stored.floor = Some(head.id);
@@ -487,11 +492,11 @@ impl Lane {
                 Some(parked.saturating_sub(removed))
             });
         for (key, id) in removals {
-            if let Some(stored) = self
-                .keys
-                .get_mut(&key)
-                .and_then(|state| state.stored.as_mut())
-            {
+            let Some(state) = self.keys.get_mut(&key) else {
+                continue;
+            };
+            state.counted = state.counted.saturating_sub(1);
+            if let Some(stored) = state.stored.as_mut() {
                 stored.floor = Some(id);
                 stored.current = None;
                 stored.since_ms = None;
