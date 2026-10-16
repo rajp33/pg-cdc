@@ -425,6 +425,25 @@ async fn release_by(state: &dyn StateStore, claim: &Claim, confirmed_lsn: Lsn, d
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneStop {
+    Exited,
+    Aborted,
+    Unfinished,
+}
+
+async fn stop_lanes_by(stop: impl Future<Output = bool>, deadline: Instant) -> LaneStop {
+    match timeout_at(deadline, stop).await {
+        Ok(true) => LaneStop::Exited,
+        Ok(false) => LaneStop::Aborted,
+        Err(_) => LaneStop::Unfinished,
+    }
+}
+
+fn keeps_record_active(lanes: LaneStop, fenced_by_lease: bool, abandoned_writes: u64) -> bool {
+    fenced_by_lease || abandoned_writes > 0 || lanes == LaneStop::Unfinished
+}
+
 async fn finished_claim(
     pending: PendingClaim,
 ) -> Option<Result<Result<Claim, TakeoverError>, JoinError>> {
@@ -728,18 +747,16 @@ impl Session<'_> {
         } else {
             Duration::ZERO
         };
-        let clean = timeout_at(deadline, self.lanes.stop(grace))
-            .await
-            .unwrap_or(false);
+        let lanes = stop_lanes_by(self.lanes.stop(grace), deadline).await;
         let fenced_by_lease = lease.is_finished();
         drop(lease);
         self.leadership.gate.fence();
         if let Some(claim) = claim {
             let abandoned_writes = self.leadership.gate.abandoned_writes();
-            if fenced_by_lease || abandoned_writes > 0 {
+            if keeps_record_active(lanes, fenced_by_lease, abandoned_writes) {
                 tracing::warn!(
                     abandoned_writes,
-                    clean,
+                    ?lanes,
                     fenced_by_lease,
                     "leaving the leader record active; the next holder waits fence_delay"
                 );
@@ -1119,6 +1136,27 @@ mod tests {
     async fn a_claim_still_waiting_out_the_fence_is_not_adopted() {
         let pending = AbortOnDropHandle::new(tokio::spawn(std::future::pending()));
         assert!(finished_claim(pending).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lanes_that_outlive_the_handover_tail_leave_the_record_active() {
+        let deadline = Instant::now() + HANDOVER_TAIL;
+        let lanes = stop_lanes_by(std::future::pending(), deadline).await;
+        assert_eq!(lanes, LaneStop::Unfinished);
+        assert_eq!(Instant::now(), deadline);
+        assert!(keeps_record_active(lanes, false, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lanes_that_stop_in_time_release_the_record_unless_a_write_was_abandoned() {
+        let deadline = Instant::now() + HANDOVER_TAIL;
+        let exited = stop_lanes_by(async { true }, deadline).await;
+        let aborted = stop_lanes_by(async { false }, deadline).await;
+        assert_eq!((exited, aborted), (LaneStop::Exited, LaneStop::Aborted));
+        assert!(!keeps_record_active(exited, false, 0));
+        assert!(!keeps_record_active(aborted, false, 0));
+        assert!(keeps_record_active(aborted, false, 1));
+        assert!(keeps_record_active(exited, true, 0));
     }
 
     #[test]
