@@ -236,3 +236,16 @@ async fn an_oversized_parked_head_blocks_only_its_own_key() {
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert_eq!(harness.sink.sends().len(), 8);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_read_task_that_panics_backs_off_before_the_next_read() {
+    fastrand::seed(1);
+    let store = TestStore::default();
+    store.seed(b"k", 1, ParkStatus::Retrying).await;
+    store.panic_reads.store(3, Ordering::SeqCst);
+    let harness = Harness::start(Setup::default(), ScriptedSink::delivering(), store).await;
+    assert_eq!(harness.delivered(1).await, vec![1]);
+    let reads = harness.store.reads_at.lock().unwrap().clone();
+    assert!(reads.len() >= 4, "{reads:?}");
+    assert!(reads[3] > reads[0], "the read retried at once: {reads:?}");
+}

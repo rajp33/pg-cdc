@@ -155,6 +155,8 @@ struct TestStore {
     failing_keys: Mutex<HashSet<OrderKeyId>>,
     append_calls: Mutex<Vec<Vec<OrderKeyId>>>,
     fail_reads: AtomicU32,
+    panic_reads: AtomicU32,
+    reads_at: Mutex<Vec<Instant>>,
     fail_removes: AtomicU32,
     fail_status_changes: AtomicU32,
     status_changes: AtomicUsize,
@@ -289,6 +291,8 @@ impl StateStore for TestStore {
         after: Option<&EventId>,
         limit: usize,
     ) -> Result<Vec<ParkedEvent>, StoreError> {
+        self.reads_at.lock().unwrap().push(Instant::now());
+        assert!(!take_failure(&self.panic_reads), "injected read panic");
         if take_failure(&self.fail_reads) {
             return Err(outage());
         }

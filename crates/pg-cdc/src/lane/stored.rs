@@ -270,8 +270,12 @@ impl Lane {
         let mut answered = HashSet::new();
         let mut failure = None;
         while let Some(joined) = self.publishing(reads.join_next()).await {
-            let Ok((key, read)) = joined else {
-                continue;
+            let (key, read) = match joined {
+                Ok(answer) => answer,
+                Err(error) => {
+                    failure = Some(StoreError::Unavailable(error.to_string()));
+                    continue;
+                }
             };
             answered.insert(key);
             match read {
