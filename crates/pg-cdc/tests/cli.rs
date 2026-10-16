@@ -323,7 +323,8 @@ async fn s1_missing_slot_is_never_created() -> TestResult {
     prepare(&pg, false).await?;
     let config = write_config(&pg, "missing_slot", "200ms")?;
     let mut child = spawn(config.path(), pg.password(), Stdio::piped())?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut stderr = BufReader::new(child.stderr.take().ok_or("no stderr")?).lines();
+    wait_for_line(&mut stderr, "replication slot missing_slot does not exist").await?;
     assert!(
         pg.slot_state("missing_slot").await?.is_none(),
         "pg-cdc created a slot"
@@ -333,12 +334,7 @@ async fn s1_missing_slot_is_never_created() -> TestResult {
         "pg-cdc must keep retrying, not exit"
     );
     child.start_kill()?;
-    let output = child.wait_with_output().await?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("replication slot missing_slot does not exist"),
-        "{stderr}"
-    );
+    child.wait().await?;
     Ok(())
 }
 
