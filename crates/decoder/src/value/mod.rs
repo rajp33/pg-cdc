@@ -290,12 +290,18 @@ mod tests {
 
     #[test]
     fn json_objects_named_like_serde_json_internals_keep_their_shape() {
+        use std::fmt::Write;
+
         let number_key = "$serde_json::private::Number";
         let raw_key = "$serde_json::private::RawValue";
         for key in [number_key, raw_key] {
+            let escaped = key.chars().fold(String::new(), |mut out, c| {
+                write!(out, "\\u{:04x}", u32::from(c)).unwrap();
+                out
+            });
+            assert!(!escaped.contains('$') && !escaped.contains("serde"));
             let text = format!(
-                r#"{{"top": {{"{key}": "123"}}, "list": [{{"{key}": "[1]"}}, {{"{key}": "1.50"}}], "escaped": {{"${}": "7"}}}}"#,
-                &key[1..]
+                r#"{{"top": {{"{key}": "123"}}, "list": [{{"{key}": "[1]"}}, {{"{key}": "1.50"}}], "escaped": {{"{escaped}": "7"}}}}"#
             );
             let value = mapped(&TypeKind::Json, &text);
             let single = |text: &str| {
@@ -312,6 +318,10 @@ mod tests {
             assert_eq!(value["escaped"], single("7"), "{text}");
             assert_eq!(
                 mapped(&TypeKind::Json, &format!(r#"{{"{key}": "123"}}"#)),
+                single("123")
+            );
+            assert_eq!(
+                mapped(&TypeKind::Json, &format!(r#"{{"{escaped}": "123"}}"#)),
                 single("123")
             );
             assert_eq!(
@@ -379,6 +389,41 @@ mod tests {
             let result = map_value(&array_of(element), &text);
             assert!(result.fallback);
             assert!(result.value.to_string().len() < 4 * MAX_NUMBER_EXPANSION);
+        }
+    }
+
+    #[test]
+    fn malformed_surrogate_escapes_fall_back_to_text() {
+        for text in [
+            r#""\ud83d""#,
+            r#""\udc18""#,
+            r#""\ud83d\u0041""#,
+            r#""\ud83d\ud83d""#,
+            r#""\ud83dx""#,
+            r#"{"\ud83d": 1}"#,
+        ] {
+            assert_eq!(parse_json(text), None, "{text}");
+            let result = map_value(&TypeKind::Json, text);
+            assert!(result.fallback, "{text}");
+            assert_eq!(result.value, Value::String(text.to_owned()));
+        }
+    }
+
+    #[test]
+    fn json_nesting_is_accepted_up_to_128_levels() {
+        let nested = |depth: usize, open: &str, close: &str| {
+            format!("{}0{}", open.repeat(depth), close.repeat(depth))
+        };
+        for (open, close) in [("[", "]"), (r#"{"k":"#, "}")] {
+            let deepest = nested(128, open, close);
+            let result = map_value(&TypeKind::Json, &deepest);
+            assert!(!result.fallback, "{open}");
+            assert_eq!(result.value.to_string(), deepest.replace(' ', ""));
+            let too_deep = nested(129, open, close);
+            assert_eq!(parse_json(&too_deep), None, "{open}");
+            let result = map_value(&TypeKind::Json, &too_deep);
+            assert!(result.fallback, "{open}");
+            assert_eq!(result.value, Value::String(too_deep));
         }
     }
 
