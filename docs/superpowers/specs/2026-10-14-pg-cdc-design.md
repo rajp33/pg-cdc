@@ -159,6 +159,7 @@ admin HTTP: /healthz /readyz /status /parked
   - `bytea_output=hex`.
 
   This makes value text deterministic and the same as a default `to_jsonb` session.
+- **UTF-8 on the wire.** The replication startup packet also sends `client_encoding=UTF8`, which overrides any role or database default, and the connection fails unless the server's `ParameterStatus` reports `UTF8`. pgoutput converts tuple text and identifiers to the client encoding, and both are decoded strictly as UTF-8.
 - **Control connection.** A regular `tokio-postgres` connection over rustls carries catalog lookups, lease checks, slot metrics and standby polling. Metadata never goes over the replication connection, because some Aurora versions reject `SHOW` there.
 - **Parameters.** Both connections take their parameters from the ConnectionProvider before every attempt (§11.7).
 - **Direct connections only.** Both connect directly to the database endpoint: RDS Proxy rejects replication connections, and poolers cannot mint IAM tokens.

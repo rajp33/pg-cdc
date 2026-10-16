@@ -163,8 +163,16 @@ impl FakeServer {
     }
 
     pub(crate) async fn ready(&mut self, pid: i32) {
+        self.ready_reporting(pid, Some("UTF8")).await;
+    }
+
+    pub(crate) async fn ready_reporting(&mut self, pid: i32, client_encoding: Option<&str>) {
         self.auth(0, b"").await;
         self.send(b'S', b"server_version\x0018.0\0").await;
+        if let Some(encoding) = client_encoding {
+            self.send(b'S', format!("client_encoding\0{encoding}\0").as_bytes())
+                .await;
+        }
         self.send(b'N', b"SWARNING\0C01000\0Mhello\0\0").await;
         let mut key = pid.to_be_bytes().to_vec();
         key.extend_from_slice(&7_i32.to_be_bytes());

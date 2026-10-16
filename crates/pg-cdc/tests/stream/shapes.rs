@@ -193,6 +193,30 @@ async fn quoted_identifiers_stream_with_exact_names() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_latin1_role_default_still_streams_utf8() -> TestResult {
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &[
+            "ALTER ROLE postgres SET client_encoding = 'LATIN1'",
+            r#"CREATE TABLE "crème" (id int PRIMARY KEY, "brûlée" text)"#,
+        ],
+        &[r#""crème""#],
+    )
+    .await?;
+    let mut session = support::spawn_session(support::params(&pg), FAST, BUFFER);
+    pg.execute(r#"INSERT INTO "crème" VALUES (1, 'déjà vu, señor')"#)
+        .await?;
+    let insert = session.next_event().await?;
+    assert_eq!(insert["table"], "crème");
+    assert_eq!(
+        insert["after"],
+        json!({"id": 1, "brûlée": "déjà vu, señor"})
+    );
+    session.stop().await
+}
+
+#[tokio::test]
 async fn o2_large_transaction_streams_in_stream_order() -> TestResult {
     const ROWS: i64 = 20_000;
     let pg = Postgres::start().await?;

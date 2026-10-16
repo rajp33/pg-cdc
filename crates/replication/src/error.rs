@@ -20,6 +20,11 @@ pub enum ReplicationError {
     Scram(std::io::Error),
     #[error("server error {sqlstate}: {message}")]
     Server { sqlstate: String, message: String },
+    #[error(
+        "the server reports client_encoding {}, not UTF8",
+        .0.as_deref().unwrap_or("unset")
+    )]
+    ClientEncoding(Option<String>),
     #[error("protocol violation: {0}")]
     Protocol(String),
     #[error("the server closed the replication connection")]

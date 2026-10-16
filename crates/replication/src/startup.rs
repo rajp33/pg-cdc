@@ -23,6 +23,7 @@ pub(crate) struct Conn {
     pub(crate) io: Box<dyn Io>,
     pub(crate) read: BytesMut,
     pub(crate) write: BytesMut,
+    client_encoding: Option<String>,
 }
 
 impl Conn {
@@ -31,6 +32,7 @@ impl Conn {
             io,
             read: BytesMut::with_capacity(8192),
             write: BytesMut::with_capacity(1024),
+            client_encoding: None,
         }
     }
 
@@ -47,9 +49,13 @@ impl Conn {
                 Some(Backend::Message(Message::ErrorResponse(body))) => {
                     return Err(server_error(&body));
                 }
-                Some(Backend::Message(
-                    Message::NoticeResponse(_) | Message::ParameterStatus(_),
-                )) => {}
+                Some(Backend::Message(Message::ParameterStatus(body))) => {
+                    let malformed = |error: std::io::Error| protocol(&error.to_string());
+                    if body.name().map_err(malformed)? == "client_encoding" {
+                        self.client_encoding = Some(body.value().map_err(malformed)?.to_owned());
+                    }
+                }
+                Some(Backend::Message(Message::NoticeResponse(_))) => {}
                 other => return Ok(other),
             }
         }
@@ -137,12 +143,17 @@ async fn login(conn: &mut Conn, config: &ReplicationConfig) -> Result<u32, Repli
             ("replication", "database"),
             ("application_name", config.application_name.as_str()),
             ("options", config.options.as_str()),
+            ("client_encoding", "UTF8"),
         ],
         &mut conn.write,
     )?;
     conn.flush().await?;
     authenticate(conn, config).await?;
-    wait_until_ready(conn).await
+    let backend_pid = wait_until_ready(conn).await?;
+    match conn.client_encoding.as_deref() {
+        Some("UTF8") => Ok(backend_pid),
+        other => Err(ReplicationError::ClientEncoding(other.map(str::to_owned))),
+    }
 }
 
 async fn authenticate(conn: &mut Conn, config: &ReplicationConfig) -> Result<(), ReplicationError> {
@@ -258,6 +269,7 @@ mod tests {
                 ("replication", "database"),
                 ("application_name", "pg-cdc-test"),
                 ("options", "-c TimeZone=UTC"),
+                ("client_encoding", "UTF8"),
             ])
         );
         server.ready(4242).await;
@@ -432,6 +444,21 @@ mod tests {
         let terminate = server.read().await;
         assert_eq!((terminate.tag, terminate.body.len()), (b'X', 0));
         check.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_report_utf8_is_refused_before_replication_starts() {
+        for reported in [Some("LATIN1"), None] {
+            let (start, mut server) = fake::spawn_start(fake::config());
+            server.read_startup().await;
+            server.ready_reporting(4242, reported).await;
+            let error = start.await.unwrap().unwrap_err();
+            assert!(
+                matches!(&error, ReplicationError::ClientEncoding(found) if found.as_deref() == reported),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("UTF8"), "{error}");
+        }
     }
 
     #[tokio::test]
