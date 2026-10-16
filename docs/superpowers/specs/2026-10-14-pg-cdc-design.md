@@ -313,6 +313,7 @@ When the encoded message (body plus attributes) exceeds the sink's `max_message_
 ### 9.2 Confirmed LSN
 
 - **The ack tracker** keeps transactions in commit order, each with a count of unsettled events.
+- **Settled runs collapse.** Consecutive settled transactions behind an unsettled one merge into one entry that keeps only the last end LSN, so the tracker holds at most about two entries per unsettled transaction, however many later transactions settle.
 - **The confirmed LSN** is the end LSN of the last transaction in the unbroken run of settled transactions at the front of that list.
 - **Starting value.** When streaming starts, the confirmed LSN starts at the slot's `confirmed_flush_lsn`, so pg-cdc never reports a lower position.
 - **When idle,** with no unsettled events and no open transaction, the confirmed LSN advances to the latest keepalive `wal_end`. This keeps the slot moving while the publication is quiet.
