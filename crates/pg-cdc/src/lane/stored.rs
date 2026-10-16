@@ -1,10 +1,10 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::task::Poll;
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -446,26 +446,20 @@ impl Lane {
 }
 
 // Store writes must stay in the lane task: a spawned write outlives an aborted lane and escapes the gate's abandoned-write count.
-async fn join_all<F: Future + Unpin>(futures: Vec<F>) -> Vec<F::Output> {
-    let mut running: Vec<Option<F>> = futures.into_iter().map(Some).collect();
-    let mut outputs: Vec<Option<F::Output>> = running.iter().map(|_| None).collect();
-    std::future::poll_fn(|context| {
-        let mut done = true;
-        for (slot, output) in running.iter_mut().zip(outputs.iter_mut()) {
-            let Some(future) = slot.as_mut() else {
-                continue;
-            };
-            match Pin::new(future).poll(context) {
-                Poll::Ready(value) => {
-                    *output = Some(value);
-                    *slot = None;
-                }
-                Poll::Pending => done = false,
-            }
+async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut running: FuturesUnordered<_> = futures
+        .into_iter()
+        .enumerate()
+        .map(|(index, future)| async move { (index, future.await) })
+        .collect();
+    let mut outputs: Vec<Option<F::Output>> = std::iter::repeat_with(|| None)
+        .take(running.len())
+        .collect();
+    while let Some((index, output)) = running.next().await {
+        if let Some(slot) = outputs.get_mut(index) {
+            *slot = Some(output);
         }
-        if done { Poll::Ready(()) } else { Poll::Pending }
-    })
-    .await;
+    }
     outputs.into_iter().flatten().collect()
 }
 
@@ -496,5 +490,54 @@ fn record_parked(events: &[ParkedEvent]) {
             outcome: EventOutcome::Dead,
             count: 1,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    use super::*;
+
+    struct Counted<'a>(&'a AtomicUsize);
+
+    impl Drop for Counted<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn join_all_returns_outputs_in_input_order_when_they_complete_in_reverse() {
+        let count = 500_u64;
+        let futures: Vec<_> = (0..count)
+            .map(|index| {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(count - index)).await;
+                    index
+                })
+            })
+            .collect();
+        assert_eq!(join_all(futures).await, (0..count).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_join_all_drops_its_unfinished_futures_in_place() {
+        let dropped = AtomicUsize::new(0);
+        let futures: Vec<_> = (0..3_u64)
+            .map(|index| {
+                let guard = Counted(&dropped);
+                Box::pin(async move {
+                    let _guard = guard;
+                    if index > 0 {
+                        std::future::pending::<()>().await;
+                    }
+                })
+            })
+            .collect();
+        let joined = tokio::time::timeout(Duration::from_secs(1), join_all(futures)).await;
+        assert!(joined.is_err());
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
     }
 }
