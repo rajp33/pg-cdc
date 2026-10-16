@@ -1,10 +1,12 @@
 use std::collections::BinaryHeap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -20,7 +22,9 @@ use crate::event::EventId;
 use crate::order::OrderKeyId;
 
 pub const LEADER_LOCK: &str = "leader.lock";
+const TEMP_ABANDONED_AFTER: Duration = Duration::from_hours(1);
 const CREATE_ATTEMPTS: usize = 3;
+const TEMP_PREFIX: &str = ".tmp-";
 
 type Cancelled<'a> = &'a dyn Fn() -> bool;
 type LeaderJob = Box<dyn FnOnce(&Path) + Send>;
@@ -203,14 +207,48 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         .create_new(true)
         .open(path)
         .map_err(|error| unavailable(path, &error))?;
-    file.write_all(bytes)
+    let written = file
+        .write_all(bytes)
         .and_then(|()| faults::before_sync(path))
-        .and_then(|()| file.sync_all())
-        .map_err(|error| unavailable(path, &error))
+        .and_then(|()| file.sync_all());
+    if let Err(error) = written {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(unavailable(path, &error));
+    }
+    Ok(())
 }
 
 fn temp_path(dir: &Path, name: &str) -> PathBuf {
-    dir.join(format!(".tmp-{name}-{:016x}", fastrand::u64(..)))
+    dir.join(format!("{TEMP_PREFIX}{name}-{:016x}", fastrand::u64(..)))
+}
+
+fn is_temp(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with(TEMP_PREFIX))
+}
+
+fn reclaim_if_abandoned(entry: &fs::DirEntry, cutoff: SystemTime) {
+    if !is_temp(&entry.file_name()) {
+        return;
+    }
+    let abandoned = entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified < cutoff);
+    if abandoned {
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
+fn reclaim_temps(dir: &Path) -> Result<(), StoreError> {
+    for entry in fs::read_dir(dir).map_err(|error| unavailable(dir, &error))? {
+        let entry = entry.map_err(|error| unavailable(dir, &error))?;
+        if is_temp(&entry.file_name()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 fn ensure_dir(root: &Path, dir: &Path) -> Result<(), StoreError> {
@@ -268,10 +306,11 @@ fn queue_entries(dir: &Path) -> Result<Option<fs::ReadDir>, StoreError> {
     }
 }
 
-fn each_event_id(
+fn scan(
     dir: &Path,
     cancelled: Cancelled<'_>,
     mut visit: impl FnMut(EventId),
+    mut stray: impl FnMut(&fs::DirEntry),
 ) -> Result<(), StoreError> {
     let Some(entries) = queue_entries(dir)? else {
         return Ok(());
@@ -279,16 +318,25 @@ fn each_event_id(
     for entry in entries {
         check(cancelled)?;
         let entry = entry.map_err(|error| unavailable(dir, &error))?;
-        if let Some(id) = entry
+        match entry
             .file_name()
             .to_str()
             .and_then(|name| name.strip_suffix(".json"))
             .and_then(|stem| stem.parse::<EventId>().ok())
         {
-            visit(id);
+            Some(id) => visit(id),
+            None => stray(&entry),
         }
     }
     Ok(())
+}
+
+fn each_event_id(
+    dir: &Path,
+    cancelled: Cancelled<'_>,
+    visit: impl FnMut(EventId),
+) -> Result<(), StoreError> {
+    scan(dir, cancelled, visit, |_| {})
 }
 
 fn keep_smallest<T: Ord>(kept: &mut BinaryHeap<T>, item: T, keep: usize) {
@@ -356,6 +404,9 @@ fn load_heads(
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(unavailable(&parked, &error)),
     };
+    let cutoff = SystemTime::now()
+        .checked_sub(TEMP_ABANDONED_AFTER)
+        .unwrap_or(UNIX_EPOCH);
     let mut heads = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| unavailable(&parked, &error))?;
@@ -369,11 +420,22 @@ fn load_heads(
         if order_key.partition() != partition {
             continue;
         }
-        if let Some((head, length)) = queue_head(&entry.path(), usize::MAX, cancelled)? {
+        let mut head: Option<EventId> = None;
+        let mut length = 0_u64;
+        scan(
+            &entry.path(),
+            cancelled,
+            |id| {
+                head = Some(head.map_or(id, |head| head.min(id)));
+                length = length.saturating_add(1);
+            },
+            |stray| reclaim_if_abandoned(stray, cutoff),
+        )?;
+        if let Some(head) = head {
             heads.push(ParkedHead {
                 order_key,
                 head,
-                length: u64::try_from(length).unwrap_or(u64::MAX),
+                length,
             });
         }
     }
@@ -607,6 +669,7 @@ fn swap(
         .map_err(|error| unavailable(&lock_path, &error))?;
     lock.lock()
         .map_err(|error| unavailable(&lock_path, &error))?;
+    reclaim_temps(root)?;
     let current = read_leader_file(root)?.map(|file| file.version);
     let matches = match (current, expected) {
         (None, None) => true,
@@ -1201,6 +1264,84 @@ mod tests {
         synced.lock().unwrap().clear();
         remove(&root, &removed, &|| false).unwrap();
         assert_eq!(*synced.lock().unwrap(), vec![parked_dir]);
+    }
+
+    fn is_temp(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".tmp-"))
+    }
+
+    #[test]
+    fn failed_writes_leave_no_temp_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 1), &|| false).unwrap();
+        let (_injected, _) = record_syncs(dir.path(), is_temp);
+
+        for attempt in 1..=3 {
+            assert!(append(&root, &encoded(queue, 2)[1..], &|| false).is_err());
+            assert!(set_status(&root, queue, event_id(0), ParkStatus::Dead, &|| false).is_err());
+            assert_eq!(
+                names(&key_dir(&root, &queue)),
+                vec![format!("{}.json", event_id(0))],
+                "attempt {attempt}"
+            );
+        }
+        assert!(swap(&root, record(), None).is_err());
+        assert_eq!(
+            names(&root),
+            vec![LEADER_LOCK.to_owned(), PARKED_DIR.to_owned()]
+        );
+    }
+
+    fn temp_file(dir: &Path, name: &str, age: Duration) -> PathBuf {
+        let path = dir.join(name);
+        let file = File::create(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn loading_heads_reclaims_only_temp_files_abandoned_long_ago() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 1), &|| false).unwrap();
+        let queue_dir = key_dir(&root, &queue);
+        let stale = temp_file(&queue_dir, ".tmp-x.json-1", Duration::from_hours(2));
+        let fresh = temp_file(&queue_dir, ".tmp-x.json-2", Duration::from_secs(60));
+        let other = key(2);
+        let only_temp = key_dir(&root, &other);
+        fs::create_dir_all(&only_temp).unwrap();
+        let orphan = temp_file(&only_temp, ".tmp-y.json-1", Duration::from_hours(2));
+
+        let heads = load_heads(&root, queue.partition(), &|| false).unwrap();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].length, 1);
+        assert!(!stale.exists());
+        assert!(!orphan.exists());
+        assert!(fresh.exists());
+        assert_eq!(names(&queue_dir).len(), 2);
+    }
+
+    #[test]
+    fn a_leader_swap_reclaims_temp_files_left_beside_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        fs::create_dir_all(&root).unwrap();
+        let leftover = temp_file(&root, &format!(".tmp-{LEADER_OBJECT}-1"), Duration::ZERO);
+        assert!(matches!(
+            swap(&root, record(), None),
+            Ok(SwapOutcome::Swapped(_))
+        ));
+        assert!(!leftover.exists());
+        assert_eq!(
+            names(&root),
+            vec![LEADER_OBJECT.to_owned(), LEADER_LOCK.to_owned()]
+        );
     }
 
     #[test]

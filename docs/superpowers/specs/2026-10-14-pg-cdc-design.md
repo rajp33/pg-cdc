@@ -523,6 +523,7 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 - **Append** writes a temp file, fsyncs it, then `link()`s it to the final name, which fails if that name exists and so gives create-only semantics. It then fsyncs the directory.
 - **Missing directories are created durably.** The first write creates `state_store.path`, the pipeline directory and any missing ancestors, and fsyncs every directory that gained an entry, up to and including the first ancestor that already existed; until that succeeds, every write repeats it.
 - **The leader compare-and-swap** runs under an exclusive lock on `leader.lock`, with the version stored in the record.
+- **Temp files do not leak.** A write whose temp file fails to write or fsync deletes it before returning the error. Temp files a crash leaves behind are reclaimed: the leader compare-and-swap deletes any beside the record while it holds `leader.lock`, and loading a partition's heads, which only the holder of the leader record does, deletes those in its queue directories last modified more than an hour ago, so no write still in progress, the holder's own or a fenced predecessor's, loses its temp file.
 - **Single host only.** Active/standby across hosts needs S3, or the later Postgres store.
 - **Listings scan directories.** A directory has no order, so finding a queue's head reads all of its entries; listing and reads keep only the page they return in memory and stop at the next entry once cancelled.
 
