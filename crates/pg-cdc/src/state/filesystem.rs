@@ -92,27 +92,11 @@ fn nonempty(dir: &Path) -> &Path {
     }
 }
 
-fn absolute(path: &Path) -> Result<PathBuf, StoreError> {
-    let mut existing = nonempty(path);
-    let mut missing = Vec::new();
-    loop {
-        match existing.canonicalize() {
-            Ok(resolved) => {
-                return Ok(missing
-                    .iter()
-                    .rev()
-                    .fold(resolved, |resolved, name| resolved.join(name)));
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-                    return Err(unavailable(existing, &error));
-                };
-                missing.push(name);
-                existing = nonempty(parent);
-            }
-            Err(error) => return Err(unavailable(existing, &error)),
-        }
-    }
+fn create_root(root: &Path) -> Result<PathBuf, StoreError> {
+    fs::create_dir_all(root).map_err(|error| unavailable(root, &error))?;
+    nonempty(root)
+        .canonicalize()
+        .map_err(|error| unavailable(root, &error))
 }
 
 #[derive(Debug, Default)]
@@ -125,8 +109,7 @@ impl RootPath {
         if self.durable.load(Ordering::Acquire) {
             return Ok(());
         }
-        let resolved = absolute(root)?;
-        fs::create_dir_all(&resolved).map_err(|error| unavailable(&resolved, &error))?;
+        let resolved = create_root(root)?;
         for dir in resolved.ancestors().skip(1) {
             sync_dir(dir).map_err(|error| {
                 StoreError::Unavailable(format!(
@@ -1366,18 +1349,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_store_path_through_a_missing_parent_component_is_created_and_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let (_injected, synced) = record_syncs(&base, |_| false);
+        let store =
+            FilesystemStateStore::new(&base.join("missing").join("..").join("state"), "orders", 2);
+        store.append_parked(&[parked(key(1), 0)]).await.unwrap();
+        assert!(base.join("state").join("orders").join(PARKED_DIR).is_dir());
+        let seen = synced.lock().unwrap().clone();
+        for containing in [base.clone(), base.join("state")] {
+            assert!(seen.contains(&containing), "{containing:?} not in {seen:?}");
+        }
+    }
+
     #[test]
     fn a_relative_store_path_is_walked_from_its_absolute_location() {
         let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let relative = Path::new("no-such-dir").join("orders");
-        assert_eq!(absolute(&relative).unwrap(), cwd.join(&relative));
-        assert_eq!(absolute(Path::new("")).unwrap(), cwd);
+        assert_eq!(create_root(Path::new("")).unwrap(), cwd);
         let dir = tempfile::tempdir().unwrap();
-        let canonical = dir.path().canonicalize().unwrap();
-        assert_eq!(
-            absolute(&dir.path().join("a").join("b")).unwrap(),
-            canonical.join("a").join("b")
-        );
+        let base = dir.path().canonicalize().unwrap();
+        let to_root = (0..cwd.components().count()).fold(PathBuf::new(), |path, _| path.join(".."));
+        let relative = to_root
+            .join(base.strip_prefix("/").unwrap())
+            .join("missing")
+            .join("..")
+            .join("state");
+        assert!(relative.is_relative());
+        assert_eq!(create_root(&relative).unwrap(), base.join("state"));
+        assert!(base.join("state").is_dir());
     }
 
     #[test]
