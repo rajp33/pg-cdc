@@ -11,7 +11,8 @@ use serde_json::Value;
 use crate::event::{Envelope, EventId};
 use crate::order::{OrderKeyId, column_value};
 
-pub const SNS_MAX_NUMBER_DIGITS: usize = 38;
+const SNS_MAX_NUMBER_WHOLE: &str = "1000000000";
+const SNS_MAX_NUMBER_FRACTION_DIGITS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SinkCapabilities {
@@ -127,6 +128,23 @@ fn sns_text(text: &str) -> bool {
     })
 }
 
+// SNS rejects a Number attribute outside -10^9..=10^9 or with more than 5 fractional digits.
+fn sns_number(text: &str) -> bool {
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let (whole, fraction) = match unsigned.split_once('.') {
+        Some((whole, fraction)) if digits(fraction) => (whole, fraction),
+        Some(_) => return false,
+        None => (unsigned, ""),
+    };
+    if !digits(whole) || fraction.len() > SNS_MAX_NUMBER_FRACTION_DIGITS {
+        return false;
+    }
+    let whole = whole.trim_start_matches('0');
+    whole.len() < SNS_MAX_NUMBER_WHOLE.len()
+        || (whole == SNS_MAX_NUMBER_WHOLE && fraction.bytes().all(|byte| byte == b'0'))
+}
+
 fn attribute_value(value: &Value) -> Option<AttributeValue> {
     match value {
         Value::Null => None,
@@ -134,8 +152,7 @@ fn attribute_value(value: &Value) -> Option<AttributeValue> {
         Value::String(text) => Some(AttributeValue::String(text.clone())),
         Value::Number(number) => {
             let text = number.to_string();
-            let digits = text.bytes().filter(u8::is_ascii_digit).count();
-            if digits <= SNS_MAX_NUMBER_DIGITS && !text.contains(['e', 'E']) {
+            if sns_number(&text) {
                 Some(AttributeValue::Number(text))
             } else {
                 Some(AttributeValue::String(text))
@@ -256,7 +273,7 @@ mod tests {
                 ("tags", &string(r#"["a","b"]"#)),
                 ("doc", &string(r#"{"k":1}"#)),
                 ("huge", &string(&"1".repeat(39))),
-                ("wide", &number(&"1".repeat(38))),
+                ("wide", &string(&"1".repeat(38))),
                 ("vast", &string("1e+300")),
                 ("tiny", &string("1.5e-7")),
                 ("large", &string("1e+15")),
@@ -272,9 +289,34 @@ mod tests {
             let value = Value::Number(serde_json::Number::from_string_unchecked(text.to_owned()));
             assert_eq!(attribute_value(&value), Some(string(text)), "{text}");
         }
-        for text in ["-12.5", "0.000001", "100000000000000000000"] {
+    }
+
+    #[test]
+    fn numbers_are_number_attributes_only_within_the_sns_range_and_precision() {
+        for text in [
+            "0",
+            "-12.5",
+            "0.00001",
+            "999999999.99999",
+            "1000000000",
+            "-1000000000",
+            "1000000000.00000",
+            "-0.5",
+        ] {
             let value = Value::Number(serde_json::Number::from_string_unchecked(text.to_owned()));
             assert_eq!(attribute_value(&value), Some(number(text)), "{text}");
+        }
+        for text in [
+            "100000000000000000000",
+            "1000000001",
+            "-1000000001",
+            "1000000000.00001",
+            "0.000001",
+            "1.500000",
+            "123456789.123456",
+        ] {
+            let value = Value::Number(serde_json::Number::from_string_unchecked(text.to_owned()));
+            assert_eq!(attribute_value(&value), Some(string(text)), "{text}");
         }
     }
 
