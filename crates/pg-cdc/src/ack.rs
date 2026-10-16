@@ -72,11 +72,13 @@ struct Txn {
     seq: u64,
     end_lsn: Option<Lsn>,
     unsettled: u64,
+    commit_ms: Option<u64>,
 }
 
 #[derive(Debug)]
 pub struct AckTracker {
     confirmed: Lsn,
+    confirmed_commit_ms: Option<u64>,
     txns: VecDeque<Txn>,
     next_seq: u64,
     last_commit: Option<Lsn>,
@@ -88,6 +90,7 @@ impl AckTracker {
     pub fn new(start: Lsn) -> Self {
         Self {
             confirmed: start,
+            confirmed_commit_ms: None,
             txns: VecDeque::new(),
             next_seq: 0,
             last_commit: None,
@@ -98,6 +101,10 @@ impl AckTracker {
 
     pub fn confirmed(&self) -> Lsn {
         self.confirmed
+    }
+
+    pub fn confirmed_commit_ms(&self) -> Option<u64> {
+        self.confirmed_commit_ms
     }
 
     pub fn inflight_events(&self) -> u64 {
@@ -127,9 +134,16 @@ impl AckTracker {
             seq: self.next_seq,
             end_lsn: None,
             unsettled: 0,
+            commit_ms: None,
         });
         self.next_seq += 1;
         Ok(())
+    }
+
+    pub fn stamp(&mut self, commit_ms: Option<u64>) {
+        if let Ok(txn) = self.open_txn() {
+            txn.commit_ms = commit_ms;
+        }
     }
 
     pub fn track(&mut self, bytes: u64) -> Result<Ticket, AckError> {
@@ -190,6 +204,9 @@ impl AckTracker {
                 break;
             }
             self.confirmed = self.confirmed.max(end_lsn);
+            if front.commit_ms.is_some() {
+                self.confirmed_commit_ms = front.commit_ms;
+            }
             self.txns.pop_front();
         }
     }
@@ -286,6 +303,26 @@ mod tests {
         assert_eq!(ack.commit(Lsn(400)), Ok(Lsn(100)));
         assert_eq!(ack.settle(delivered(late)), Ok(Lsn(100)));
         assert_eq!(ack.settle(delivered(early)), Ok(Lsn(400)));
+    }
+
+    #[test]
+    fn the_confirmed_commit_time_is_that_of_the_last_confirmed_transaction() {
+        let mut ack = AckTracker::new(Lsn(100));
+        assert_eq!(ack.confirmed_commit_ms(), None);
+        ack.begin().unwrap();
+        ack.stamp(Some(1_000));
+        let early = ack.track(1).unwrap();
+        ack.commit(Lsn(200)).unwrap();
+        ack.begin().unwrap();
+        ack.stamp(Some(2_000));
+        let late = ack.track(1).unwrap();
+        ack.commit(Lsn(300)).unwrap();
+        ack.settle(delivered(late)).unwrap();
+        assert_eq!(ack.confirmed_commit_ms(), None);
+        ack.settle(delivered(early)).unwrap();
+        assert_eq!(ack.confirmed_commit_ms(), Some(2_000));
+        assert_eq!(ack.keepalive(Lsn(400)), Lsn(400));
+        assert_eq!(ack.confirmed_commit_ms(), Some(2_000));
     }
 
     #[test]

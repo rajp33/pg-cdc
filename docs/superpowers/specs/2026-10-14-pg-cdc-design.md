@@ -672,7 +672,7 @@ On failure:
 
 - **What happens.** If the slot is missing or invalidated, streaming stops and the task turns unhealthy and alerts. pg-cdc never recreates a slot.
   - Invalidation comes from `max_slot_wal_keep_size`, or from `idle_replication_slot_timeout` on Postgres 18.
-- **Recovery.** An operator recreates the slot (§13.1). Changes made between the loss and the recreation are not captured; backfills (§20) will close that gap.
+- **Recovery.** An operator recreates the slot (§13.1). Changes from the oldest one neither delivered nor parked at the loss through the recreation are not captured; backfills (§20) will close that gap. That start is the first transaction after the confirmed position, which the active task logs at info at most once a minute (`confirmed position`, with `confirmed_lsn` and `last_confirmed_commit_unix_ms`), and which the slot's `confirmed_flush_lsn` shows while the slot is still visible. Parked events are kept and drain after the recreation.
 - **Aurora.** Whether logical slots survive a writer failover is not documented, and an AWS post (2026-08-12) says they must be recreated. This must be tested in staging before production.
   - If the slot survives, pg-cdc reconnects through the cluster endpoint and resumes.
   - If it does not, the path above applies.

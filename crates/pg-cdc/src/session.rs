@@ -45,6 +45,7 @@ pub const LANE_STOP_GRACE: Duration = Duration::from_secs(1);
 pub const CONTROL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SLOT_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
+pub const POSITION_LOG_INTERVAL: Duration = Duration::from_mins(1);
 const POSTGRES_EPOCH_UNIX_MS: i64 = 946_684_800_000;
 
 const INSUFFICIENT_PRIVILEGE: &str = "42501";
@@ -303,6 +304,7 @@ async fn serve(
         },
         drain_timeout: config.leadership.drain_timeout,
         committed_ms: None,
+        position_log_at: Instant::now(),
         transaction: Span::none(),
         transaction_events: 0,
     };
@@ -377,6 +379,14 @@ async fn claim_in_span(
     }
     .instrument(span)
     .await
+}
+
+fn position_log_due(next: &mut Instant, now: Instant) -> bool {
+    if now < *next {
+        return false;
+    }
+    *next = now + POSITION_LOG_INTERVAL;
+    true
 }
 
 fn commit_unix_ms(commit_ts: i64) -> Option<u64> {
@@ -685,6 +695,7 @@ struct Session<'a> {
     leadership: Leadership,
     drain_timeout: Duration,
     committed_ms: Option<u64>,
+    position_log_at: Instant,
     transaction: Span,
     transaction_events: u64,
 }
@@ -909,9 +920,17 @@ impl Session<'_> {
         }
     }
 
-    fn confirm(&self, stream: &ReplicationStream, lsn: Lsn) {
+    fn confirm(&mut self, stream: &ReplicationStream, lsn: Lsn) {
         stream.confirm(lsn);
-        self.status.set_confirmed(Some(self.ack.confirmed()));
+        let confirmed = self.ack.confirmed();
+        self.status.set_confirmed(Some(confirmed));
+        if position_log_due(&mut self.position_log_at, Instant::now()) {
+            tracing::info!(
+                confirmed_lsn = %confirmed,
+                last_confirmed_commit_unix_ms = self.ack.confirmed_commit_ms(),
+                "confirmed position"
+            );
+        }
     }
 
     fn publish_inflight(&self) {
@@ -938,6 +957,7 @@ impl Session<'_> {
                     .map_err(build_error)?;
                 self.ack.begin()?;
                 self.committed_ms = commit_unix_ms(begin.commit_ts);
+                self.ack.stamp(self.committed_ms);
                 self.transaction_events = 0;
                 self.transaction = tracing::debug_span!(
                     "transaction",
@@ -1073,6 +1093,22 @@ mod tests {
     use crate::state::memory::MemoryStateStore;
     use tracing::Level;
     use tracing::level_filters::LevelFilter;
+
+    #[test]
+    fn the_confirmed_position_is_logged_at_most_once_a_minute() {
+        let start = Instant::now();
+        let mut next = start;
+        assert!(position_log_due(&mut next, start));
+        assert!(!position_log_due(
+            &mut next,
+            start + Duration::from_secs(59)
+        ));
+        assert!(position_log_due(&mut next, start + Duration::from_secs(60)));
+        assert!(!position_log_due(
+            &mut next,
+            start + Duration::from_secs(61)
+        ));
+    }
 
     #[test]
     fn commit_timestamps_convert_to_unix_milliseconds() {
