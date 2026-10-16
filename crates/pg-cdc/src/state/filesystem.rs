@@ -92,6 +92,29 @@ fn nonempty(dir: &Path) -> &Path {
     }
 }
 
+fn absolute(path: &Path) -> Result<PathBuf, StoreError> {
+    let mut existing = nonempty(path);
+    let mut missing = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(resolved) => {
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(resolved, |resolved, name| resolved.join(name)));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return Err(unavailable(existing, &error));
+                };
+                missing.push(name);
+                existing = nonempty(parent);
+            }
+            Err(error) => return Err(unavailable(existing, &error)),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct RootPath {
     durable: AtomicBool,
@@ -102,15 +125,14 @@ impl RootPath {
         if self.durable.load(Ordering::Acquire) {
             return Ok(());
         }
-        fs::create_dir_all(root).map_err(|error| unavailable(root, &error))?;
-        for dir in root.ancestors().skip(1).map(nonempty) {
-            match faults::before_sync(dir).and_then(|()| File::open(dir)) {
-                // pg-cdc creates directories it can read, so one it cannot open was not created by it.
-                Err(error) if error.kind() == ErrorKind::PermissionDenied => break,
-                opened => opened
-                    .and_then(|handle| handle.sync_all())
-                    .map_err(|error| unavailable(dir, &error))?,
-            }
+        let resolved = absolute(root)?;
+        fs::create_dir_all(&resolved).map_err(|error| unavailable(&resolved, &error))?;
+        for dir in resolved.ancestors().skip(1) {
+            sync_dir(dir).map_err(|error| {
+                StoreError::Unavailable(format!(
+                    "cannot make the state store path durable: {error}"
+                ))
+            })?;
         }
         self.durable.store(true, Ordering::Release);
         Ok(())
@@ -588,7 +610,7 @@ fn set_status(
     let name = format!("{id}.json");
     let path = dir.join(&name);
     let object = super::parked_name(&key, &id);
-    let _lock = match lock_key_dir(&dir, Share::Exclusive, cancelled)? {
+    let _lock = match lock_key_dir(&dir, cancelled)? {
         KeyLock::Held(lock) => lock,
         KeyLock::Missing => return Err(StoreError::NotFound(object)),
         KeyLock::Busy => return Err(busy(&dir)),
@@ -605,12 +627,6 @@ fn set_status(
     let encoded = encode_parked(&event)?;
     check(cancelled)?;
     replace(&dir, &name, &encoded)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Share {
-    Shared,
-    Exclusive,
 }
 
 enum KeyLock {
@@ -638,7 +654,7 @@ fn same_dir(handle: &File, dir: &Path) -> Result<bool, StoreError> {
     }
 }
 
-fn lock_key_dir(dir: &Path, share: Share, cancelled: Cancelled<'_>) -> Result<KeyLock, StoreError> {
+fn lock_key_dir(dir: &Path, cancelled: Cancelled<'_>) -> Result<KeyLock, StoreError> {
     let deadline = std::time::Instant::now() + KEY_LOCK_WAIT;
     let mut pause = Duration::from_millis(1);
     loop {
@@ -647,23 +663,18 @@ fn lock_key_dir(dir: &Path, share: Share, cancelled: Cancelled<'_>) -> Result<Ke
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(KeyLock::Missing),
             Err(error) => return Err(unavailable(dir, &error)),
         };
-        let locked = match share {
-            Share::Shared => handle.try_lock_shared(),
-            Share::Exclusive => handle.try_lock(),
-        };
-        match locked {
+        match handle.try_lock() {
             Ok(()) if same_dir(&handle, dir)? => return Ok(KeyLock::Held(handle)),
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) if std::time::Instant::now() >= deadline => {
-                return Ok(KeyLock::Busy);
-            }
-            Err(TryLockError::WouldBlock) => {
-                check(cancelled)?;
-                thread::sleep(pause);
-                pause = (pause * 2).min(Duration::from_millis(50));
-            }
+            Ok(()) | Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(error)) => return Err(unavailable(dir, &error)),
         }
+        drop(handle);
+        if std::time::Instant::now() >= deadline {
+            return Ok(KeyLock::Busy);
+        }
+        check(cancelled)?;
+        thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
     }
 }
 
@@ -691,7 +702,7 @@ fn remove(
         }
         let dir = key_dir(root, key);
         let path = dir.join(format!("{id}.json"));
-        let _lock = match lock_key_dir(&dir, Share::Shared, cancelled)? {
+        let _lock = match lock_key_dir(&dir, cancelled)? {
             KeyLock::Held(lock) => lock,
             KeyLock::Missing => {
                 sync_absence(&dir, &parked)?;
@@ -1274,14 +1285,14 @@ mod tests {
     #[tokio::test]
     async fn a_store_path_with_missing_ancestors_is_synced_up_to_the_first_existing_one() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        let (_injected, synced) = record_syncs(base, |_| false);
+        let base = dir.path().canonicalize().unwrap();
+        let (_injected, synced) = record_syncs(&base, |_| false);
 
         let parking = base.join("new").join("deeper");
         let store = FilesystemStateStore::new(&parking, "orders", 2);
         store.append_parked(&[parked(key(1), 0)]).await.unwrap();
         let seen = std::mem::take(&mut *synced.lock().unwrap());
-        for created_in in [base.to_path_buf(), base.join("new"), parking.clone()] {
+        for created_in in [base.clone(), base.join("new"), parking.clone()] {
             assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
         }
 
@@ -1289,7 +1300,7 @@ mod tests {
         let store = FilesystemStateStore::new(&leading, "orders", 2);
         store.swap_leader(&record(), None).await.unwrap();
         let seen = std::mem::take(&mut *synced.lock().unwrap());
-        for created_in in [base.to_path_buf(), base.join("other"), leading.clone()] {
+        for created_in in [base.clone(), base.join("other"), leading.clone()] {
             assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
         }
     }
@@ -1297,15 +1308,15 @@ mod tests {
     #[tokio::test]
     async fn ancestors_created_before_a_failed_sync_are_synced_by_the_retry() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        let (_injected, synced) = record_syncs(base, fail_once(base.join("new")));
+        let base = dir.path().canonicalize().unwrap();
+        let (_injected, synced) = record_syncs(&base, fail_once(base.join("new")));
         let store = FilesystemStateStore::new(&base.join("new").join("deeper"), "orders", 2);
 
         assert!(store.append_parked(&[parked(key(1), 0)]).await.is_err());
         synced.lock().unwrap().clear();
         store.append_parked(&[parked(key(1), 0)]).await.unwrap();
         let seen = synced.lock().unwrap().clone();
-        for created_in in [base.to_path_buf(), base.join("new")] {
+        for created_in in [base.clone(), base.join("new")] {
             assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
         }
     }
@@ -1313,8 +1324,8 @@ mod tests {
     #[tokio::test]
     async fn a_store_reopened_after_a_failed_ancestor_sync_syncs_the_ancestors() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        let (_injected, synced) = record_syncs(base, fail_once(base.join("new")));
+        let base = dir.path().canonicalize().unwrap();
+        let (_injected, synced) = record_syncs(&base, fail_once(base.join("new")));
         let parking = base.join("new").join("deeper");
 
         let crashed = FilesystemStateStore::new(&parking, "orders", 2);
@@ -1325,9 +1336,48 @@ mod tests {
         let reopened = FilesystemStateStore::new(&parking, "orders", 2);
         reopened.append_parked(&[parked(key(1), 0)]).await.unwrap();
         let seen = synced.lock().unwrap().clone();
-        for containing in [base.to_path_buf(), base.join("new"), parking.clone()] {
+        for containing in [base.clone(), base.join("new"), parking.clone()] {
             assert!(seen.contains(&containing), "{containing:?} not in {seen:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_ancestor_that_cannot_be_synced_fails_the_store_instead_of_being_skipped() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("wx");
+        fs::create_dir(&unreadable).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o300)).unwrap();
+        if File::open(&unreadable).is_ok() {
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let store = FilesystemStateStore::new(&unreadable.join("new"), "orders", 2);
+        let appended = store.append_parked(&[parked(key(1), 0)]).await;
+        let swapped = store.swap_leader(&record(), None).await;
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        for result in [appended.map(drop), swapped.map(drop)] {
+            assert!(
+                matches!(&result, Err(StoreError::Unavailable(message))
+                    if message.contains(&unreadable.display().to_string())
+                        && message.contains("os error 13")),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_store_path_is_walked_from_its_absolute_location() {
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let relative = Path::new("no-such-dir").join("orders");
+        assert_eq!(absolute(&relative).unwrap(), cwd.join(&relative));
+        assert_eq!(absolute(Path::new("")).unwrap(), cwd);
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            absolute(&dir.path().join("a").join("b")).unwrap(),
+            canonical.join("a").join("b")
+        );
     }
 
     #[test]
@@ -1602,6 +1652,56 @@ mod tests {
             read(&root, paused, None, 1, &|| false).unwrap()[0].status,
             ParkStatus::Dead
         );
+    }
+
+    #[test]
+    fn removals_of_one_key_never_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(dir.path().join("orders"));
+        let queue = key(1);
+        append(&root, &encoded(queue, 2), &|| false).unwrap();
+        let queue_dir = key_dir(&root, &queue);
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel::<()>();
+        let reached = Mutex::new(Some(reached));
+        let resume_rx = Mutex::new(resume_rx);
+        let (_injected, _) = record_syncs(dir.path(), {
+            let queue_dir = queue_dir.clone();
+            move |path| {
+                let first = if path == queue_dir {
+                    reached.lock().unwrap().take()
+                } else {
+                    None
+                };
+                if let Some(reached) = first {
+                    reached.send(()).unwrap();
+                    let _ = resume_rx.lock().unwrap().recv();
+                }
+                false
+            }
+        });
+        let first = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || remove(&root, &[(queue, event_id(0))], &|| false))
+        };
+        reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let second = {
+            let root = Arc::clone(&root);
+            finishes_within(Duration::from_secs(10), move || {
+                remove(&root, &[(queue, event_id(1))], &|| false)
+            })
+        };
+        assert!(
+            matches!(second, Err(StoreError::Unavailable(_))),
+            "{second:?}"
+        );
+        assert_eq!(names(&queue_dir), vec![format!("{}.json", event_id(1))]);
+
+        resume.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        remove(&root, &[(queue, event_id(1))], &|| false).unwrap();
+        assert!(!queue_dir.exists());
     }
 
     #[test]
