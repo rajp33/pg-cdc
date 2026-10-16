@@ -139,8 +139,8 @@ Discard removes the head only if it is still that event (409 with the current he
 |---|---|
 | 404 | the key has no parked events |
 | 409 | this task is not the active holder (the reply names the holder), or the head is not dead (redrive), is another event (discard), or is still being parked (try again) |
-| 503 | pg-cdc is starting, the key's partition is still loading (`Retry-After: 1`), or the state store is unavailable |
-| 504 | no answer within 30 s, typically during an S3 brownout; the operation may still complete, so check with `show` before repeating it |
+| 503 | pg-cdc is starting, the key's partition is still loading (`Retry-After: 1`), the key's lane already has 16 redrive and discard requests waiting (`Retry-After: 1`; retry once earlier ones answer), or the state store is unavailable |
+| 504 | no answer within 30 s, typically during an S3 brownout; the operation may still complete if the lane had started it (one it had not started is skipped), so check with `show` before repeating it |
 
 **Oversize events.** With a `payload_store`, an event larger than the sink's limit is delivered as a pointer (`payload_ref`) to `s3://<bucket>/<prefix>/<pipeline>/payloads/<event id>.json`. Without one it parks dead; configure a payload store and redrive.
 

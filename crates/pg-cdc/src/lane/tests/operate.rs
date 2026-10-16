@@ -611,3 +611,94 @@ async fn a_lane_that_is_parking_everything_for_shutdown_refuses_operations() {
     );
     assert_eq!(harness.store.status_changes.load(Ordering::SeqCst), 0);
 }
+
+fn stalled_status_changes(delay: Duration) -> TestStore {
+    TestStore {
+        status_delay: delay,
+        ..TestStore::default()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_operation_queue_refuses_more_requests_until_the_lane_takes_them() {
+    let store = stalled_status_changes(Duration::from_secs(3600));
+    store.seed(b"k", 0, ParkStatus::Dead).await;
+    let harness = Harness::start(Setup::default(), ScriptedSink::delivering(), store).await;
+    let operator = harness.operator();
+    let mut waiting = JoinSet::new();
+    for _ in 0..OPERATION_QUEUE {
+        let operator = operator.clone();
+        waiting.spawn(async move { operator.redrive(k()).await });
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    for _ in 0..100 {
+        assert_eq!(operator.redrive(k()).await, Err(OperateError::Busy(k())));
+    }
+    assert_eq!(harness.store.status_changes.load(Ordering::SeqCst), 1);
+    waiting.abort_all();
+    tokio::time::sleep(Duration::from_secs(3601)).await;
+    assert_eq!(
+        operator.redrive(k()).await,
+        Err(OperateError::NotParked(k()))
+    );
+    assert_eq!(harness.store.status_changes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_operation_whose_caller_gave_up_is_not_executed() {
+    let store = stalled_status_changes(Duration::from_secs(10));
+    store.seed(b"a", 0, ParkStatus::Dead).await;
+    store.seed(b"b", 0, ParkStatus::Dead).await;
+    let harness = Harness::start(Setup::default(), ScriptedSink::delivering(), store).await;
+    let operator = harness.operator();
+    let first = tokio::spawn({
+        let operator = operator.clone();
+        async move { operator.redrive(OrderKeyId::of(b"a")).await }
+    });
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let gave_up = tokio::time::timeout(
+        Duration::from_secs(1),
+        operator.redrive(OrderKeyId::of(b"b")),
+    )
+    .await;
+    assert!(gave_up.is_err());
+    assert_eq!(first.await.unwrap(), Ok(id(0)));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(harness.store.status_changes.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.store.queue(b"b").await, vec![(0, ParkStatus::Dead)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn delivery_interleaves_with_a_long_operation_queue() {
+    let store = stalled_status_changes(Duration::from_secs(1));
+    let keys: Vec<Vec<u8>> = (0..12)
+        .map(|key| format!("dead-{key}").into_bytes())
+        .collect();
+    for key in &keys {
+        store.seed(key, 0, ParkStatus::Dead).await;
+    }
+    let mut harness = Harness::start(Setup::default(), ScriptedSink::delivering(), store).await;
+    let operator = harness.operator();
+    let start = Instant::now();
+    let mut redrives = JoinSet::new();
+    for key in &keys {
+        let (operator, key) = (operator.clone(), OrderKeyId::of(key));
+        redrives.spawn(async move { operator.redrive(key).await });
+    }
+    harness.send(100, b"live", 10).unwrap();
+    assert_eq!(harness.settle(1).await, Lsn(100));
+    let live = harness
+        .sink
+        .sends()
+        .into_iter()
+        .find(|sent| sent.ordinal == 100)
+        .unwrap();
+    assert!(
+        live.at - start < Duration::from_secs(5),
+        "delivered after {:?}",
+        live.at - start
+    );
+    while let Some(redriven) = redrives.join_next().await {
+        assert_eq!(redriven.unwrap(), Ok(EventId::new(Lsn(0x10), 0)));
+    }
+}

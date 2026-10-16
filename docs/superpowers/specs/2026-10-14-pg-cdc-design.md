@@ -846,7 +846,7 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
 - **Inspections share a memory budget.** At most two listings and queue pages are read at once; others wait their turn within the 30 s budget. Each holds its turn from before its first store read until its reply has been sent or its connection has closed, so clients that stop reading cannot pile up replies.
 - **No races with delivery.** Parked operations run inside the owning lane.
 - **Standbys refuse them.** A standby answers with 409 and the current holder from the leader record.
-- **Only the active holder answers.** Every parked endpoint answers 409 unless this task holds claimed lanes, so a task waiting `fence_delay`, a draining task and a fenced task refuse too; the body carries `role`, and `holder`, `leader_state` and `epoch` from the leader record. Before the state store is ready the endpoints answer 503 (`pg-cdc is starting`), and an operation that outlives 30 s answers 504, since it may still complete.
+- **Only the active holder answers.** Every parked endpoint answers 409 unless this task holds claimed lanes, so a task waiting `fence_delay`, a draining task and a fenced task refuse too; the body carries `role`, and `holder`, `leader_state` and `epoch` from the leader record. Before the state store is ready the endpoints answer 503 (`pg-cdc is starting`), and an operation that outlives 30 s answers 504, since it may still complete. Each lane queues at most 16 redrive and discard requests and answers 503 with `Retry-After: 1` past that; it runs at most 4 between deliveries and skips one whose requester has gone.
 
 ## 17. Observability
 

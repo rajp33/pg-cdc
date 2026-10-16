@@ -751,6 +751,13 @@ mod tests {
             Err("503 Service Unavailable: unavailable".to_owned())
         );
         assert_eq!(
+            parked_output(&reply(
+                503,
+                r#"{"error":"too many redrive and discard requests are waiting on the lane of order key 6b; try again shortly"}"#
+            )),
+            Err("503 Service Unavailable: too many redrive and discard requests are waiting on the lane of order key 6b; try again shortly".to_owned())
+        );
+        assert_eq!(
             parked_output(&reply(500, r#"{"holder":"other-1"}"#)),
             Err(r#"500 Internal Server Error: {"holder":"other-1"}"#.to_owned())
         );

@@ -2,16 +2,21 @@ use std::cmp::Reverse;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::time::Instant;
 
 use super::{Inbound, Lane, Stored};
 use crate::event::EventId;
 use crate::order::OrderKeyId;
 use crate::state::{ParkStatus, StoreError};
 
+pub const OPERATION_QUEUE: usize = 16;
+const OPERATIONS_PER_TURN: usize = 4;
+
 #[derive(Debug, Clone)]
 pub struct Operator {
     inboxes: Vec<mpsc::WeakUnboundedSender<Inbound>>,
+    queues: Vec<Arc<Semaphore>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -30,6 +35,10 @@ pub enum OperateError {
     },
     #[error("the head of order key {key} is still being parked; try again")]
     Parking { key: OrderKeyId },
+    #[error(
+        "too many redrive and discard requests are waiting on the lane of order key {0}; try again shortly"
+    )]
+    Busy(OrderKeyId),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error("the lanes are stopping or have stopped")]
@@ -46,11 +55,21 @@ pub(super) enum Action {
 pub(super) struct Operation {
     action: Action,
     reply: oneshot::Sender<Result<EventId, OperateError>>,
+    _queued: OwnedSemaphorePermit,
+}
+
+pub(super) fn operation_queues(lanes: usize) -> Vec<Arc<Semaphore>> {
+    (0..lanes)
+        .map(|_| Arc::new(Semaphore::new(OPERATION_QUEUE)))
+        .collect()
 }
 
 impl Operator {
-    pub(super) fn new(inboxes: Vec<mpsc::WeakUnboundedSender<Inbound>>) -> Self {
-        Self { inboxes }
+    pub(super) fn new(
+        inboxes: Vec<mpsc::WeakUnboundedSender<Inbound>>,
+        queues: Vec<Arc<Semaphore>>,
+    ) -> Self {
+        Self { inboxes, queues }
     }
 
     pub async fn redrive(&self, key: OrderKeyId) -> Result<EventId, OperateError> {
@@ -64,13 +83,25 @@ impl Operator {
     async fn request(&self, key: OrderKeyId, action: Action) -> Result<EventId, OperateError> {
         let (reply, answer) = oneshot::channel();
         {
+            let lane = key.lane(self.inboxes.len());
             let inbox = self
                 .inboxes
-                .get(key.lane(self.inboxes.len()))
+                .get(lane)
                 .and_then(mpsc::WeakUnboundedSender::upgrade)
                 .ok_or(OperateError::Stopped)?;
+            let queued = self
+                .queues
+                .get(lane)
+                .ok_or(OperateError::Stopped)?
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| OperateError::Busy(key))?;
             inbox
-                .send(Inbound::Operate(Operation { action, reply }))
+                .send(Inbound::Operate(Operation {
+                    action,
+                    reply,
+                    _queued: queued,
+                }))
                 .map_err(|_| OperateError::Stopped)?;
         }
         answer.await.map_err(|_| OperateError::Stopped)?
@@ -78,8 +109,19 @@ impl Operator {
 }
 
 impl Lane {
+    pub(super) fn operations_wake(&self) -> Option<Instant> {
+        (!self.operations.is_empty()).then(Instant::now)
+    }
+
     pub(super) async fn perform_operations(&mut self) {
-        while let Some(Operation { action, reply }) = self.operations.pop_front() {
+        let mut performed = 0;
+        while performed < OPERATIONS_PER_TURN
+            && let Some(Operation { action, reply, .. }) = self.operations.pop_front()
+        {
+            if reply.is_closed() {
+                continue;
+            }
+            performed += 1;
             let result = if self.closing {
                 Err(OperateError::Stopped)
             } else {
