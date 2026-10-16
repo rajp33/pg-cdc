@@ -610,7 +610,7 @@ fn set_status(
     let name = format!("{id}.json");
     let path = dir.join(&name);
     let object = super::parked_name(&key, &id);
-    let _lock = match lock_key_dir(&dir, Share::Exclusive, cancelled)? {
+    let _lock = match lock_key_dir(&dir, cancelled)? {
         KeyLock::Held(lock) => lock,
         KeyLock::Missing => return Err(StoreError::NotFound(object)),
         KeyLock::Busy => return Err(busy(&dir)),
@@ -627,12 +627,6 @@ fn set_status(
     let encoded = encode_parked(&event)?;
     check(cancelled)?;
     replace(&dir, &name, &encoded)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Share {
-    Shared,
-    Exclusive,
 }
 
 enum KeyLock {
@@ -660,7 +654,7 @@ fn same_dir(handle: &File, dir: &Path) -> Result<bool, StoreError> {
     }
 }
 
-fn lock_key_dir(dir: &Path, share: Share, cancelled: Cancelled<'_>) -> Result<KeyLock, StoreError> {
+fn lock_key_dir(dir: &Path, cancelled: Cancelled<'_>) -> Result<KeyLock, StoreError> {
     let deadline = std::time::Instant::now() + KEY_LOCK_WAIT;
     let mut pause = Duration::from_millis(1);
     loop {
@@ -669,23 +663,18 @@ fn lock_key_dir(dir: &Path, share: Share, cancelled: Cancelled<'_>) -> Result<Ke
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(KeyLock::Missing),
             Err(error) => return Err(unavailable(dir, &error)),
         };
-        let locked = match share {
-            Share::Shared => handle.try_lock_shared(),
-            Share::Exclusive => handle.try_lock(),
-        };
-        match locked {
+        match handle.try_lock() {
             Ok(()) if same_dir(&handle, dir)? => return Ok(KeyLock::Held(handle)),
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) if std::time::Instant::now() >= deadline => {
-                return Ok(KeyLock::Busy);
-            }
-            Err(TryLockError::WouldBlock) => {
-                check(cancelled)?;
-                thread::sleep(pause);
-                pause = (pause * 2).min(Duration::from_millis(50));
-            }
+            Ok(()) | Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(error)) => return Err(unavailable(dir, &error)),
         }
+        drop(handle);
+        if std::time::Instant::now() >= deadline {
+            return Ok(KeyLock::Busy);
+        }
+        check(cancelled)?;
+        thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
     }
 }
 
@@ -713,7 +702,7 @@ fn remove(
         }
         let dir = key_dir(root, key);
         let path = dir.join(format!("{id}.json"));
-        let _lock = match lock_key_dir(&dir, Share::Shared, cancelled)? {
+        let _lock = match lock_key_dir(&dir, cancelled)? {
             KeyLock::Held(lock) => lock,
             KeyLock::Missing => {
                 sync_absence(&dir, &parked)?;
@@ -1663,6 +1652,56 @@ mod tests {
             read(&root, paused, None, 1, &|| false).unwrap()[0].status,
             ParkStatus::Dead
         );
+    }
+
+    #[test]
+    fn removals_of_one_key_never_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(dir.path().join("orders"));
+        let queue = key(1);
+        append(&root, &encoded(queue, 2), &|| false).unwrap();
+        let queue_dir = key_dir(&root, &queue);
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel::<()>();
+        let reached = Mutex::new(Some(reached));
+        let resume_rx = Mutex::new(resume_rx);
+        let (_injected, _) = record_syncs(dir.path(), {
+            let queue_dir = queue_dir.clone();
+            move |path| {
+                let first = if path == queue_dir {
+                    reached.lock().unwrap().take()
+                } else {
+                    None
+                };
+                if let Some(reached) = first {
+                    reached.send(()).unwrap();
+                    let _ = resume_rx.lock().unwrap().recv();
+                }
+                false
+            }
+        });
+        let first = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || remove(&root, &[(queue, event_id(0))], &|| false))
+        };
+        reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let second = {
+            let root = Arc::clone(&root);
+            finishes_within(Duration::from_secs(10), move || {
+                remove(&root, &[(queue, event_id(1))], &|| false)
+            })
+        };
+        assert!(
+            matches!(second, Err(StoreError::Unavailable(_))),
+            "{second:?}"
+        );
+        assert_eq!(names(&queue_dir), vec![format!("{}.json", event_id(1))]);
+
+        resume.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        remove(&root, &[(queue, event_id(1))], &|| false).unwrap();
+        assert!(!queue_dir.exists());
     }
 
     #[test]
