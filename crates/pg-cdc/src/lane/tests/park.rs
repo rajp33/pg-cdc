@@ -296,3 +296,48 @@ async fn an_append_that_lands_only_part_of_a_queue_delivers_each_event_once_in_o
     assert_eq!(delivered, vec![0, 1, 2]);
     assert_eq!(harness.store.queue(b"k").await, vec![]);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_key_whose_append_fails_retries_alone_while_the_other_keys_settle() {
+    let script: Script = Box::new(|_, _| Outcome::Retryable(SinkError("down".to_owned())));
+    let store = TestStore::default();
+    let failing = OrderKeyId::of(b"b");
+    store.failing_keys.lock().unwrap().insert(failing);
+    let mut harness =
+        Harness::start(Setup::default(), ScriptedSink::new(LIMITS, script), store).await;
+    harness.send(0, b"a", 10).unwrap();
+    harness.send(1, b"b", 10).unwrap();
+    harness.send(2, b"c", 10).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    harness.lanes.park_all();
+    let settled = tokio::time::timeout(Duration::from_secs(60), harness.settle(2)).await;
+    assert_eq!(settled.ok(), Some(Lsn(100)));
+    assert_eq!(
+        harness.store.queue(b"a").await,
+        vec![(0, ParkStatus::Retrying)]
+    );
+    assert_eq!(
+        harness.store.queue(b"c").await,
+        vec![(2, ParkStatus::Retrying)]
+    );
+    assert_eq!(harness.store.queue(b"b").await, vec![]);
+    harness.store.append_calls.lock().unwrap().clear();
+    assert!(harness.quiet_for(Duration::from_secs(60)).await);
+    let retried = std::mem::take(&mut *harness.store.append_calls.lock().unwrap());
+    assert_ne!(retried, Vec::<Vec<OrderKeyId>>::new());
+    assert!(
+        retried.iter().all(|keys| keys == &vec![failing]),
+        "{retried:?}"
+    );
+    harness.store.failing_keys.lock().unwrap().clear();
+    assert_eq!(harness.settle(1).await, Lsn(102));
+    assert_eq!(
+        harness.store.queue(b"b").await,
+        vec![(1, ParkStatus::Retrying)]
+    );
+    assert_eq!(
+        harness.store.queue(b"a").await,
+        vec![(0, ParkStatus::Retrying)]
+    );
+    assert_eq!(harness.ack.inflight_events(), 0);
+}

@@ -152,6 +152,8 @@ struct TestStore {
     appends: AtomicUsize,
     fail_appends: AtomicU32,
     land_on_failure: AtomicUsize,
+    failing_keys: Mutex<HashSet<OrderKeyId>>,
+    append_calls: Mutex<Vec<Vec<OrderKeyId>>>,
     fail_reads: AtomicU32,
     fail_removes: AtomicU32,
     fail_status_changes: AtomicU32,
@@ -225,6 +227,17 @@ impl TestStore {
 impl StateStore for TestStore {
     async fn append_parked(&self, events: &[ParkedEvent]) -> Result<(), StoreError> {
         tokio::time::sleep(self.append_delay).await;
+        let mut keys: Vec<OrderKeyId> = events.iter().map(|event| event.order_key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let failing = {
+            let failing = self.failing_keys.lock().unwrap();
+            keys.iter().any(|key| failing.contains(key))
+        };
+        self.append_calls.lock().unwrap().push(keys);
+        if failing {
+            return Err(outage());
+        }
         if take_failure(&self.fail_appends) {
             let land = self.land_on_failure.load(Ordering::SeqCst);
             let mut sorted: Vec<&ParkedEvent> = events.iter().collect();

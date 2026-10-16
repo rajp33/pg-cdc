@@ -1,7 +1,9 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::task::Poll;
 
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -136,21 +138,26 @@ impl Lane {
         self.store_due = Some(Instant::now() + delay);
     }
 
-    fn queued_events(&self, keys: &[OrderKeyId]) -> Vec<ParkedEvent> {
+    fn queued_events(&self, key: &OrderKeyId) -> Vec<ParkedEvent> {
+        let Some(state) = self.keys.get(key) else {
+            return Vec::new();
+        };
         let parked_at = now_ms();
-        let mut events = Vec::new();
-        for state in keys.iter().filter_map(|key| self.keys.get(key)) {
-            let floor = state.stored.as_ref().and_then(|stored| stored.floor);
-            let dead = state
-                .stored
-                .as_ref()
-                .is_some_and(|stored| stored.dead_on_append);
-            for (index, pending) in state.queue.iter().enumerate() {
+        let floor = state.stored.as_ref().and_then(|stored| stored.floor);
+        let dead = state
+            .stored
+            .as_ref()
+            .is_some_and(|stored| stored.dead_on_append);
+        state
+            .queue
+            .iter()
+            .enumerate()
+            .map(|(index, pending)| {
                 let failure = state
                     .failure
                     .as_ref()
                     .filter(|_| index == 0 && floor == Some(pending.outbound.id));
-                events.push(ParkedEvent {
+                ParkedEvent {
                     order_key: pending.outbound.order_key,
                     id: pending.outbound.id,
                     status: if dead && index == 0 {
@@ -164,16 +171,20 @@ impl Lane {
                         .map_or_else(|| QUEUED_BEHIND.to_owned(), |failure| failure.error.clone()),
                     attributes: pending.outbound.attributes.clone(),
                     body: pending.outbound.body.clone(),
-                });
-            }
-        }
-        events
+                }
+            })
+            .collect()
     }
 
     async fn flush_appends(&mut self) {
-        let keys: Vec<OrderKeyId> = std::mem::take(&mut self.to_append).into_iter().collect();
-        let events = self.queued_events(&keys);
-        let count = u64::try_from(events.len()).unwrap_or(u64::MAX);
+        let queues: Vec<(OrderKeyId, Vec<ParkedEvent>)> = std::mem::take(&mut self.to_append)
+            .into_iter()
+            .map(|key| (key, self.queued_events(&key)))
+            .collect();
+        let count = queues
+            .iter()
+            .map(|(_, events)| u64::try_from(events.len()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
         let parked = self.parked.load(Ordering::SeqCst);
         if self.max_parked > 0 && parked.saturating_add(count) > self.max_parked {
             let delay = self.store_backoff.next_delay();
@@ -185,40 +196,55 @@ impl Lane {
                 "the parked event limit is reached; events stay in flight"
             );
             self.append_due = Some(Instant::now() + delay);
-            self.to_append.extend(keys);
+            self.to_append
+                .extend(queues.into_iter().map(|(key, _)| key));
             return;
         }
         self.append_due = None;
         let store = Arc::clone(&self.store);
         let span = tracing::debug_span!("park", events = count);
-        let appended = self
-            .publishing(store.append_parked(&events).instrument(span))
-            .await;
-        if let Err(error) = &appended {
-            self.store_failed("append", error);
-            self.to_append.extend(keys);
-            return;
-        }
-        self.store_succeeded();
-        record_parked(&events);
-        self.parked.fetch_add(count, Ordering::SeqCst);
-        for key in keys {
-            let Some(state) = self.keys.get_mut(&key) else {
-                continue;
-            };
-            for pending in std::mem::take(&mut state.queue) {
-                if let Ok(settled) = pending.ticket.park(&appended) {
-                    let _ = self.reports.send(Report::Settled(settled));
+        let appends = queues
+            .iter()
+            .map(|(_, events)| store.append_parked(events))
+            .collect();
+        let appended = self.publishing(join_all(appends).instrument(span)).await;
+        let mut failure = None;
+        for ((key, events), appended) in queues.into_iter().zip(appended) {
+            match appended {
+                Ok(()) => self.appended(key, &events),
+                Err(error) => {
+                    self.to_append.insert(key);
+                    failure = Some(error);
                 }
             }
-            if let Some(stored) = state.stored.as_mut()
-                && stored.dead_on_append
-            {
-                stored.dead_on_append = false;
-                stored.dead = true;
-                self.stats_dirty = true;
-                tracing::error!(order_key = %key, id = ?stored.floor, "a dead event is parked and blocks its order key");
+        }
+        match failure {
+            Some(error) => self.store_failed("append", &error),
+            None => self.store_succeeded(),
+        }
+    }
+
+    fn appended(&mut self, key: OrderKeyId, events: &[ParkedEvent]) {
+        record_parked(events);
+        self.parked.fetch_add(
+            u64::try_from(events.len()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+        let Some(state) = self.keys.get_mut(&key) else {
+            return;
+        };
+        for pending in std::mem::take(&mut state.queue) {
+            if let Ok(settled) = pending.ticket.park(&Ok(())) {
+                let _ = self.reports.send(Report::Settled(settled));
             }
+        }
+        if let Some(stored) = state.stored.as_mut()
+            && stored.dead_on_append
+        {
+            stored.dead_on_append = false;
+            stored.dead = true;
+            self.stats_dirty = true;
+            tracing::error!(order_key = %key, id = ?stored.floor, "a dead event is parked and blocks its order key");
         }
     }
 
@@ -412,6 +438,30 @@ impl Lane {
         }
         self.store_succeeded();
     }
+}
+
+// Store writes must stay in the lane task: a spawned write outlives an aborted lane and escapes the gate's abandoned-write count.
+async fn join_all<F: Future + Unpin>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut running: Vec<Option<F>> = futures.into_iter().map(Some).collect();
+    let mut outputs: Vec<Option<F::Output>> = running.iter().map(|_| None).collect();
+    std::future::poll_fn(|context| {
+        let mut done = true;
+        for (slot, output) in running.iter_mut().zip(outputs.iter_mut()) {
+            let Some(future) = slot.as_mut() else {
+                continue;
+            };
+            match Pin::new(future).poll(context) {
+                Poll::Ready(value) => {
+                    *output = Some(value);
+                    *slot = None;
+                }
+                Poll::Pending => done = false,
+            }
+        }
+        if done { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
 }
 
 fn record_parked(events: &[ParkedEvent]) {
