@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use pg_cdc_decoder::Lsn;
 
@@ -69,7 +70,6 @@ pub struct Settled {
 
 #[derive(Debug)]
 struct Txn {
-    seq: u64,
     last: u64,
     end_lsn: Option<Lsn>,
     unsettled: u64,
@@ -86,7 +86,7 @@ impl Txn {
 pub struct AckTracker {
     confirmed: Lsn,
     confirmed_commit_ms: Option<u64>,
-    txns: VecDeque<Txn>,
+    txns: BTreeMap<u64, Txn>,
     next_seq: u64,
     last_commit: Option<Lsn>,
     inflight_events: u64,
@@ -98,7 +98,7 @@ impl AckTracker {
         Self {
             confirmed: start,
             confirmed_commit_ms: None,
-            txns: VecDeque::new(),
+            txns: BTreeMap::new(),
             next_seq: 0,
             last_commit: None,
             inflight_events: 0,
@@ -126,10 +126,12 @@ impl AckTracker {
         self.txns.is_empty()
     }
 
-    fn open_txn(&mut self) -> Result<&mut Txn, AckError> {
+    fn open_txn(&mut self) -> Result<(u64, &mut Txn), AckError> {
         self.txns
-            .back_mut()
-            .filter(|txn| txn.end_lsn.is_none())
+            .iter_mut()
+            .next_back()
+            .filter(|(_, txn)| txn.end_lsn.is_none())
+            .map(|(seq, txn)| (*seq, txn))
             .ok_or(AckError::NotOpen)
     }
 
@@ -137,27 +139,28 @@ impl AckTracker {
         if self.open_txn().is_ok() {
             return Err(AckError::AlreadyOpen);
         }
-        self.txns.push_back(Txn {
-            seq: self.next_seq,
-            last: self.next_seq,
-            end_lsn: None,
-            unsettled: 0,
-            commit_ms: None,
-        });
+        self.txns.insert(
+            self.next_seq,
+            Txn {
+                last: self.next_seq,
+                end_lsn: None,
+                unsettled: 0,
+                commit_ms: None,
+            },
+        );
         self.next_seq += 1;
         Ok(())
     }
 
     pub fn stamp(&mut self, commit_ms: Option<u64>) {
-        if let Ok(txn) = self.open_txn() {
+        if let Ok((_, txn)) = self.open_txn() {
             txn.commit_ms = commit_ms;
         }
     }
 
     pub fn track(&mut self, bytes: u64) -> Result<Ticket, AckError> {
-        let txn = self.open_txn()?;
+        let (seq, txn) = self.open_txn()?;
         txn.unsettled += 1;
-        let seq = txn.seq;
         self.inflight_events += 1;
         self.inflight_bytes = self.inflight_bytes.saturating_add(bytes);
         Ok(Ticket { txn: seq, bytes })
@@ -169,12 +172,10 @@ impl AckTracker {
         {
             return Err(AckError::CommitOutOfOrder { previous, end_lsn });
         }
-        let txn = self.open_txn()?;
+        let (seq, txn) = self.open_txn()?;
         txn.end_lsn = Some(end_lsn);
         self.last_commit = Some(end_lsn);
-        if let Some(index) = self.txns.len().checked_sub(1) {
-            self.compact(index);
-        }
+        self.compact(seq);
         self.advance();
         Ok(self.confirmed)
     }
@@ -186,16 +187,17 @@ impl AckTracker {
     pub fn settle(&mut self, settled: Settled) -> Result<Lsn, AckError> {
         let Settled { txn, bytes } = settled;
         let unknown = AckError::UnknownSettlement { txn };
-        let index = self.txns.partition_point(|entry| entry.last < txn);
-        let entry = self
+        let (seq, entry) = self
             .txns
-            .get_mut(index)
-            .filter(|entry| entry.seq <= txn)
+            .range_mut(..=txn)
+            .next_back()
+            .filter(|(_, entry)| entry.last >= txn)
             .ok_or(unknown.clone())?;
+        let seq = *seq;
         entry.unsettled = entry.unsettled.checked_sub(1).ok_or(unknown)?;
         self.inflight_events -= 1;
         self.inflight_bytes = self.inflight_bytes.saturating_sub(bytes);
-        self.compact(index);
+        self.compact(seq);
         self.advance();
         Ok(self.confirmed)
     }
@@ -207,26 +209,35 @@ impl AckTracker {
         self.confirmed
     }
 
-    fn compact(&mut self, index: usize) {
-        let settled = |txns: &VecDeque<Txn>, at: usize| txns.get(at).is_some_and(Txn::is_settled);
-        if !settled(&self.txns, index) {
+    fn compact(&mut self, seq: u64) {
+        if !self.txns.get(&seq).is_some_and(Txn::is_settled) {
             return;
         }
-        let mut index = index;
-        if settled(&self.txns, index + 1) {
-            self.merge(index);
+        let next = self
+            .txns
+            .range((Excluded(seq), Unbounded))
+            .next()
+            .filter(|(_, txn)| txn.is_settled())
+            .map(|(next, _)| *next);
+        if let Some(next) = next {
+            self.merge(seq, next);
         }
-        if index > 0 && settled(&self.txns, index - 1) {
-            index -= 1;
-            self.merge(index);
+        let previous = self
+            .txns
+            .range(..seq)
+            .next_back()
+            .filter(|(_, txn)| txn.is_settled())
+            .map(|(previous, _)| *previous);
+        if let Some(previous) = previous {
+            self.merge(previous, seq);
         }
     }
 
-    fn merge(&mut self, index: usize) {
-        let Some(later) = self.txns.remove(index + 1) else {
+    fn merge(&mut self, earlier: u64, later: u64) {
+        let Some(later) = self.txns.remove(&later) else {
             return;
         };
-        if let Some(earlier) = self.txns.get_mut(index) {
+        if let Some(earlier) = self.txns.get_mut(&earlier) {
             earlier.last = later.last;
             earlier.end_lsn = earlier.end_lsn.max(later.end_lsn);
             earlier.commit_ms = later.commit_ms.or(earlier.commit_ms);
@@ -234,7 +245,7 @@ impl AckTracker {
     }
 
     fn advance(&mut self) {
-        while let Some(front) = self.txns.front() {
+        while let Some((_, front)) = self.txns.first_key_value() {
             let Some(end_lsn) = front.end_lsn else {
                 break;
             };
@@ -245,7 +256,7 @@ impl AckTracker {
             if front.commit_ms.is_some() {
                 self.confirmed_commit_ms = front.commit_ms;
             }
-            self.txns.pop_front();
+            self.txns.pop_first();
         }
     }
 }
@@ -399,6 +410,47 @@ mod tests {
             Err(AckError::UnknownSettlement { txn: 1 })
         );
         assert_eq!(ack.settle(delivered(blocker)), Ok(Lsn(400)));
+        assert!(ack.is_idle());
+    }
+
+    #[test]
+    fn a_recovering_block_between_stuck_blocks_compacts_into_one_entry() {
+        let blocks = 50_000_u64;
+        let mut ack = AckTracker::new(Lsn(100));
+        let mut tickets: Vec<Ticket> = Vec::new();
+        for txn in 0..3 * blocks {
+            ack.begin().unwrap();
+            tickets.push(ack.track(1).unwrap());
+            ack.commit(Lsn(200 + txn)).unwrap();
+        }
+        let suffix = tickets.split_off(usize::try_from(2 * blocks).unwrap());
+        let middle = tickets.split_off(usize::try_from(blocks).unwrap());
+        let prefix = tickets;
+        let mut stale = AckTracker::new(Lsn(100));
+        for _ in 0..=blocks {
+            stale.begin().unwrap();
+            stale.track(1).unwrap();
+            stale.commit(Lsn(100)).unwrap();
+        }
+        stale.begin().unwrap();
+        let inside = stale.track(1).unwrap();
+        for ticket in middle {
+            assert_eq!(ack.settle(delivered(ticket)), Ok(Lsn(100)));
+        }
+        assert_eq!(ack.txns.len(), usize::try_from(2 * blocks + 1).unwrap());
+        assert_eq!(
+            ack.settle(delivered(inside)),
+            Err(AckError::UnknownSettlement { txn: blocks + 1 })
+        );
+        for ticket in prefix {
+            ack.settle(delivered(ticket)).unwrap();
+        }
+        assert_eq!(ack.confirmed(), Lsn(200 + 2 * blocks - 1));
+        assert_eq!(ack.txns.len(), usize::try_from(blocks).unwrap());
+        for ticket in suffix {
+            ack.settle(delivered(ticket)).unwrap();
+        }
+        assert_eq!(ack.confirmed(), Lsn(200 + 3 * blocks - 1));
         assert!(ack.is_idle());
     }
 
