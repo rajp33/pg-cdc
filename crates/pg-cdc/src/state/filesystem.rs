@@ -1426,6 +1426,38 @@ mod tests {
     }
 
     #[test]
+    fn a_writer_whose_open_temp_file_is_reclaimed_fails_instead_of_losing_its_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(dir.path().join("orders"));
+        let queue = key(1);
+        let fired = AtomicBool::new(false);
+        let (_injected, _) = record_syncs(dir.path(), {
+            let root = Arc::clone(&root);
+            move |path| {
+                if is_temp(path) && !fired.swap(true, Ordering::SeqCst) {
+                    File::options()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_modified(std::time::SystemTime::now() - Duration::from_hours(2))
+                        .unwrap();
+                    load_heads(&root, queue.partition(), &|| false).unwrap();
+                    assert!(!path.exists());
+                }
+                false
+            }
+        });
+
+        assert!(append(&root, &encoded(queue, 1), &|| false).is_err());
+        assert_eq!(names(&key_dir(&root, &queue)), Vec::<String>::new());
+        append(&root, &encoded(queue, 1), &|| false).unwrap();
+        assert_eq!(
+            read(&root, queue, None, 1, &|| false).unwrap(),
+            vec![parked(queue, 0)]
+        );
+    }
+
+    #[test]
     fn a_leader_swap_reclaims_temp_files_left_beside_the_record() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("orders");
