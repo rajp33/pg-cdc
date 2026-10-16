@@ -102,7 +102,7 @@ pg-cdc v1 is the change reader for Theia's [THE-526](https://linear.app/theia-vi
 3. **WAL stays bounded during a sink outage.** The slot keeps advancing once events park, so retained WAL is roughly `park_after` worth of write volume.
 4. **Throughput:** at least 5,000 events/s sustained, with p99 commit-to-acknowledgement under 1 s against a healthy SNS topic.
 5. **Handover:** a deploy handover completes in under 10 s with nothing lost.
-6. **Memory** stays within `max_inflight_bytes` plus fixed overhead, whatever the transaction size.
+6. **Memory** stays within `max_inflight_bytes` plus fixed overhead, whatever the transaction size. Parked order keys are outside this bound: each costs about 0.5 to 1 KB of lane memory while parked, bounded only by `max_parked_events` (§10.5).
 7. **Telemetry overhead:** with telemetry not configured, throughput is within 1% of a build without the `otel` feature.
 
 ## 5. Architecture
@@ -371,6 +371,8 @@ Short of a halt (§10.7) or a lost slot (§13.3), only two conditions stall the 
 
 - **The parked limit.** `delivery.max_parked_events` defaults to 10,000,000, and 0 means unlimited. At the limit no more events park, so undeliverable events stay in flight until backpressure stalls the reader.
 - **The StateStore is unavailable.** Events cannot park, and the pipeline stalls the same way.
+
+Memory is a third limit. Each order key with a parked queue keeps about 0.5 to 1 KB of lane state in memory while it is parked, and a takeover loads every parked queue's head before delivering, so `max_inflight_bytes` does not bound it. Only `max_parked_events` does, since each parked key holds at least one event; the task needs about `max_parked_events` x 1 KB on top of `max_inflight_bytes`, or a lower `max_parked_events`.
 
 ### 10.6 Startup and takeover
 
