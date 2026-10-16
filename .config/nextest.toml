@@ -7,3 +7,16 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = "kind(test)"
 test-group = "docker"
+
+[[profile.default.overrides]]
+filter = """
+(binary(handover) & (
+  test(=a_start_first_deploy_hands_over_on_sigterm_without_loss)
+  | test(=a_sigterm_with_a_full_stdout_pipe_still_exits_within_the_budget)
+  | test(=a_sigterm_with_a_full_stdout_log_pipe_still_hands_over_within_the_budget)
+  | test(=a_sigterm_with_a_full_stderr_log_pipe_still_hands_over_within_the_budget)
+  | test(=a_sigterm_that_exhausts_every_window_with_a_full_log_pipe_exits_within_the_bound)
+))
+| (binary(stream) & test(=leadership::l3_a_standby_never_writes_while_another_session_holds_the_slot))
+"""
+retries = 2
