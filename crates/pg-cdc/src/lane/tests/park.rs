@@ -442,3 +442,83 @@ async fn lanes_parking_at_once_never_exceed_the_parked_limit_together() {
     assert_eq!(settled, 3);
     assert_eq!(harness.ack.inflight_events(), 9);
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_event_delivered_after_a_partial_append_releases_its_reservation_once() {
+    let start = Instant::now();
+    let script: Script = Box::new(move |ordinal, _| {
+        if ordinal == 0 && Instant::now() >= start + Duration::from_millis(1050) {
+            Outcome::Delivered
+        } else {
+            Outcome::Retryable(SinkError("throttled".to_owned()))
+        }
+    });
+    let store = TestStore::default();
+    store.fail_appends.store(u32::MAX, Ordering::SeqCst);
+    store.land_on_failure.store(1, Ordering::SeqCst);
+    let setup = Setup {
+        park_after: Duration::from_secs(1),
+        max_parked_events: 2,
+        ..Setup::default()
+    };
+    let mut harness = Harness::start(setup, ScriptedSink::new(LIMITS, script), store).await;
+    harness.send(0, b"k", 10).unwrap();
+    harness.send(1, b"k", 10).unwrap();
+    assert_eq!(harness.settle(1).await, Lsn(100));
+    for _ in 0..1000 {
+        if harness.store.queue(b"k").await == vec![(1, ParkStatus::Retrying)] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(1, ParkStatus::Retrying)]
+    );
+    harness.store.fail_appends.store(0, Ordering::SeqCst);
+    assert_eq!(harness.settle(1).await, Lsn(101));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(1, ParkStatus::Retrying)]
+    );
+    assert_eq!(harness.gauges().events, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drained_key_releases_only_the_reservations_its_queue_still_holds() {
+    let start = Instant::now();
+    let script: Script = Box::new(move |ordinal, _| {
+        let recovered = Instant::now() >= start + Duration::from_millis(1050);
+        if ordinal == 9 || (ordinal == 0 && !recovered) {
+            Outcome::Retryable(SinkError("throttled".to_owned()))
+        } else {
+            Outcome::Delivered
+        }
+    });
+    let store = TestStore::default();
+    store.seed(b"other", 9, ParkStatus::Retrying).await;
+    store
+        .failing_keys
+        .lock()
+        .unwrap()
+        .insert(OrderKeyId::of(b"k"));
+    let setup = Setup {
+        park_after: Duration::from_secs(1),
+        max_parked_events: 3,
+        ..Setup::default()
+    };
+    let mut harness = Harness::start(setup, ScriptedSink::new(LIMITS, script), store).await;
+    assert_eq!(harness.gauges().events, 1);
+    harness.store.seed(b"k", 0, ParkStatus::Retrying).await;
+    harness.send(0, b"k", 10).unwrap();
+    harness.send(1, b"k", 10).unwrap();
+    assert_eq!(harness.settle(2).await, Lsn(101));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(harness.store.queue(b"k").await, vec![]);
+    assert_eq!(
+        harness.store.queue(b"other").await,
+        vec![(9, ParkStatus::Retrying)]
+    );
+    assert_eq!(harness.gauges().events, 1);
+}

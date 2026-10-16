@@ -31,9 +31,11 @@ impl Lane {
         });
         self.stats_dirty = true;
         let queued = std::mem::take(&mut state.queue);
+        let mut dropped = 0_u64;
         for pending in queued {
             let id = pending.outbound.id;
             if id < head.head {
+                dropped += 1;
                 if let Ok(settled) = pending.ticket.skip_replayed(id, head.head) {
                     let _ = self.reports.send(Report::Settled(settled));
                 }
@@ -41,9 +43,12 @@ impl Lane {
                 state.queue.push_back(pending);
             }
         }
+        let freed = dropped.min(state.reserved);
+        state.reserved -= freed;
         if !state.queue.is_empty() {
             self.to_append.insert(key);
         }
+        self.release(freed);
     }
 
     pub(super) fn partition_loaded(&mut self, partition: u8) {
@@ -232,7 +237,6 @@ impl Lane {
         };
         let wanted = u64::try_from(state.queue.len()).unwrap_or(u64::MAX);
         let held = state.reserved.min(wanted);
-        self.release(state.reserved - held);
         let allowed = held.saturating_add(self.reserve(wanted - held));
         if let Some(state) = self.keys.get_mut(&key) {
             state.reserved = allowed;
@@ -434,14 +438,14 @@ impl Lane {
                 record_delivered(&head, None);
                 state.backoff.reset();
                 state.failure = None;
-                if state
+                if let Some(pending) = state
                     .queue
-                    .front()
-                    .is_some_and(|pending| pending.outbound.id == head.id)
-                    && let Some(pending) = state.queue.pop_front()
-                    && let Ok(settled) = pending.ticket.settle(outcome)
+                    .pop_front_if(|pending| pending.outbound.id == head.id)
                 {
-                    let _ = self.reports.send(Report::Settled(settled));
+                    state.reserved = state.reserved.saturating_sub(1);
+                    if let Ok(settled) = pending.ticket.settle(outcome) {
+                        let _ = self.reports.send(Report::Settled(settled));
+                    }
                 }
                 self.to_remove.push((key, head.id));
             }
