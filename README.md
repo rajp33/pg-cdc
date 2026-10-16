@@ -81,7 +81,7 @@ The replication slot is the lock: Postgres allows one walsender per slot, so onl
 ```yaml
 leadership:
   lease_timeout: 6s
-  fence_delay: 10s
+  fence_delay: 16s
   drain_timeout: 5s
 admin:
   listen: 127.0.0.1:9187
@@ -90,7 +90,7 @@ admin:
 - **Standby.** A task that finds the slot held logs `waiting as standby`. It holds one control connection, polls `pg_replication_slots` every 2 s, and takes the slot when it frees. If another standby wins the race, it keeps polling. A standby never writes to the sink or the state store.
 - **Takeover.** The new holder reads the leader record (`leader.json` in the state store). A `released` record means the previous holder handed over cleanly, and delivery starts at once. An `active` record means the previous holder crashed or was fenced, and the successor waits `fence_delay` before it writes anything. Each takeover logs `took over the slot` with its `epoch` and its `kind` (`first`, `clean` or `unclean`); the epoch rises by one at every takeover.
 - **`leadership.lease_timeout`** (default 6 s, above 2 s). Every 2 s the active task checks over the control connection that the slot is still held by its own walsender. If no check succeeds for `lease_timeout`, the task fences itself: it stops writing, drops in-flight work, closes the replication connection and returns to standby.
-- **`leadership.fence_delay`** (default 10 s, must exceed `lease_timeout`). What a successor waits after a crash or a fence, so the old holder has stopped writing before the new one starts. A crashed or fenced holder therefore costs its successor `fence_delay`.
+- **`leadership.fence_delay`** (default 16 s, must exceed `lease_timeout`, and with an S3 state store must be at least `lease_timeout` plus the S3 client's 10 s attempt timeout). What a successor waits after a crash or a fence, so the old holder has stopped writing, and a store write it already sent has landed or timed out, before the new one starts. A crashed or fenced holder therefore costs its successor `fence_delay`.
 - **`leadership.drain_timeout`** (default 5 s). The window for in-flight events to deliver, and again for parking what remains, during a shutdown.
 - **Shutdown on SIGTERM.** The task stops reading, drains for `drain_timeout`, parks for at most another `drain_timeout`, stops its lanes, sends a final status update, marks the leader record `released` with the confirmed LSN, closes the replication connection and exits 0. The whole sequence takes at most `2 x drain_timeout + 3 s`, 13 s at the defaults. A clean handover leaves the successor a gap of the old task's shutdown plus one poll, a few seconds, well under 10 s. If the task was fenced, had to abandon a write, could not stop its lanes within the 3 s tail or could not send the final status update, the record stays `active` and the successor waits `fence_delay`.
 - **Admin endpoint.** `admin.listen` is an IP address and port, default `127.0.0.1:9187`; host names are rejected, and port 0 picks a free port that is logged as `admin listening`. The endpoint has no authentication, so keep it on loopback or a private network. Two tasks that share a network namespace, as during a start-first deploy on one host, need distinct ports. A task that cannot bind the address exits 1.

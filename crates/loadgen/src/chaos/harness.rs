@@ -107,7 +107,7 @@ state_store:
   prefix: {STATE_PREFIX}
 leadership:
   lease_timeout: 4s
-  fence_delay: 4500ms
+  fence_delay: 14s
   drain_timeout: 1s
 admin:
   listen: 127.0.0.1:0
@@ -499,7 +499,7 @@ mod tests {
             "  bucket: chaos-state",
             "  prefix: chaos",
             "  lease_timeout: 4s",
-            "  fence_delay: 4500ms",
+            "  fence_delay: 14s",
             "  drain_timeout: 1s",
             "  listen: 127.0.0.1:0",
             "    mode: disable",

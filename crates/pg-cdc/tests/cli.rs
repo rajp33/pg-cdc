@@ -527,7 +527,9 @@ async fn a_missing_state_bucket_keeps_the_store_check_retrying_without_taking_th
     let aws = AwsEmulator::start().await?;
     let sections = "sink:\n  type: discard\nstate_store:\n  type: s3\n  bucket: missing-state\n";
     let config = write_config_with_sink(&pg, "cli_slot", "200ms", sections)?;
-    let mut child = spawn_with_env(config.path(), pg.password(), Stdio::null(), &moto_env(&aws))?;
+    let mut env = moto_env(&aws);
+    env.push(("PGCDC__LEADERSHIP__FENCE_DELAY", "14s"));
+    let mut child = spawn_with_env(config.path(), pg.password(), Stdio::null(), &env)?;
     let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
     let failed = wait_for_line(&mut stdout, "state store check failed").await?;
     assert!(failed.contains("NoSuchBucket"), "{failed}");

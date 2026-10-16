@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::leader::POLL_INTERVAL;
 use crate::order::OrderBy;
+use crate::state::s3::S3_ATTEMPT_TIMEOUT;
 
 pub const ENV_PREFIX: &str = "PGCDC__";
 pub const DEFAULT_LANES: usize = 64;
@@ -23,7 +24,7 @@ pub const DEFAULT_MAX_PARKED_EVENTS: u64 = 10_000_000;
 pub const DEFAULT_STORE_CONCURRENCY: usize = 256;
 pub const MAX_CONCURRENCY: usize = 4096;
 pub const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(6);
-pub const DEFAULT_FENCE_DELAY: Duration = Duration::from_secs(10);
+pub const DEFAULT_FENCE_DELAY: Duration = Duration::from_secs(16);
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_TRACE_SAMPLE_RATIO: f64 = 0.01;
 pub const DEFAULT_ADMIN_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9187);
@@ -549,6 +550,19 @@ impl Config {
         self.delivery.validate()?;
         self.leadership.validate()?;
         self.state_store.validate()?;
+        if matches!(self.state_store, StateStoreConfig::S3(_))
+            && self.leadership.fence_delay
+                < self
+                    .leadership
+                    .lease_timeout
+                    .saturating_add(S3_ATTEMPT_TIMEOUT)
+        {
+            return Err(invalid_duration(
+                "leadership.fence_delay",
+                self.leadership.fence_delay,
+                "must be at least leadership.lease_timeout plus the 10s S3 attempt timeout when the state store is S3",
+            ));
+        }
         self.telemetry.validate()?;
         if let Some(PayloadStoreConfig::S3(payload)) = &self.payload_store {
             validate_bucket("payload_store.bucket", &payload.bucket)?;
@@ -1664,7 +1678,7 @@ state_store:
         let config = parse(MINIMAL, with_password()).unwrap();
         assert_eq!(config.leadership, LeadershipConfig::default());
         assert_eq!(config.leadership.lease_timeout, Duration::from_secs(6));
-        assert_eq!(config.leadership.fence_delay, Duration::from_secs(10));
+        assert_eq!(config.leadership.fence_delay, Duration::from_secs(16));
         assert_eq!(config.leadership.drain_timeout, Duration::from_secs(5));
         assert_eq!(config.admin, AdminConfig::default());
         assert_eq!(config.admin.listen, "127.0.0.1:9187".parse().unwrap());
@@ -1716,6 +1730,45 @@ state_store:
             "leadership.fence_delay \"6000ms\" is invalid: must be greater than leadership.lease_timeout"
         );
         parse(&leadership("  fence_delay: 6001ms"), with_password()).unwrap();
+    }
+
+    #[test]
+    fn an_s3_state_store_needs_a_fence_delay_covering_the_lease_and_one_s3_attempt() {
+        let s3 = |timers: &str| {
+            format!(
+                "{}leadership:\n{timers}\n",
+                stores("state_store:\n  type: s3\n  bucket: b\n")
+            )
+        };
+        let error = parse(
+            &s3("  lease_timeout: 6s\n  fence_delay: 15999ms"),
+            with_password(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "leadership.fence_delay \"15999ms\" is invalid: must be at least leadership.lease_timeout plus the 10s S3 attempt timeout when the state store is S3"
+        );
+        let config = parse(
+            &s3("  lease_timeout: 6s\n  fence_delay: 16s"),
+            with_password(),
+        )
+        .unwrap();
+        assert_eq!(config.leadership.fence_delay, Duration::from_secs(16));
+        let defaults = parse(
+            &stores("state_store:\n  type: s3\n  bucket: b\n"),
+            with_password(),
+        )
+        .unwrap();
+        assert!(
+            defaults.leadership.fence_delay
+                >= defaults.leadership.lease_timeout + S3_ATTEMPT_TIMEOUT
+        );
+        parse(
+            &leadership("  lease_timeout: 6s\n  fence_delay: 7s"),
+            with_password(),
+        )
+        .unwrap();
     }
 
     #[test]

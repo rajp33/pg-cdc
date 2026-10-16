@@ -590,7 +590,7 @@ A task moves from `standby` to `active` to `draining`. The slot is the lock, bec
 1. **Acquire the slot.** Start the status task and the reader immediately.
 2. **Read the leader record.**
    - If it is `released`, continue at once.
-   - If it is `active`, the previous holder did not release cleanly. Wait `fence_delay` (10 s, longer than `lease_timeout`) before any sink or store write.
+   - If it is `active`, the previous holder did not release cleanly. Wait `fence_delay` (16 s: longer than `lease_timeout`, and with an S3 state store at least `lease_timeout` plus the S3 attempt timeout) before any sink or store write.
 3. **Claim leadership.** Swap the record to `{epoch: previous + 1, holder: self, state: active}`.
    - If the swap fails, another writer is active: release the slot, return to standby and raise an alert.
 4. **Start delivery.** Load the parked heads and enable delivery partition by partition (§10.6).
@@ -621,6 +621,8 @@ The new task's gap is the drain plus one poll, about 2–7 s. A transaction stil
 ### 12.8 Known limit
 
 A process paused for longer than `fence_delay` can land stale writes when it resumes. The result is duplicates, never loss.
+
+A store write already on the wire when its task fences can still commit after the future is dropped. A self-fenced task stops at most `lease_timeout` after its last good lease check, and the S3 client gives up an attempt after 10 s, so with an S3 state store `fence_delay` must be at least `lease_timeout` plus that attempt timeout. Otherwise the old holder's first append for a key could land after the successor listed that key's partition, and the orphaned queue head would be redelivered after newer events of the key at the next takeover.
 
 ## 13. Slot and source safety
 
@@ -768,7 +770,7 @@ payload_store:
 
 leadership:
   lease_timeout: 6s
-  fence_delay: 10s
+  fence_delay: 16s
   drain_timeout: 5s
 
 admin:
@@ -794,7 +796,7 @@ With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDE
 | `sink.max_concurrency` | `32` |
 | `state_store.max_concurrency` | `256` |
 | `leadership.lease_timeout` | `6s` |
-| `leadership.fence_delay` | `10s` |
+| `leadership.fence_delay` | `16s` |
 | `leadership.drain_timeout` | `5s` |
 | `admin.listen` | `127.0.0.1:9187` |
 | `telemetry.otlp_endpoint` | unset (telemetry disabled) |
@@ -809,7 +811,7 @@ Fixed internal values:
 - reconnect backoff: 1 s to 30 s;
 - decode fault halt: 3 consecutive faults.
 
-`fence_delay` must be greater than `lease_timeout`; config validation enforces it.
+`fence_delay` must be greater than `lease_timeout`, and with an S3 state store at least `lease_timeout` plus the S3 client's 10 s attempt timeout; config validation enforces both.
 
 ## 16. CLI and admin API
 
