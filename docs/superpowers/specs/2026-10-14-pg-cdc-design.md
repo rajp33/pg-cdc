@@ -602,7 +602,7 @@ A task moves from `standby` to `active` to `draining`. The slot is the lock, bec
 1. Stop reading the socket.
 2. Give in-flight events `drain_timeout` (5 s) to deliver, then park whatever remains.
 3. Send a final status update. If it cannot be sent, the leader record stays `active` and the next holder waits `fence_delay`.
-4. Swap the leader record to `released`, with the confirmed LSN.
+4. Swap the leader record to `released`, with the confirmed LSN. If the swap does not finish in time, it may still have landed, so the record is either `active` or `released`; the next holder reads it and waits `fence_delay` only if it is still `active`.
 5. Close the replication connection and exit 0.
 
 The new task's gap is the drain plus one poll, about 2–7 s. A transaction still open at handover replays to the new task with the same ids.
