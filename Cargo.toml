@@ -1,0 +1,134 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rajp33/pg-cdc"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+aws-config = { version = "1.12.0", default-features = false, features = [
+  "rt-tokio",
+  "behavior-version-latest",
+] }
+aws-sdk-rds = { version = "1.154.0", default-features = false, features = [
+  "rt-tokio",
+  "behavior-version-latest",
+] }
+aws-sdk-s3 = { version = "1.152.0", default-features = false, features = [
+  "rt-tokio",
+  "behavior-version-latest",
+] }
+aws-sdk-sns = { version = "1.116.0", default-features = false, features = [
+  "rt-tokio",
+  "behavior-version-latest",
+] }
+aws-sdk-sqs = { version = "1.114.0", default-features = false, features = [
+  "rt-tokio",
+  "behavior-version-latest",
+] }
+aws-smithy-http-client = { version = "1.5.0", default-features = false, features = ["rustls-ring"] }
+bytes = "1.12.1"
+clap = { version = "4.6.7", default-features = false, features = [
+  "std",
+  "derive",
+  "help",
+  "usage",
+  "error-context",
+] }
+fallible-iterator = "0.2.0"
+fastrand = "2.5.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+opentelemetry = { version = "0.33.1", default-features = false, features = [
+  "trace",
+  "metrics",
+  "logs",
+] }
+opentelemetry-appender-tracing = { version = "0.33.1", default-features = false }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = [
+  "grpc-tonic",
+  "trace",
+  "metrics",
+  "logs",
+  "tls-ring",
+  "tls-webpki-roots",
+] }
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = [
+  "gen-tonic",
+  "trace",
+  "metrics",
+  "logs",
+] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
+  "trace",
+  "metrics",
+  "logs",
+] }
+pg-cdc-decoder = { path = "crates/decoder", version = "0.1.0" }
+pg-cdc-replication = { path = "crates/replication", version = "0.1.0" }
+pg-cdc-testkit = { path = "crates/testkit", version = "0.1.0" }
+postgres-protocol = "0.6.12"
+proptest = "1.12.0"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
+serde_json = { version = "1.0.154", features = [
+  "arbitrary_precision",
+  "preserve_order",
+  "raw_value",
+] }
+tempfile = "3.27.0"
+testcontainers = { version = "0.28.0", default-features = false }
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", default-features = false }
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
+tokio-postgres-rustls = { version = "0.14.0", default-features = false }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7.20", default-features = false }
+tonic = { version = "0.14.6", default-features = false, features = ["server", "router", "codegen"] }
+tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+  "fmt",
+  "json",
+  "env-filter",
+  "std",
+] }
+twox-hash = { version = "2.1.5", default-features = false, features = ["xxhash3_128"] }
+webpki-roots = "1.0.9"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+indexing_slicing = "deny"
