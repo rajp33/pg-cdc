@@ -543,6 +543,16 @@ fn set_status(
     replace(&dir, &name, &encode_parked(&event)?)
 }
 
+fn sync_absence(dir: &Path, parked: &Path) -> Result<(), StoreError> {
+    if dir.is_dir() {
+        sync_dir(dir)
+    } else if parked.is_dir() {
+        sync_dir(parked)
+    } else {
+        Ok(())
+    }
+}
+
 fn remove(
     root: &Path,
     events: &[(OrderKeyId, EventId)],
@@ -555,7 +565,9 @@ fn remove(
         let path = dir.join(format!("{id}.json"));
         match fs::remove_file(&path) {
             Ok(()) => sync_dir(&dir)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                sync_absence(&dir, &parked)?;
+            }
             Err(error) => return Err(unavailable(&path, &error)),
         }
         if fs::remove_dir(&dir).is_ok() {
@@ -1155,6 +1167,40 @@ mod tests {
         for created_in in [base.to_path_buf(), base.join("new")] {
             assert!(seen.contains(&created_in), "{created_in:?} not in {seen:?}");
         }
+    }
+
+    #[test]
+    fn a_removal_retried_after_a_failed_directory_sync_syncs_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 2), &|| false).unwrap();
+        let queue_dir = key_dir(&root, &queue);
+        let (_injected, synced) = record_syncs(dir.path(), fail_once(queue_dir.clone()));
+
+        let removed = [(queue, event_id(0))];
+        assert!(remove(&root, &removed, &|| false).is_err());
+        assert_eq!(names(&queue_dir), vec![format!("{}.json", event_id(1))]);
+        synced.lock().unwrap().clear();
+        remove(&root, &removed, &|| false).unwrap();
+        assert_eq!(*synced.lock().unwrap(), vec![queue_dir]);
+    }
+
+    #[test]
+    fn a_removal_retried_after_its_emptied_directory_went_unsynced_syncs_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("orders");
+        let queue = key(1);
+        append(&root, &encoded(queue, 1), &|| false).unwrap();
+        let parked_dir = root.join(PARKED_DIR);
+        let (_injected, synced) = record_syncs(dir.path(), fail_once(parked_dir.clone()));
+
+        let removed = [(queue, event_id(0))];
+        assert!(remove(&root, &removed, &|| false).is_err());
+        assert!(!key_dir(&root, &queue).exists());
+        synced.lock().unwrap().clear();
+        remove(&root, &removed, &|| false).unwrap();
+        assert_eq!(*synced.lock().unwrap(), vec![parked_dir]);
     }
 
     #[test]
