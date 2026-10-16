@@ -181,7 +181,7 @@ Spans: `transaction` (`commit_lsn`, `xid`, `events`), `sink_send` (`sink`, `size
 
 ## Container image
 
-`ghcr.io/rajp33/pg-cdc` is built for linux/amd64 and linux/arm64 on distroless (`gcr.io/distroless/cc-debian13:nonroot`) and runs as the `nonroot` user. Tags: `main` for the main branch, `sha-<short commit>`, and for release tags `<version>`, `<major>.<minor>` and `latest`.
+`ghcr.io/rajp33/pg-cdc` is built for linux/amd64 and linux/arm64 on distroless (`gcr.io/distroless/cc-debian13:nonroot`) and runs as the `nonroot` user. Tags: `main` for the main branch, `sha-<short commit>`, and for release tags `<version>`, `<major>.<minor>` and, for a release tag `vX.Y.Z` without a pre-release suffix, `latest`. The `ci` workflow builds both architectures on every pull request without pushing, and publishes only after lint (including `cargo deny`), the tests and the Postgres version matrix pass for that commit. Each published image carries an SBOM and build provenance and is signed with cosign; the [runbook](docs/runbook.md#2-ecs-settings) shows how to verify it.
 
 ```sh
 docker run --rm -v "$PWD/pg-cdc.yaml:/etc/pg-cdc/config.yaml:ro" \

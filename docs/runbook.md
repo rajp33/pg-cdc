@@ -49,6 +49,15 @@ With none free, the new task logs SQLSTATE 53300 (`number of requested standby c
 - **Health check in the task definition:** `["CMD", "/usr/local/bin/pg-cdc", "health"]`, for example with interval 10 s, timeout 3 s, retries 3 and start period 30 s. ECS ignores the image's own `HEALTHCHECK`. Set `PGCDC__ADMIN__LISTEN` in the task's environment when `admin.listen` is not `127.0.0.1:9187`; `pg-cdc health` and `pg-cdc parked` read it.
 - **Desired count:** 1, or 2 for a hot standby. Two tasks that share a network namespace need distinct admin ports.
 - **Source capacity:** one free WAL sender while a task starts (section 1).
+- **Verify the image.** Every published image is signed keylessly by the `ci` workflow. Before deploying a tag, resolve it to a digest, check the signature, and deploy by digest:
+
+  ```sh
+  cosign verify ghcr.io/rajp33/pg-cdc@sha256:<digest> \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github\.com/rajp33/pg-cdc/\.github/workflows/ci\.yml@refs/(heads/main|tags/v.+)$'
+  ```
+
+  `docker buildx imagetools inspect ghcr.io/rajp33/pg-cdc@sha256:<digest> --format '{{json .SBOM}}'` (or `.Provenance`) shows the attached SBOM and build provenance.
 
 ## 3. Clean handover and crash takeover
 
