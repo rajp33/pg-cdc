@@ -218,6 +218,7 @@ struct Key {
     failure: Option<Failure>,
     stored: Option<Stored>,
     offloaded: Option<Outbound>,
+    reserved: u64,
 }
 
 impl Key {
@@ -228,6 +229,7 @@ impl Key {
             failure: None,
             stored: None,
             offloaded: None,
+            reserved: 0,
         }
     }
 }

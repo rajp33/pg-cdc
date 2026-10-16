@@ -359,3 +359,86 @@ async fn park_all_parks_a_live_key_whose_partition_loads_afterwards() {
     );
     assert_eq!(harness.sink.batches(), Vec::<Vec<u32>>::new());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_backlog_above_the_parked_limit_parks_its_oldest_events_and_keeps_the_rest_in_flight() {
+    let script: Script = Box::new(|ordinal, _| {
+        if ordinal == 0 {
+            Outcome::Terminal(SinkError("rejected".to_owned()))
+        } else {
+            Outcome::Delivered
+        }
+    });
+    let setup = Setup {
+        max_parked_events: 2,
+        ..Setup::default()
+    };
+    let mut harness = Harness::start(
+        setup,
+        ScriptedSink::new(LIMITS, script),
+        TestStore::default(),
+    )
+    .await;
+    for ordinal in 0..3 {
+        harness.send(ordinal, b"k", 10).unwrap();
+    }
+    let parked = tokio::time::timeout(Duration::from_secs(60), harness.settle(2)).await;
+    assert_eq!(parked, Ok(Lsn(101)));
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(0, ParkStatus::Dead), (1, ParkStatus::Retrying)]
+    );
+    assert_eq!(harness.ack.inflight_events(), 1);
+    assert_eq!(harness.gauges().events, 2);
+
+    let dead = EventId::new(Lsn(0x10), 0);
+    assert_eq!(
+        harness.operator().discard(OrderKeyId::of(b"k"), dead).await,
+        Ok(dead)
+    );
+    assert_eq!(harness.settle(1).await, Lsn(102));
+    assert_eq!(harness.delivered(2).await, vec![1, 2]);
+    assert!(harness.quiet_for(Duration::from_secs(60)).await);
+    assert_eq!(harness.store.queue(b"k").await, vec![]);
+    assert_eq!(harness.gauges().events, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lanes_parking_at_once_never_exceed_the_parked_limit_together() {
+    let lanes = 4;
+    let store = TestStore {
+        append_delay: Duration::from_millis(200),
+        ..TestStore::default()
+    };
+    let setup = Setup {
+        lanes,
+        concurrency: lanes,
+        park_after: Duration::from_secs(1),
+        max_parked_events: 3,
+        ..Setup::default()
+    };
+    let script: Script = Box::new(|_, _| Outcome::Retryable(SinkError("down".to_owned())));
+    let mut harness = Harness::start(setup, ScriptedSink::new(LIMITS, script), store).await;
+    let keys: Vec<Vec<u8>> = (0..lanes).map(|lane| key_in_lane(lane, lanes, 0)).collect();
+    let mut ordinal = 0;
+    for key in &keys {
+        for _ in 0..3 {
+            harness.send(ordinal, key, 10).unwrap();
+            ordinal += 1;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let mut parked = 0;
+    for key in &keys {
+        parked += harness.store.queue(key).await.len();
+    }
+    assert_eq!(parked, 3);
+    assert_eq!(harness.gauges().events, 3);
+    let mut settled = 0;
+    while let Ok(Report::Settled(settlement)) = harness.reports.try_recv() {
+        harness.ack.settle(settlement).unwrap();
+        settled += 1;
+    }
+    assert_eq!(settled, 3);
+    assert_eq!(harness.ack.inflight_events(), 9);
+}
