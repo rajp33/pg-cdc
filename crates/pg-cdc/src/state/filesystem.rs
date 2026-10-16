@@ -1,10 +1,11 @@
 use std::collections::BinaryHeap;
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, ErrorKind, Read as _, Write as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,8 +23,8 @@ use crate::event::EventId;
 use crate::order::OrderKeyId;
 
 pub const LEADER_LOCK: &str = "leader.lock";
-pub const PARKED_LOCK: &str = "parked.lock";
 const TEMP_ABANDONED_AFTER: Duration = Duration::from_hours(1);
+const KEY_LOCK_WAIT: Duration = Duration::from_secs(2);
 const CREATE_ATTEMPTS: usize = 3;
 const TEMP_PREFIX: &str = ".tmp-";
 
@@ -93,7 +94,6 @@ fn nonempty(dir: &Path) -> &Path {
 
 #[derive(Debug, Default)]
 struct RootPath {
-    existing: OnceLock<PathBuf>,
     durable: AtomicBool,
 }
 
@@ -102,20 +102,14 @@ impl RootPath {
         if self.durable.load(Ordering::Acquire) {
             return Ok(());
         }
-        let existing = self.existing.get_or_init(|| {
-            root.ancestors()
-                .map(nonempty)
-                .find(|dir| dir.is_dir())
-                .unwrap_or(Path::new("."))
-                .to_path_buf()
-        });
         fs::create_dir_all(root).map_err(|error| unavailable(root, &error))?;
-        if existing != root {
-            for dir in root.ancestors().skip(1).map(nonempty) {
-                sync_dir(dir)?;
-                if dir == existing {
-                    break;
-                }
+        for dir in root.ancestors().skip(1).map(nonempty) {
+            match faults::before_sync(dir).and_then(|()| File::open(dir)) {
+                // pg-cdc creates directories it can read, so one it cannot open was not created by it.
+                Err(error) if error.kind() == ErrorKind::PermissionDenied => break,
+                opened => opened
+                    .and_then(|handle| handle.sync_all())
+                    .map_err(|error| unavailable(dir, &error))?,
             }
         }
         self.durable.store(true, Ordering::Release);
@@ -594,11 +588,11 @@ fn set_status(
     let name = format!("{id}.json");
     let path = dir.join(&name);
     let object = super::parked_name(&key, &id);
-    let Some(lock) = parked_lock(root)? else {
-        return Err(StoreError::NotFound(object));
+    let _lock = match lock_key_dir(&dir, Share::Exclusive, cancelled)? {
+        KeyLock::Held(lock) => lock,
+        KeyLock::Missing => return Err(StoreError::NotFound(object)),
+        KeyLock::Busy => return Err(busy(&dir)),
     };
-    lock.lock()
-        .map_err(|error| unavailable(&root.join(PARKED_LOCK), &error))?;
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -613,17 +607,63 @@ fn set_status(
     replace(&dir, &name, &encoded)
 }
 
-fn parked_lock(root: &Path) -> Result<Option<File>, StoreError> {
-    let path = root.join(PARKED_LOCK);
-    match OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-    {
-        Ok(file) => Ok(Some(file)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(unavailable(&path, &error)),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Share {
+    Shared,
+    Exclusive,
+}
+
+enum KeyLock {
+    Held(File),
+    Missing,
+    Busy,
+}
+
+fn busy(dir: &Path) -> StoreError {
+    StoreError::Unavailable(format!(
+        "{}: locked by another writer for {}s",
+        dir.display(),
+        KEY_LOCK_WAIT.as_secs()
+    ))
+}
+
+fn same_dir(handle: &File, dir: &Path) -> Result<bool, StoreError> {
+    let held = handle
+        .metadata()
+        .map_err(|error| unavailable(dir, &error))?;
+    match fs::metadata(dir) {
+        Ok(current) => Ok(held.dev() == current.dev() && held.ino() == current.ino()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(unavailable(dir, &error)),
+    }
+}
+
+fn lock_key_dir(dir: &Path, share: Share, cancelled: Cancelled<'_>) -> Result<KeyLock, StoreError> {
+    let deadline = std::time::Instant::now() + KEY_LOCK_WAIT;
+    let mut pause = Duration::from_millis(1);
+    loop {
+        let handle = match File::open(dir) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(KeyLock::Missing),
+            Err(error) => return Err(unavailable(dir, &error)),
+        };
+        let locked = match share {
+            Share::Shared => handle.try_lock_shared(),
+            Share::Exclusive => handle.try_lock(),
+        };
+        match locked {
+            Ok(()) if same_dir(&handle, dir)? => return Ok(KeyLock::Held(handle)),
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() >= deadline => {
+                return Ok(KeyLock::Busy);
+            }
+            Err(TryLockError::WouldBlock) => {
+                check(cancelled)?;
+                thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            Err(TryLockError::Error(error)) => return Err(unavailable(dir, &error)),
+        }
     }
 }
 
@@ -643,15 +683,25 @@ fn remove(
     cancelled: Cancelled<'_>,
 ) -> Result<(), StoreError> {
     let parked = root.join(PARKED_DIR);
-    let lock = parked_lock(root)?;
-    if let Some(lock) = &lock {
-        lock.lock_shared()
-            .map_err(|error| unavailable(&root.join(PARKED_LOCK), &error))?;
-    }
+    let mut busy_keys = Vec::new();
     for (key, id) in events {
         check(cancelled)?;
+        if busy_keys.contains(key) {
+            continue;
+        }
         let dir = key_dir(root, key);
         let path = dir.join(format!("{id}.json"));
+        let _lock = match lock_key_dir(&dir, Share::Shared, cancelled)? {
+            KeyLock::Held(lock) => lock,
+            KeyLock::Missing => {
+                sync_absence(&dir, &parked)?;
+                continue;
+            }
+            KeyLock::Busy => {
+                busy_keys.push(*key);
+                continue;
+            }
+        };
         match fs::remove_file(&path) {
             Ok(()) => sync_dir(&dir)?,
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -663,7 +713,10 @@ fn remove(
             sync_dir(&parked)?;
         }
     }
-    Ok(())
+    match busy_keys.first() {
+        Some(key) => Err(busy(&key_dir(root, key))),
+        None => Ok(()),
+    }
 }
 
 fn read_leader_file(root: &Path) -> Result<Option<LeaderFile>, StoreError> {
@@ -1257,6 +1310,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_store_reopened_after_a_failed_ancestor_sync_syncs_the_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let (_injected, synced) = record_syncs(base, fail_once(base.join("new")));
+        let parking = base.join("new").join("deeper");
+
+        let crashed = FilesystemStateStore::new(&parking, "orders", 2);
+        assert!(crashed.append_parked(&[parked(key(1), 0)]).await.is_err());
+        drop(crashed);
+        synced.lock().unwrap().clear();
+
+        let reopened = FilesystemStateStore::new(&parking, "orders", 2);
+        reopened.append_parked(&[parked(key(1), 0)]).await.unwrap();
+        let seen = synced.lock().unwrap().clone();
+        for containing in [base.to_path_buf(), base.join("new"), parking.clone()] {
+            assert!(seen.contains(&containing), "{containing:?} not in {seen:?}");
+        }
+    }
+
     #[test]
     fn a_removal_retried_after_a_failed_directory_sync_syncs_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -1317,11 +1390,7 @@ mod tests {
         assert!(swap(&root, record(), None).is_err());
         assert_eq!(
             names(&root),
-            vec![
-                LEADER_LOCK.to_owned(),
-                PARKED_DIR.to_owned(),
-                PARKED_LOCK.to_owned()
-            ]
+            vec![LEADER_LOCK.to_owned(), PARKED_DIR.to_owned()]
         );
     }
 
@@ -1354,6 +1423,38 @@ mod tests {
         assert!(!orphan.exists());
         assert!(fresh.exists());
         assert_eq!(names(&queue_dir).len(), 2);
+    }
+
+    #[test]
+    fn a_writer_whose_open_temp_file_is_reclaimed_fails_instead_of_losing_its_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(dir.path().join("orders"));
+        let queue = key(1);
+        let fired = AtomicBool::new(false);
+        let (_injected, _) = record_syncs(dir.path(), {
+            let root = Arc::clone(&root);
+            move |path| {
+                if is_temp(path) && !fired.swap(true, Ordering::SeqCst) {
+                    File::options()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_modified(std::time::SystemTime::now() - Duration::from_hours(2))
+                        .unwrap();
+                    load_heads(&root, queue.partition(), &|| false).unwrap();
+                    assert!(!path.exists());
+                }
+                false
+            }
+        });
+
+        assert!(append(&root, &encoded(queue, 1), &|| false).is_err());
+        assert_eq!(names(&key_dir(&root, &queue)), Vec::<String>::new());
+        append(&root, &encoded(queue, 1), &|| false).unwrap();
+        assert_eq!(
+            read(&root, queue, None, 1, &|| false).unwrap(),
+            vec![parked(queue, 0)]
+        );
     }
 
     #[test]
@@ -1407,6 +1508,99 @@ mod tests {
         assert_eq!(
             names(&key_dir(&root, &queue)),
             vec![format!("{}.json", event_id(1))]
+        );
+    }
+
+    fn finishes_within<T: Send + 'static>(
+        limit: Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        finished
+            .recv_timeout(limit)
+            .expect("the call did not finish in time")
+    }
+
+    #[test]
+    fn a_writer_paused_mid_rewrite_blocks_only_its_own_key_and_only_for_a_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(dir.path().join("orders"));
+        let (paused, other) = (key(1), key(2));
+        append(&root, &encoded(paused, 1), &|| false).unwrap();
+        append(&root, &encoded(other, 1), &|| false).unwrap();
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel::<()>();
+        let reached = Mutex::new(Some(reached));
+        let resume_rx = Mutex::new(resume_rx);
+        let (_injected, _) = record_syncs(dir.path(), move |path| {
+            if is_temp(path)
+                && let Some(reached) = reached.lock().unwrap().take()
+            {
+                reached.send(()).unwrap();
+                let _ = resume_rx.lock().unwrap().recv();
+            }
+            false
+        });
+        let predecessor = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || {
+                set_status(&root, paused, event_id(0), ParkStatus::Dead, &|| false)
+            })
+        };
+        reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let removed = {
+            let root = Arc::clone(&root);
+            finishes_within(Duration::from_secs(10), move || {
+                remove(
+                    &root,
+                    &[(paused, event_id(0)), (other, event_id(0))],
+                    &|| false,
+                )
+            })
+        };
+        assert!(
+            matches!(removed, Err(StoreError::Unavailable(_))),
+            "{removed:?}"
+        );
+        assert!(!key_dir(&root, &other).exists());
+        assert_eq!(names(&key_dir(&root, &paused)).len(), 2);
+
+        let changed = {
+            let root = Arc::clone(&root);
+            finishes_within(Duration::from_secs(10), move || {
+                set_status(&root, paused, event_id(0), ParkStatus::Retrying, &|| false)
+            })
+        };
+        assert!(
+            matches!(changed, Err(StoreError::Unavailable(_))),
+            "{changed:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let cancelled = {
+            let root = Arc::clone(&root);
+            finishes_within(Duration::from_secs(10), move || {
+                set_status(
+                    &root,
+                    paused,
+                    event_id(0),
+                    ParkStatus::Retrying,
+                    &cancelled_after(3),
+                )
+            })
+        };
+        assert!(is_cancelled(&cancelled), "{cancelled:?}");
+        assert!(started.elapsed() < KEY_LOCK_WAIT, "{:?}", started.elapsed());
+
+        resume.send(()).unwrap();
+        predecessor.join().unwrap().unwrap();
+        assert_eq!(
+            read(&root, paused, None, 1, &|| false).unwrap()[0].status,
+            ParkStatus::Dead
         );
     }
 
