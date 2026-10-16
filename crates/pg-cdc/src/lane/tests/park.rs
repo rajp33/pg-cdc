@@ -578,3 +578,42 @@ async fn a_replayed_copy_appended_again_is_counted_once_the_queue_drains() {
     assert_eq!(harness.store.queue(b"k").await, vec![]);
     assert_eq!(harness.gauges().events, 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn nothing_parks_until_every_partition_has_been_counted() {
+    let held = OrderKeyId::of(b"held").partition();
+    let terminal = (0..1000)
+        .map(|number| format!("terminal-{number}").into_bytes())
+        .find(|key| OrderKeyId::of(key).partition() != held)
+        .unwrap();
+    let script: Script = Box::new(|ordinal, _| {
+        if ordinal == 0 {
+            Outcome::Terminal(SinkError("rejected".to_owned()))
+        } else {
+            Outcome::Delivered
+        }
+    });
+    let store = TestStore::default();
+    store.seed(b"held", 7, ParkStatus::Retrying).await;
+    store.hold(held);
+    let setup = Setup {
+        max_parked_events: 1,
+        ..Setup::default()
+    };
+    let mut harness = Harness::start(setup, ScriptedSink::new(LIMITS, script), store).await;
+    harness.send(0, &terminal, 10).unwrap();
+    assert!(harness.quiet_for(Duration::from_secs(60)).await);
+    assert_eq!(harness.store.queue(&terminal).await, vec![]);
+    assert!(harness.store.append_calls.lock().unwrap().is_empty());
+    assert_eq!(harness.ack.inflight_events(), 1);
+
+    harness.store.release.notify_one();
+    assert_eq!(harness.settle(1).await, Lsn(100));
+    assert_eq!(harness.delivered(1).await, vec![7]);
+    assert_eq!(harness.store.queue(b"held").await, vec![]);
+    assert_eq!(
+        harness.store.queue(&terminal).await,
+        vec![(0, ParkStatus::Dead)]
+    );
+    assert_eq!(harness.gauges().events, 1);
+}

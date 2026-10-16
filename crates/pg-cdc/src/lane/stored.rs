@@ -57,6 +57,10 @@ impl Lane {
         if let Some(loaded) = self.loaded.get_mut(usize::from(partition)) {
             *loaded = true;
         }
+        if !self.counted_everywhere && self.loaded.iter().all(|loaded| *loaded) {
+            self.counted_everywhere = true;
+            self.append_due = None;
+        }
         let mut keys: Vec<(Option<EventId>, OrderKeyId)> = self
             .keys
             .iter()
@@ -77,7 +81,7 @@ impl Lane {
     }
 
     pub(super) fn store_wake(&self) -> Option<Instant> {
-        let appending = !self.to_append.is_empty();
+        let appending = self.counted_everywhere && !self.to_append.is_empty();
         let other = !self.to_remove.is_empty()
             || !self.to_kill.is_empty()
             || (!self.closing
@@ -106,7 +110,10 @@ impl Lane {
         for offset in 0..STORE_STEPS {
             let step = (self.store_turn + offset) % STORE_STEPS;
             let ran = match step {
-                0 if !self.to_append.is_empty() && self.append_due.is_none_or(|due| due <= now) => {
+                0 if self.counted_everywhere
+                    && !self.to_append.is_empty()
+                    && self.append_due.is_none_or(|due| due <= now) =>
+                {
                     self.flush_appends().await;
                     true
                 }
