@@ -8,6 +8,7 @@ use hyper::{Response, StatusCode};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinSet;
 
 use super::{
@@ -27,6 +28,17 @@ pub(super) struct Reply {
     status: StatusCode,
     body: Bytes,
     retry_after: bool,
+}
+
+struct HeldBody {
+    body: Bytes,
+    _turn: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for HeldBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
 }
 
 impl Reply {
@@ -54,6 +66,14 @@ impl Reply {
 
     fn with_retry_after(mut self) -> Self {
         self.retry_after = true;
+        self
+    }
+
+    fn holding(mut self, turn: OwnedSemaphorePermit) -> Self {
+        self.body = Bytes::from_owner(HeldBody {
+            body: self.body,
+            _turn: turn,
+        });
         self
     }
 
@@ -282,6 +302,13 @@ async fn bounded(operation: impl Future<Output = Reply>) -> Reply {
         })
 }
 
+async fn inspect(admin: &Admin, inspection: impl Future<Output = Reply>) -> Reply {
+    let Ok(turn) = Arc::clone(&admin.inspections).acquire_owned().await else {
+        return Reply::error(StatusCode::SERVICE_UNAVAILABLE, "pg-cdc is stopping");
+    };
+    inspection.await.holding(turn)
+}
+
 fn collapse(outcome: Checked<Reply>) -> Reply {
     outcome.unwrap_or_else(|reply| reply)
 }
@@ -327,10 +354,7 @@ async fn try_list(admin: &Admin, query: Option<&str>) -> Checked<Reply> {
     };
     let after = query.after_key()?;
     let access = access(admin).await?;
-    Ok(bounded(async {
-        let Ok(_inspection) = admin.inspections.acquire().await else {
-            return Reply::error(StatusCode::SERVICE_UNAVAILABLE, "pg-cdc is stopping");
-        };
+    Ok(bounded(inspect(admin, async {
         match scan(&access.store, &listing, after).await {
             Ok(page) => Reply::json(
                 StatusCode::OK,
@@ -341,7 +365,7 @@ async fn try_list(admin: &Admin, query: Option<&str>) -> Checked<Reply> {
             ),
             Err(error) => store_failure(&error),
         }
-    })
+    }))
     .await)
 }
 
@@ -488,10 +512,7 @@ async fn try_show(admin: &Admin, key: &str, query: Option<&str>) -> Checked<Repl
     let limit = query.limit()?;
     let after = query.after_event()?;
     let access = access(admin).await?;
-    Ok(bounded(async {
-        let Ok(_inspection) = admin.inspections.acquire().await else {
-            return Reply::error(StatusCode::SERVICE_UNAVAILABLE, "pg-cdc is stopping");
-        };
+    Ok(bounded(inspect(admin, async {
         let mut slice = match access
             .store
             .read_parked_within(
@@ -530,7 +551,7 @@ async fn try_show(admin: &Admin, key: &str, query: Option<&str>) -> Checked<Repl
             ),
             Err(error) => store_failure(&error),
         }
-    })
+    }))
     .await)
 }
 
@@ -1910,6 +1931,93 @@ mod tests {
             assert_eq!(status.unwrap(), 200);
         }
         assert_eq!(counting.reads().peak_running, PARKED_SHOW_CONCURRENCY);
+        fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_holds_its_inspection_turn_until_its_body_is_dropped() {
+        let a = named("a");
+        let store = MemoryStateStore::new();
+        seed(&store, &[parked(a, 0x10, 0, ParkStatus::Dead)]).await;
+        let fixture = Fixture::reading(Arc::new(store)).await;
+        let available = || fixture.admin.inspections.available_permits();
+
+        for target in [format!("/parked/{a}"), "/parked".to_owned()] {
+            let response = route(&Method::GET, &target.parse().unwrap(), &fixture.admin).await;
+            assert_eq!(response.status(), 200, "{target}");
+            assert_eq!(available(), PARKED_SHOW_CONCURRENCY - 1, "{target}");
+            drop(response);
+            assert_eq!(available(), PARKED_SHOW_CONCURRENCY, "{target}");
+        }
+        fixture.stop().await;
+    }
+
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let waited = tokio::time::timeout(Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "{what} did not happen within 10 s");
+    }
+
+    #[tokio::test]
+    async fn clients_that_stop_reading_keep_the_inspection_budget_until_they_go() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::{TcpListener, TcpSocket, TcpStream};
+
+        let a = named("a");
+        let store = MemoryStateStore::new();
+        let third = PARKED_SHOW_BYTES / 3 - 1024;
+        seed(
+            &store,
+            &[
+                padded(a, 0, third),
+                padded(a, 1, third),
+                padded(a, 2, third),
+            ],
+        )
+        .await;
+        let counting = CountingStore::over(&store);
+        let fixture = Fixture::reading(counting.clone()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(crate::admin::serve(listener, fixture.admin.clone()));
+        let request =
+            format!("GET /parked/{a} HTTP/1.1\r\nHost: pg-cdc\r\nConnection: close\r\n\r\n");
+        let available = || fixture.admin.inspections.available_permits();
+
+        let mut stalled = Vec::new();
+        for _ in 0..PARKED_SHOW_CONCURRENCY {
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.set_recv_buffer_size(4096).unwrap();
+            let mut stream = socket.connect(addr).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stalled.push(stream);
+        }
+        eventually("both pages loading", || {
+            counting.counts().loaded_bytes.len() == PARKED_SHOW_CONCURRENCY
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(available(), 0);
+
+        drop(stalled.pop());
+        eventually("a released turn", || available() == 1).await;
+        let mut reader = TcpStream::connect(addr).await.unwrap();
+        reader.write_all(request.as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        reader.read_to_end(&mut reply).await.unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(reply.len() > usize::try_from(3 * third).unwrap());
+
+        drop(stalled);
+        eventually("every turn released", || {
+            available() == PARKED_SHOW_CONCURRENCY
+        })
+        .await;
+        server.abort();
         fixture.stop().await;
     }
 
