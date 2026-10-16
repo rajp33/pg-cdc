@@ -260,7 +260,7 @@ The xid is left out of the envelope: it is 32 bits and wraps, and `commit_lsn` a
   - it is unique within a pipeline;
   - it is identical on every replay of the same WAL;
   - lexicographic order equals stream order;
-  - it is a valid SNS FIFO deduplication id.
+  - prefixed with the pipeline name and `:`, it is a valid SNS FIFO deduplication id (§11.2).
 - **Change publications only when caught up.** If the publication's table list changes while transactions are still unacknowledged, those transactions can get different ordinals on replay.
 
 ### 7.3 Key and order key
@@ -314,6 +314,7 @@ When the encoded message (body plus attributes) exceeds the sink's `max_message_
 ### 9.2 Confirmed LSN
 
 - **The ack tracker** keeps transactions in commit order, each with a count of unsettled events.
+- **Settled runs collapse.** Consecutive settled transactions behind an unsettled one merge into one entry that keeps only the last end LSN, so the tracker holds at most about two entries per unsettled transaction, however many later transactions settle.
 - **The confirmed LSN** is the end LSN of the last transaction in the unbroken run of settled transactions at the front of that list.
 - **Starting value.** When streaming starts, the confirmed LSN starts at the slot's `confirmed_flush_lsn`, so pg-cdc never reports a lower position.
 - **When idle,** with no unsettled events and no open transaction, the confirmed LSN advances to the latest keepalive `wal_end`. This keeps the slot moving while the publication is quiet.
@@ -370,7 +371,7 @@ A retryable outcome puts the event's order key into exponential backoff with ful
 
 Short of a halt (§10.7) or a lost slot (§13.3), only two conditions stall the pipeline:
 
-- **The parked limit.** `delivery.max_parked_events` defaults to 10,000,000, and 0 means unlimited. At the limit no more events park, so undeliverable events stay in flight until backpressure stalls the reader.
+- **The parked limit.** `delivery.max_parked_events` defaults to 10,000,000, and 0 means unlimited. At the limit no more events park, so undeliverable events stay in flight until backpressure stalls the reader. Lanes reserve room in the shared count before they write, so together they never park past the limit. A key whose backlog is larger than the room left parks its oldest events that fit and keeps the rest in flight, in order, until room frees.
 - **The StateStore is unavailable.** Events cannot park, and the pipeline stalls the same way.
 
 Memory is a third limit. Each order key with a parked queue keeps about 0.5 to 1 KB of lane state in memory while it is parked, and a takeover loads every parked queue's head before delivering, so `max_inflight_bytes` does not bound it. Only `max_parked_events` does, since each parked key holds at least one event; the task needs about `max_parked_events` x 1 KB on top of `max_inflight_bytes`, or a lower `max_parked_events`.
@@ -453,12 +454,13 @@ v1 sinks:
   - a failed entry with `SenderFault=false` is `Retryable`;
   - request-level failures (throttling, 5xx, timeouts, connection or credential errors, a missing topic) make every entry `Retryable`.
 - **FIFO topics.**
-  - `MessageGroupId` is the order key id, and `MessageDeduplicationId` is the event id.
+  - `MessageGroupId` is the order key id, and `MessageDeduplicationId` is `<pipeline>:<event id>`, at most 89 characters. SNS deduplicates across the whole topic, so pipelines sharing a FIFO topic need distinct `pipeline` names; the same event gets the same id on every replay and after every takeover.
   - SNS FIFO allows 300 messages/s per group and 3,000/s per topic by default, and more in high-throughput mode.
 - **Standard topics.** There is no group id, unless `sink.fair_queue_group: column:<name>` sets one from that column for SQS fair queues. The column must also be listed in `attribute_columns`.
 - **Message attributes.**
   - Every message carries `schema`, `table` and `op`, plus one attribute per column in `sink.attribute_columns`.
   - A column's value comes from `after`, or from `before` when there is no `after`. It is sent as String or Number and omitted when null.
+  - A number is sent as Number only from -10^9 to 10^9 with at most 5 fractional digits, which is what SNS accepts; any other number, including exponent form, is sent as String with its exact text, never rounded.
   - A String value containing a character SNS and SQS reject (anything outside #x9, #xA, #xD, #x20–#xD7FF, #xE000–#xFFFD and #x10000–#x10FFFF) is omitted like a null, with a warning.
   - SNS allows 10 attributes per message.
 
@@ -845,7 +847,7 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
 - **Inspections share a memory budget.** At most two listings and queue pages are read at once; others wait their turn within the 30 s budget. Each holds its turn from before its first store read until its reply has been sent or its connection has closed, so clients that stop reading cannot pile up replies.
 - **No races with delivery.** Parked operations run inside the owning lane.
 - **Standbys refuse them.** A standby answers with 409 and the current holder from the leader record.
-- **Only the active holder answers.** Every parked endpoint answers 409 unless this task holds claimed lanes, so a task waiting `fence_delay`, a draining task and a fenced task refuse too; the body carries `role`, and `holder`, `leader_state` and `epoch` from the leader record. Before the state store is ready the endpoints answer 503 (`pg-cdc is starting`), and an operation that outlives 30 s answers 504, since it may still complete.
+- **Only the active holder answers.** Every parked endpoint answers 409 unless this task holds claimed lanes, so a task waiting `fence_delay`, a draining task and a fenced task refuse too; the body carries `role`, and `holder`, `leader_state` and `epoch` from the leader record. Before the state store is ready the endpoints answer 503 (`pg-cdc is starting`), and an operation that outlives 30 s answers 504, since it may still complete. Each lane queues at most 16 redrive and discard requests and answers 503 with `Retry-After: 1` past that; it runs at most 4 between deliveries and skips one whose requester has gone.
 
 ## 17. Observability
 

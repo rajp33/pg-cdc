@@ -31,7 +31,7 @@ use crate::status::{LaneCounts, ParkedGauges, STATS_INTERVAL};
 use crate::supervisor::Backoff;
 
 use operate::Operation;
-pub use operate::{OperateError, Operator};
+pub use operate::{OPERATION_QUEUE, OperateError, Operator};
 
 pub const LINGER: Duration = Duration::from_millis(5);
 pub const RETRY_BASE: Duration = Duration::from_millis(100);
@@ -91,6 +91,7 @@ enum Inbound {
 #[derive(Debug)]
 pub struct Lanes {
     inboxes: Vec<mpsc::UnboundedSender<Inbound>>,
+    operation_queues: Vec<Arc<Semaphore>>,
     running: JoinSet<()>,
     loader: JoinSet<()>,
     gauges: Arc<ParkedGauges>,
@@ -156,6 +157,7 @@ impl Lanes {
             parked,
         ));
         Self {
+            operation_queues: operate::operation_queues(inboxes.len()),
             inboxes,
             running,
             loader,
@@ -169,6 +171,7 @@ impl Lanes {
                 .iter()
                 .map(mpsc::UnboundedSender::downgrade)
                 .collect(),
+            self.operation_queues.clone(),
         )
     }
 
@@ -193,6 +196,7 @@ impl Lanes {
     pub async fn stop(self, grace: Duration) -> bool {
         let Self {
             inboxes,
+            operation_queues: _,
             mut running,
             mut loader,
             gauges: _,
@@ -218,6 +222,7 @@ struct Key {
     failure: Option<Failure>,
     stored: Option<Stored>,
     offloaded: Option<Outbound>,
+    reserved: u64,
 }
 
 impl Key {
@@ -228,6 +233,7 @@ impl Key {
             failure: None,
             stored: None,
             offloaded: None,
+            reserved: 0,
         }
     }
 }
@@ -326,7 +332,7 @@ impl Lane {
                 if stored {
                     continue;
                 }
-                let until = [self.store_wake(), self.stats_wake()]
+                let until = [self.store_wake(), self.stats_wake(), self.operations_wake()]
                     .into_iter()
                     .flatten()
                     .min();
@@ -351,10 +357,16 @@ impl Lane {
                 continue;
             }
             let next_retry = self.retries.peek().map(|Reverse((due, _))| *due);
-            let until = [linger, next_retry, self.store_wake(), self.stats_wake()]
-                .into_iter()
-                .flatten()
-                .min();
+            let until = [
+                linger,
+                next_retry,
+                self.store_wake(),
+                self.stats_wake(),
+                self.operations_wake(),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             if !self.wait(until).await {
                 return;
             }

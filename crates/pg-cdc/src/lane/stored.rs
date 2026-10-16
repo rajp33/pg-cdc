@@ -139,7 +139,7 @@ impl Lane {
         self.store_due = Some(Instant::now() + delay);
     }
 
-    fn queued_events(&self, key: &OrderKeyId) -> Vec<ParkedEvent> {
+    fn queued_events(&self, key: &OrderKeyId, limit: usize) -> Vec<ParkedEvent> {
         let Some(state) = self.keys.get(key) else {
             return Vec::new();
         };
@@ -152,6 +152,7 @@ impl Lane {
         state
             .queue
             .iter()
+            .take(limit)
             .enumerate()
             .map(|(index, pending)| {
                 let failure = state
@@ -177,31 +178,90 @@ impl Lane {
             .collect()
     }
 
+    fn reserve(&self, wanted: u64) -> u64 {
+        let max = self.max_parked;
+        let take = |parked: u64| {
+            if max == 0 {
+                wanted
+            } else {
+                wanted.min(max.saturating_sub(parked))
+            }
+        };
+        if wanted == 0 {
+            return 0;
+        }
+        self.parked
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |parked| {
+                let granted = take(parked);
+                (granted > 0).then(|| parked.saturating_add(granted))
+            })
+            .map_or(0, take)
+    }
+
+    fn release(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let _ = self
+            .parked
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |parked| {
+                Some(parked.saturating_sub(count))
+            });
+    }
+
+    fn admit(&mut self, key: OrderKeyId) -> (u64, u64) {
+        let Some(state) = self.keys.get(&key) else {
+            return (0, 0);
+        };
+        let wanted = u64::try_from(state.queue.len()).unwrap_or(u64::MAX);
+        let held = state.reserved.min(wanted);
+        self.release(state.reserved - held);
+        let allowed = held.saturating_add(self.reserve(wanted - held));
+        if let Some(state) = self.keys.get_mut(&key) {
+            state.reserved = allowed;
+        }
+        (wanted, allowed)
+    }
+
     async fn flush_appends(&mut self) {
-        let queues: Vec<(OrderKeyId, Vec<ParkedEvent>)> = std::mem::take(&mut self.to_append)
-            .into_iter()
-            .map(|key| (key, self.queued_events(&key)))
-            .collect();
-        let count = queues
-            .iter()
-            .map(|(_, events)| u64::try_from(events.len()).unwrap_or(u64::MAX))
-            .fold(0_u64, u64::saturating_add);
-        let parked = self.parked.load(Ordering::SeqCst);
-        if self.max_parked > 0 && parked.saturating_add(count) > self.max_parked {
+        let mut queues: Vec<(OrderKeyId, Vec<ParkedEvent>)> = Vec::new();
+        let mut held_back = 0_u64;
+        for key in std::mem::take(&mut self.to_append) {
+            let (wanted, allowed) = self.admit(key);
+            held_back = held_back.saturating_add(wanted - allowed);
+            let events = self.queued_events(&key, usize::try_from(allowed).unwrap_or(usize::MAX));
+            if events.is_empty() {
+                if wanted > 0 {
+                    self.to_append.insert(key);
+                }
+            } else {
+                queues.push((key, events));
+            }
+        }
+        if !queues.is_empty() {
+            self.append(queues).await;
+        }
+        if held_back > 0 {
             let delay = self.store_backoff.next_delay();
             tracing::warn!(
                 lane = self.index,
-                parked,
+                parked = self.parked.load(Ordering::SeqCst),
+                held_back,
                 max_parked_events = self.max_parked,
                 ?delay,
                 "the parked event limit is reached; events stay in flight"
             );
             self.append_due = Some(Instant::now() + delay);
-            self.to_append
-                .extend(queues.into_iter().map(|(key, _)| key));
-            return;
+        } else {
+            self.append_due = None;
         }
-        self.append_due = None;
+    }
+
+    async fn append(&mut self, queues: Vec<(OrderKeyId, Vec<ParkedEvent>)>) {
+        let count = queues
+            .iter()
+            .map(|(_, events)| u64::try_from(events.len()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
         let store = Arc::clone(&self.store);
         let span = tracing::debug_span!("park", events = count);
         let appends = queues
@@ -227,17 +287,22 @@ impl Lane {
 
     fn appended(&mut self, key: OrderKeyId, events: &[ParkedEvent]) {
         record_parked(events);
-        self.parked.fetch_add(
-            u64::try_from(events.len()).unwrap_or(u64::MAX),
-            Ordering::SeqCst,
-        );
         let Some(state) = self.keys.get_mut(&key) else {
             return;
         };
-        for pending in std::mem::take(&mut state.queue) {
+        let count = u64::try_from(events.len()).unwrap_or(u64::MAX);
+        state.reserved = state.reserved.saturating_sub(count);
+        let last = events.last().map(|event| event.id);
+        while let Some(pending) = state
+            .queue
+            .pop_front_if(|pending| last.is_some_and(|last| pending.outbound.id <= last))
+        {
             if let Ok(settled) = pending.ticket.park(&Ok(())) {
                 let _ = self.reports.send(Report::Settled(settled));
             }
+        }
+        if !state.queue.is_empty() {
+            self.to_append.insert(key);
         }
         if let Some(stored) = state.stored.as_mut()
             && stored.dead_on_append
@@ -307,6 +372,7 @@ impl Lane {
         };
         self.stats_dirty = true;
         let Some(head) = head else {
+            let reserved = std::mem::take(&mut state.reserved);
             state.stored = None;
             state.backoff.reset();
             state.failure = None;
@@ -316,6 +382,7 @@ impl Lane {
             } else {
                 self.make_ready(key);
             }
+            self.release(reserved);
             return;
         };
         stored.floor = Some(head.id);

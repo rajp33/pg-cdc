@@ -437,7 +437,7 @@ async fn run(
         return Ok(());
     };
     let Some(sink) = shutdown
-        .run_until_cancelled(Box::pin(sink(&config.sink)))
+        .run_until_cancelled(Box::pin(sink(&config.pipeline, &config.sink)))
         .await
     else {
         tracing::info!("pg-cdc stopped cleanly");
@@ -509,12 +509,13 @@ async fn start_admin(listen: SocketAddr, admin: Admin) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn sink(config: &SinkConfig) -> Arc<dyn Sink> {
+async fn sink(pipeline: &str, config: &SinkConfig) -> Arc<dyn Sink> {
     match config {
         SinkConfig::Stdout(_) => Arc::new(StdoutSink::stdout()),
         SinkConfig::Discard(_) => Arc::new(DiscardSink::new()),
         SinkConfig::Sns(sns) => Arc::new(
             SnsSink::from_environment(
+                pipeline,
                 sns.topic_arn.clone(),
                 sns.region.clone(),
                 sns.fair_queue_group.clone(),
@@ -759,6 +760,13 @@ mod tests {
         assert_eq!(
             parked_output(&reply(503, "unavailable\n")),
             Err("503 Service Unavailable: unavailable".to_owned())
+        );
+        assert_eq!(
+            parked_output(&reply(
+                503,
+                r#"{"error":"too many redrive and discard requests are waiting on the lane of order key 6b; try again shortly"}"#
+            )),
+            Err("503 Service Unavailable: too many redrive and discard requests are waiting on the lane of order key 6b; try again shortly".to_owned())
         );
         assert_eq!(
             parked_output(&reply(500, r#"{"holder":"other-1"}"#)),

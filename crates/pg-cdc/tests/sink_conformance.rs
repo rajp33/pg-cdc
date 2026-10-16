@@ -252,7 +252,7 @@ async fn the_discard_sink_conforms() -> TestResult {
 async fn sns_conforms(fifo: bool) -> TestResult {
     let aws = AwsEmulator::start().await?;
     let route = aws.topic_with_queue("conformance", fifo).await?;
-    let sink = SnsSink::new(aws.sns().await, route.topic_arn.clone(), None);
+    let sink = SnsSink::new(aws.sns().await, "orders", route.topic_arn.clone(), None);
     let destination = Destination::Queue {
         aws: Box::new(aws),
         topic_arn: route.topic_arn,

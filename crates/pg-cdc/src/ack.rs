@@ -70,8 +70,15 @@ pub struct Settled {
 #[derive(Debug)]
 struct Txn {
     seq: u64,
+    last: u64,
     end_lsn: Option<Lsn>,
     unsettled: u64,
+}
+
+impl Txn {
+    fn is_settled(&self) -> bool {
+        self.end_lsn.is_some() && self.unsettled == 0
+    }
 }
 
 #[derive(Debug)]
@@ -125,6 +132,7 @@ impl AckTracker {
         }
         self.txns.push_back(Txn {
             seq: self.next_seq,
+            last: self.next_seq,
             end_lsn: None,
             unsettled: 0,
         });
@@ -150,6 +158,9 @@ impl AckTracker {
         let txn = self.open_txn()?;
         txn.end_lsn = Some(end_lsn);
         self.last_commit = Some(end_lsn);
+        if let Some(index) = self.txns.len().checked_sub(1) {
+            self.compact(index);
+        }
         self.advance();
         Ok(self.confirmed)
     }
@@ -161,15 +172,16 @@ impl AckTracker {
     pub fn settle(&mut self, settled: Settled) -> Result<Lsn, AckError> {
         let Settled { txn, bytes } = settled;
         let unknown = AckError::UnknownSettlement { txn };
-        let front = self.txns.front().map_or(u64::MAX, |txn| txn.seq);
-        let index = txn
-            .checked_sub(front)
-            .and_then(|index| usize::try_from(index).ok())
+        let index = self.txns.partition_point(|entry| entry.last < txn);
+        let entry = self
+            .txns
+            .get_mut(index)
+            .filter(|entry| entry.seq <= txn)
             .ok_or(unknown.clone())?;
-        let entry = self.txns.get_mut(index).ok_or(unknown.clone())?;
         entry.unsettled = entry.unsettled.checked_sub(1).ok_or(unknown)?;
         self.inflight_events -= 1;
         self.inflight_bytes = self.inflight_bytes.saturating_sub(bytes);
+        self.compact(index);
         self.advance();
         Ok(self.confirmed)
     }
@@ -179,6 +191,31 @@ impl AckTracker {
             self.confirmed = self.confirmed.max(wal_end);
         }
         self.confirmed
+    }
+
+    fn compact(&mut self, index: usize) {
+        let settled = |txns: &VecDeque<Txn>, at: usize| txns.get(at).is_some_and(Txn::is_settled);
+        if !settled(&self.txns, index) {
+            return;
+        }
+        let mut index = index;
+        if settled(&self.txns, index + 1) {
+            self.merge(index);
+        }
+        if index > 0 && settled(&self.txns, index - 1) {
+            index -= 1;
+            self.merge(index);
+        }
+    }
+
+    fn merge(&mut self, index: usize) {
+        let Some(later) = self.txns.remove(index + 1) else {
+            return;
+        };
+        if let Some(earlier) = self.txns.get_mut(index) {
+            earlier.last = later.last;
+            earlier.end_lsn = earlier.end_lsn.max(later.end_lsn);
+        }
     }
 
     fn advance(&mut self) {
@@ -286,6 +323,65 @@ mod tests {
         assert_eq!(ack.commit(Lsn(400)), Ok(Lsn(100)));
         assert_eq!(ack.settle(delivered(late)), Ok(Lsn(100)));
         assert_eq!(ack.settle(delivered(early)), Ok(Lsn(400)));
+    }
+
+    #[test]
+    fn settled_transactions_behind_an_unsettled_one_keep_the_tracker_bounded() {
+        let mut ack = AckTracker::new(Lsn(100));
+        ack.begin().unwrap();
+        let blocker = ack.track(1).unwrap();
+        ack.commit(Lsn(200)).unwrap();
+        let mut end = 200;
+        for round in 0..100_000_u64 {
+            ack.begin().unwrap();
+            if round % 2 == 0 {
+                let ticket = ack.track(1).unwrap();
+                end += 10;
+                assert_eq!(ack.commit(Lsn(end)), Ok(Lsn(100)));
+                assert_eq!(ack.settle(delivered(ticket)), Ok(Lsn(100)));
+            } else {
+                end += 10;
+                assert_eq!(ack.commit(Lsn(end)), Ok(Lsn(100)));
+            }
+            assert!(ack.txns.len() <= 3, "{} entries", ack.txns.len());
+        }
+        ack.begin().unwrap();
+        let open = ack.track(1).unwrap();
+        assert_eq!(ack.settle(delivered(blocker)), Ok(Lsn(end)));
+        assert!(!ack.is_idle());
+        assert_eq!(ack.commit(Lsn(end + 10)), Ok(Lsn(end)));
+        assert_eq!(ack.settle(delivered(open)), Ok(Lsn(end + 10)));
+        assert!(ack.is_idle());
+        assert_eq!((ack.inflight_events(), ack.inflight_bytes()), (0, 0));
+    }
+
+    #[test]
+    fn a_settlement_inside_a_compacted_range_is_unknown() {
+        let mut ack = AckTracker::new(Lsn(100));
+        ack.begin().unwrap();
+        let blocker = ack.track(1).unwrap();
+        ack.commit(Lsn(200)).unwrap();
+        ack.begin().unwrap();
+        let first = ack.track(1).unwrap();
+        let second = ack.track(1).unwrap();
+        ack.commit(Lsn(300)).unwrap();
+        ack.begin().unwrap();
+        ack.commit(Lsn(400)).unwrap();
+        ack.settle(delivered(first)).unwrap();
+        let mut copy = AckTracker::new(Lsn(100));
+        copy.begin().unwrap();
+        copy.track(1).unwrap();
+        copy.commit(Lsn(200)).unwrap();
+        copy.begin().unwrap();
+        let stale = copy.track(1).unwrap();
+        ack.settle(delivered(second)).unwrap();
+        assert_eq!(ack.txns.len(), 2);
+        assert_eq!(
+            ack.settle(delivered(stale)),
+            Err(AckError::UnknownSettlement { txn: 1 })
+        );
+        assert_eq!(ack.settle(delivered(blocker)), Ok(Lsn(400)));
+        assert!(ack.is_idle());
     }
 
     #[test]
@@ -400,6 +496,12 @@ mod tests {
             }
             prop_assert_eq!(confirmed.0, self.expected());
             prop_assert_eq!(ack.is_idle(), self.idle());
+            let unsettled = self.unsettled.iter().filter(|count| **count > 0).count();
+            prop_assert!(
+                ack.txns.len() <= 2 * unsettled + 2,
+                "{} entries for {unsettled} unsettled transactions",
+                ack.txns.len()
+            );
             self.previous = confirmed;
             Ok(())
         }

@@ -599,7 +599,7 @@ async fn try_discard(admin: &Admin, key: &str, query: Option<&str>) -> Checked<R
 async fn operate_failure(admin: &Admin, error: OperateError) -> Reply {
     match error {
         OperateError::NotParked(_) => Reply::error(StatusCode::NOT_FOUND, &error),
-        OperateError::Loading(_) => {
+        OperateError::Loading(_) | OperateError::Busy(_) => {
             Reply::error(StatusCode::SERVICE_UNAVAILABLE, &error).with_retry_after()
         }
         OperateError::NotDead { head, .. } | OperateError::HeadMismatch { head, .. } => {
@@ -2154,6 +2154,37 @@ mod tests {
         fixture.stop().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_with_a_full_operation_queue_answers_503_with_retry_after() {
+        let a = named("a");
+        let store = MemoryStateStore::new();
+        seed(&store, &[parked(a, 0x10, 0, ParkStatus::Retrying)]).await;
+        let fixture = Fixture::start(&store, Arc::new(store.clone()), true).await;
+        let admin = Arc::new(fixture.admin.clone());
+        let target = format!("/parked/{a}/redrive");
+        let mut waiting = tokio::task::JoinSet::new();
+        for _ in 0..crate::lane::OPERATION_QUEUE {
+            let (admin, target) = (Arc::clone(&admin), target.clone());
+            waiting.spawn(async move { post(&admin, &target).await.status });
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let started = Instant::now();
+        let refused = post(&fixture.admin, &target).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(refused.status, 503);
+        assert_eq!(refused.headers[RETRY_AFTER], "1");
+        assert!(
+            refused.body["error"]
+                .as_str()
+                .unwrap()
+                .contains("too many redrive and discard requests")
+        );
+        while let Some(status) = waiting.join_next().await {
+            assert_eq!(status.unwrap(), 504);
+        }
+        fixture.stop().await;
+    }
+
     #[tokio::test]
     async fn withdrawn_access_turns_parked_endpoints_into_409s() {
         let store = MemoryStateStore::new();
@@ -2185,6 +2216,7 @@ mod tests {
                 409,
             ),
             (OperateError::Parking { key }, 409),
+            (OperateError::Busy(key), 503),
             (
                 OperateError::Store(StoreError::Unavailable("down".to_owned())),
                 503,
@@ -2197,12 +2229,12 @@ mod tests {
                 error,
                 OperateError::NotDead { .. } | OperateError::HeadMismatch { .. }
             );
-            let loading = matches!(error, OperateError::Loading(_));
+            let retry = matches!(error, OperateError::Loading(_) | OperateError::Busy(_));
             let stopped = matches!(error, OperateError::Stopped);
             let response = operate_failure(&admin, error).await.into_response();
             assert_eq!(response.status(), status, "{message}");
             assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
-            assert_eq!(response.headers().get(RETRY_AFTER).is_some(), loading);
+            assert_eq!(response.headers().get(RETRY_AFTER).is_some(), retry);
             let body: Value =
                 serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                     .unwrap();
