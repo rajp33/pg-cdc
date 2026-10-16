@@ -28,6 +28,7 @@ jobs:
         with:
           version: 2026.10.9
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: rustup toolchain install && rustup component add rustfmt clippy
       - run: mise run lint
       - run: mise run actionlint
 
@@ -76,6 +77,7 @@ jobs:
         with:
           version: 2026.10.9
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: rustup toolchain install && rustup component add llvm-tools-preview
       - run: mise run cov
 
   chaos-smoke:
