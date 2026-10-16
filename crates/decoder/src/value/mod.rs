@@ -1,10 +1,12 @@
 mod array;
 mod datetime;
+mod json;
 mod number;
 
 use serde_json::{Number, Value};
 
 pub use datetime::format_commit_ts;
+pub use json::parse_json;
 
 const MAX_NUMBER_EXPANSION: usize = 1 << 20;
 
@@ -147,7 +149,7 @@ fn integer(text: &str) -> Option<Value> {
 }
 
 fn json(text: &str, budget: &mut usize) -> Option<Value> {
-    normalize_numbers(serde_json::from_str(text).ok()?, budget)
+    normalize_numbers(parse_json(text)?, budget)
 }
 
 fn normalize_numbers(value: Value, budget: &mut usize) -> Option<Value> {
@@ -284,6 +286,75 @@ mod tests {
         );
         assert_eq!(mapped(&TypeKind::Json, "null"), Value::Null);
         assert_eq!(mapped(&TypeKind::Json, r#"{"x": 100}"#), json!({"x": 100}));
+    }
+
+    #[test]
+    fn json_objects_named_like_serde_json_internals_keep_their_shape() {
+        let number_key = "$serde_json::private::Number";
+        let raw_key = "$serde_json::private::RawValue";
+        for key in [number_key, raw_key] {
+            let text = format!(
+                r#"{{"top": {{"{key}": "123"}}, "list": [{{"{key}": "[1]"}}, {{"{key}": "1.50"}}], "escaped": {{"${}": "7"}}}}"#,
+                &key[1..]
+            );
+            let value = mapped(&TypeKind::Json, &text);
+            let single = |text: &str| {
+                let mut object = serde_json::Map::new();
+                object.insert(key.to_owned(), Value::String(text.to_owned()));
+                Value::Object(object)
+            };
+            assert_eq!(value["top"], single("123"), "{text}");
+            assert_eq!(
+                value["list"],
+                Value::Array(vec![single("[1]"), single("1.50")]),
+                "{text}"
+            );
+            assert_eq!(value["escaped"], single("7"), "{text}");
+            assert_eq!(
+                mapped(&TypeKind::Json, &format!(r#"{{"{key}": "123"}}"#)),
+                single("123")
+            );
+            assert_eq!(
+                mapped(
+                    &array_of(TypeKind::Json),
+                    &format!(r#"{{"{{\"{key}\": \"9\"}}"}}"#)
+                ),
+                Value::Array(vec![single("9")])
+            );
+        }
+    }
+
+    #[test]
+    fn json_keeps_number_literals_exact_through_the_parser() {
+        assert_eq!(
+            parse_json(
+                r#"{"n": 1.50, "big": 123456789012345678901234567890, "small": 0.000100, "z": -0}"#
+            )
+            .map(|value| value.to_string()),
+            Some(
+                r#"{"n":1.50,"big":123456789012345678901234567890,"small":0.000100,"z":-0}"#
+                    .to_owned()
+            )
+        );
+        for invalid in [
+            "",
+            "{",
+            "[1,]",
+            r#"{"a" 1}"#,
+            r#"{"a":1,}"#,
+            "01",
+            "1.",
+            "nan",
+            r#""\x""#,
+            "[1] 2",
+            "\"tab\there\"",
+        ] {
+            assert_eq!(parse_json(invalid), None, "{invalid:?}");
+        }
+        assert_eq!(
+            parse_json(" \t\n\r[ \"\\u00e9\\ud83d\\udc18\" , true,false , null ] "),
+            Some(json!(["é🐘", true, false, null]))
+        );
     }
 
     #[test]
@@ -520,7 +591,37 @@ mod tests {
         ]
     }
 
+    fn json_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(Value::from),
+            any::<f64>()
+                .prop_filter("finite", |x| x.is_finite())
+                .prop_map(Value::from),
+            ".*".prop_map(Value::String),
+        ];
+        leaf.prop_recursive(4, 32, 6, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
+                proptest::collection::vec((".*", inner), 0..6)
+                    .prop_map(|entries| Value::Object(entries.into_iter().collect())),
+            ]
+        })
+    }
+
     proptest! {
+        #[test]
+        fn parse_json_agrees_with_serde_json_on_ordinary_documents(value in json_value(), pretty in any::<bool>()) {
+            let text = if pretty {
+                serde_json::to_string_pretty(&value).unwrap()
+            } else {
+                serde_json::to_string(&value).unwrap()
+            };
+            prop_assert_eq!(parse_json(&text), serde_json::from_str::<Value>(&text).ok());
+            prop_assert_eq!(parse_json(&text), Some(value));
+        }
+
         #[test]
         fn d2_map_value_is_total(kind in scalar_kind(), text in ".*", as_array in any::<bool>(), semicolon in any::<bool>()) {
             let scalar = kind.clone();

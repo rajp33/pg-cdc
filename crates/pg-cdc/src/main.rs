@@ -225,7 +225,9 @@ fn with_query(path: String, query: &[(&str, Option<String>)]) -> String {
 }
 
 fn parked_output(reply: &Reply) -> Result<Vec<u8>, String> {
-    let json = serde_json::from_slice::<serde_json::Value>(&reply.body).ok();
+    let json = std::str::from_utf8(&reply.body)
+        .ok()
+        .and_then(pg_cdc_decoder::value::parse_json);
     if (200..300).contains(&reply.status) {
         return Ok(
             match json.and_then(|json| serde_json::to_string_pretty(&json).ok()) {
@@ -727,6 +729,15 @@ mod tests {
             parked_output(&reply(202, "accepted\n")),
             Ok(b"accepted\n".to_vec())
         );
+    }
+
+    #[test]
+    fn a_pretty_printed_event_keeps_objects_named_like_serde_json_internals() {
+        let body = r#"{"events":[{"after":{"a":{"$serde_json::private::Number":"123"},"b":[{"$serde_json::private::RawValue":"[1]"}],"n":1.50}}]}"#;
+        let printed = parked_output(&reply(200, body)).unwrap();
+        let printed = String::from_utf8(printed).unwrap();
+        let compact: String = printed.split_whitespace().collect();
+        assert_eq!(compact, body);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use pg_cdc::catalog::TypeResolver;
 use pg_cdc_decoder::message::{LogicalMessage, TupleValue, decode};
-use pg_cdc_decoder::value::map_value;
+use pg_cdc_decoder::value::{map_value, parse_json};
 use pg_cdc_testkit::Postgres;
 use serde_json::Value;
 
@@ -90,11 +90,15 @@ const CASES: &[Case] = &[
             r#"'{"b": 1, "a": 1e2, "a": 3}'"#,
             r#"'[1.0, -0, "x"]'"#,
             "'null'",
+            r#"'{"$serde_json::private::Number": "123"}'"#,
         ],
     ),
     case(
         "jsonb",
-        &[r#"'{"x": 1.0e2, "nested": {"k": [true, null]}}'"#],
+        &[
+            r#"'{"x": 1.0e2, "nested": {"k": [true, null]}}'"#,
+            r#"'[{"$serde_json::private::RawValue": "[1]"}, {"n": {"$serde_json::private::Number": "1.50"}}]'"#,
+        ],
     ),
     case(
         "date",
@@ -249,7 +253,7 @@ async fn d2_to_jsonb_reference_matches_every_builtin_type() -> TestResult {
         for index in 0..CASES.len() {
             let text: Option<String> = row.try_get(index)?;
             values.push(match text {
-                Some(text) => serde_json::from_str::<Value>(&text)?,
+                Some(text) => parse_json(&text).ok_or_else(|| format!("{text:?} is not JSON"))?,
                 None => Value::Null,
             });
         }
