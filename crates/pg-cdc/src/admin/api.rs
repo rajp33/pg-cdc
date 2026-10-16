@@ -18,7 +18,8 @@ use crate::event::EventId;
 use crate::lane::OperateError;
 use crate::order::OrderKeyId;
 use crate::state::{
-    LeaderRecord, ParkStatus, ParkedEntry, ParkedEvent, StateStore, StoreError, now_ms,
+    LeaderRecord, ParkStatus, ParkedEntry, ParkedEvent, ParkedHead, ParkedSummary, StateStore,
+    StoreError, now_ms,
 };
 use crate::status::ParkedAccess;
 
@@ -295,6 +296,7 @@ struct QueueBody {
     attempts: u32,
     first_failure_ms: u64,
     last_error: String,
+    last_error_cut: bool,
 }
 
 #[derive(Serialize)]
@@ -326,6 +328,9 @@ async fn try_list(admin: &Admin, query: Option<&str>) -> Checked<Reply> {
     let after = query.after_key()?;
     let access = access(admin).await?;
     Ok(bounded(async {
+        let Ok(_inspection) = admin.inspections.acquire().await else {
+            return Reply::error(StatusCode::SERVICE_UNAVAILABLE, "pg-cdc is stopping");
+        };
         match scan(&access.store, &listing, after).await {
             Ok(page) => Reply::json(
                 StatusCode::OK,
@@ -368,6 +373,7 @@ async fn scan(
                 attempts: head.attempts,
                 first_failure_ms: head.first_failure_ms,
                 last_error: head.last_error,
+                last_error_cut: head.last_error_cut,
             });
             if queues.len() == listing.limit {
                 let next = Some(queue.order_key);
@@ -386,31 +392,11 @@ async fn scan(
     })
 }
 
-struct Head {
-    id: EventId,
-    status: ParkStatus,
-    attempts: u32,
-    first_failure_ms: u64,
-    last_error: String,
-}
-
-impl From<ParkedEvent> for Head {
-    fn from(event: ParkedEvent) -> Self {
-        Self {
-            id: event.id,
-            status: event.status,
-            attempts: event.attempts,
-            first_failure_ms: event.first_failure_ms,
-            last_error: event.last_error,
-        }
-    }
-}
-
 async fn read_heads(
     store: &Arc<dyn StateStore>,
-    queues: &[crate::state::ParkedHead],
-) -> Result<Vec<Option<Head>>, StoreError> {
-    let mut heads: Vec<Option<Head>> = queues.iter().map(|_| None).collect();
+    queues: &[ParkedHead],
+) -> Result<Vec<Option<ParkedSummary>>, StoreError> {
+    let mut heads: Vec<Option<ParkedSummary>> = queues.iter().map(|_| None).collect();
     let mut pending = queues.iter().enumerate();
     let mut reading = JoinSet::new();
     loop {
@@ -419,13 +405,7 @@ async fn read_heads(
         {
             let store = Arc::clone(store);
             let key = queue.order_key;
-            reading.spawn(async move {
-                let head = store
-                    .read_parked(&key, None, 1)
-                    .await
-                    .map(|events| events.into_iter().next().map(Head::from));
-                (index, head)
-            });
+            reading.spawn(async move { (index, store.read_parked_summary(&key).await) });
         }
         let Some(joined) = reading.join_next().await else {
             return Ok(heads);
@@ -641,10 +621,12 @@ mod tests {
     use crate::lane::{LaneSettings, Lanes, OperateError, Stores};
     use crate::order::OrderKeyId;
     use crate::sink::{AttributeValue, Outbound, Outcome, Sink, SinkCapabilities, SinkError};
+    use crate::state::PARKED_SUMMARY_BYTES;
     use crate::state::memory::MemoryStateStore;
     use crate::state::{
         LeaderRecord, LeaderState, ParkStatus, ParkedEntry, ParkedEvent, ParkedHead, ParkedQueues,
-        ParkedSlice, StateStore, StoreError, SwapOutcome, Version, Versioned, now_ms,
+        ParkedSlice, ParkedSummary, StateStore, StoreError, SwapOutcome, Version, Versioned,
+        now_ms,
     };
     use crate::status::{LaneCounts, ParkedAccess, ParkedGauges, Status};
 
@@ -869,6 +851,31 @@ mod tests {
             counts.reads.push((limit, read.entries.len()));
             counts.loaded_bytes.push(bytes);
             drop(counts);
+            Ok(read)
+        }
+
+        async fn read_parked_summary(
+            &self,
+            key: &OrderKeyId,
+        ) -> Result<Option<ParkedSummary>, StoreError> {
+            self.count()?;
+            if self.races().deliver_before_reading == Some(*key) {
+                self.races().deliver_before_reading = None;
+                self.deliver_head(key).await;
+            }
+            let delay = {
+                let mut reads = self.reads();
+                reads.running += 1;
+                reads.peak_running = reads.peak_running.max(reads.running);
+                reads.delays.get(key).copied()
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let read = self.inner.read_parked_summary(key).await;
+            self.reads().running -= 1;
+            let read = read?;
+            self.counts().reads.push((1, usize::from(read.is_some())));
             Ok(read)
         }
 
@@ -1271,7 +1278,8 @@ mod tests {
                 "length_capped": false,
                 "attempts": 3,
                 "first_failure_ms": 1000,
-                "last_error": "seeded failure"
+                "last_error": "seeded failure",
+                "last_error_cut": false
             })
         );
         assert!(queues.iter().all(|queue| queue["length"] == 2));
@@ -1558,10 +1566,45 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn listing_holds_no_more_head_envelopes_than_reads_in_flight() {
-        let keys = sorted_keys(200);
+    async fn a_listing_cuts_a_last_error_too_long_to_list() {
+        let (a, b) = (named("a"), named("b"));
+        let long = "e".repeat(PARKED_SUMMARY_BYTES);
         let store = MemoryStateStore::new();
-        let large = Bytes::from(format!(r#"{{"pad":"{}"}}"#, "x".repeat(64 * 1024)));
+        seed(
+            &store,
+            &[
+                ParkedEvent {
+                    last_error: long.clone(),
+                    ..parked(a, 0x10, 0, ParkStatus::Dead)
+                },
+                parked(b, 0x20, 0, ParkStatus::Dead),
+            ],
+        )
+        .await;
+        let fixture = Fixture::reading(Arc::new(store)).await;
+
+        let answer = get(&fixture.admin, "/parked").await;
+        assert_eq!(answer.status, 200);
+        let queues = answer.body["queues"].as_array().unwrap();
+        let of = |key: OrderKeyId| {
+            queues
+                .iter()
+                .find(|queue| queue["order_key"] == key.to_string())
+                .unwrap()
+        };
+        let cut = of(a)["last_error"].as_str().unwrap();
+        assert!(long.starts_with(cut) && cut.len() < long.len(), "{cut}");
+        assert_eq!(of(a)["last_error_cut"], true);
+        assert_eq!(of(b)["last_error"], "seeded failure");
+        assert_eq!(of(b)["last_error_cut"], false);
+        fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_listings_load_no_head_envelopes() {
+        let keys = sorted_keys(40);
+        let store = MemoryStateStore::new();
+        let large = Bytes::from(format!(r#"{{"pad":"{}"}}"#, "x".repeat(256 * 1024)));
         for key in &keys {
             let event = ParkedEvent {
                 body: large.clone(),
@@ -1570,18 +1613,60 @@ mod tests {
             seed(&store, &[event]).await;
         }
         let counting = CountingStore::over(&store);
+        {
+            let mut reads = counting.reads();
+            for key in &keys {
+                reads.delays.insert(*key, Duration::from_millis(10));
+            }
+        }
         let fixture = Fixture::reading(counting.clone()).await;
 
-        let answer = get(&fixture.admin, "/parked?limit=200").await;
+        let mut listings = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let admin = fixture.admin.clone();
+            listings.spawn(async move { get(&admin, "/parked?status=dead").await });
+        }
+        while let Some(answer) = listings.join_next().await {
+            let answer = answer.unwrap();
+            assert_eq!(answer.status, 200);
+            assert_eq!(queue_keys(&answer).len(), keys.len());
+            assert!(
+                answer.body["queues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|queue| queue["last_error"] == "seeded failure")
+            );
+        }
+        assert_eq!(counting.counts().reads.len(), 4 * keys.len());
+        assert_eq!(counting.peak_bodies.load(Ordering::SeqCst), 0);
+        fixture.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_waits_for_the_inspection_budget() {
+        let a = named("a");
+        let store = MemoryStateStore::new();
+        seed(&store, &[parked(a, 0x10, 0, ParkStatus::Dead)]).await;
+        let counting = CountingStore::over(&store);
+        let fixture = Fixture::reading(counting.clone()).await;
+
+        let budget = u32::try_from(PARKED_SHOW_CONCURRENCY).unwrap();
+        let held = Arc::clone(&fixture.admin.inspections)
+            .acquire_many_owned(budget)
+            .await
+            .unwrap();
+        let waiting = get(&fixture.admin, "/parked").await;
+        assert_eq!(waiting.status, 504);
+        {
+            let counts = counting.counts();
+            assert!(counts.lists.is_empty(), "{:?}", counts.lists);
+            assert!(counts.reads.is_empty(), "{:?}", counts.reads);
+        }
+        drop(held);
+        let answer = get(&fixture.admin, "/parked").await;
         assert_eq!(answer.status, 200);
-        assert_eq!(queue_keys(&answer).len(), 200);
-        assert_eq!(counting.counts().reads.len(), 200);
-        let peak = counting.peak_bodies.load(Ordering::SeqCst);
-        assert!(
-            peak <= HEAD_READ_CONCURRENCY,
-            "{peak} envelopes held at once"
-        );
-        assert_eq!(counting.live_bodies.load(Ordering::SeqCst), 0);
+        assert_eq!(queue_keys(&answer), vec![a.to_string()]);
         fixture.stop().await;
     }
 

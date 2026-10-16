@@ -113,7 +113,7 @@ pg-cdc parked list --status dead
 pg-cdc parked show <order key id> --limit 10
 ```
 
-`list` returns up to 100 queues per page (`--limit` up to 1,000; continue with `--after <next>`), each with its head event, status, attempts, first failure time and last error; `length` is capped at 1,000 (`length_capped`). `show` returns the queue's events with their envelopes, up to 8 MiB of stored events per page (continue with `--after <next>`); an event larger than that, such as an oversize row parked without a payload store, is shown as `{"id", "bytes", "withheld": true}` and can be read from the state store at `parked/<order key id>/<event id>.json`.
+`list` returns up to 100 queues per page (`--limit` up to 1,000; continue with `--after <next>`), each with its head event, status, attempts, first failure time and last error; `length` is capped at 1,000 (`length_capped`), and a last error longer than about 8 KiB is cut (`last_error_cut`; `show` has it whole). `show` returns the queue's events with their envelopes, up to 8 MiB of stored events per page (continue with `--after <next>`); an event larger than that, such as an oversize row parked without a payload store, is shown as `{"id", "bytes", "withheld": true}` and can be read from the state store at `parked/<order key id>/<event id>.json`.
 
 **Redrive** after fixing the cause (a consumer, a permission, a size limit):
 

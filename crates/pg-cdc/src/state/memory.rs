@@ -6,7 +6,8 @@ use async_trait::async_trait;
 
 use super::{
     Admission, ByteBudget, LeaderRecord, ParkStatus, ParkedEntry, ParkedEvent, ParkedHead,
-    ParkedQueues, ParkedSlice, StateStore, StoreError, SwapOutcome, Version, Versioned,
+    ParkedQueues, ParkedSlice, ParkedSummary, StateStore, StoreError, SwapOutcome, Version,
+    Versioned,
 };
 use crate::event::EventId;
 use crate::order::OrderKeyId;
@@ -147,6 +148,19 @@ impl StateStore for MemoryStateStore {
             }
         }
         Ok(slice)
+    }
+
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError> {
+        let inner = self.lock()?;
+        inner
+            .parked
+            .get(key)
+            .and_then(|queue| queue.values().next())
+            .map(ParkedSummary::of)
+            .transpose()
     }
 
     async fn set_parked_status(

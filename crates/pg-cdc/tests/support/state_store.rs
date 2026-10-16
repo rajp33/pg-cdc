@@ -6,8 +6,9 @@ use pg_cdc::event::EventId;
 use pg_cdc::order::OrderKeyId;
 use pg_cdc::sink::AttributeValue;
 use pg_cdc::state::{
-    LeaderRecord, LeaderState, ParkStatus, ParkedEntry, ParkedEvent, ParkedHead, ParkedQueues,
-    ParkedSlice, StateStore, StoreError, SwapOutcome, Version, Versioned,
+    LeaderRecord, LeaderState, PARKED_SUMMARY_BYTES, ParkStatus, ParkedEntry, ParkedEvent,
+    ParkedHead, ParkedQueues, ParkedSlice, ParkedSummary, StateStore, StoreError, SwapOutcome,
+    Version, Versioned,
 };
 use pg_cdc_decoder::Lsn;
 
@@ -23,6 +24,7 @@ where
     queues_list_in_key_order_from_a_cursor_with_capped_lengths(store.as_ref()).await?;
     reads_return_ascending_ids_and_respect_after_and_limit(store.as_ref()).await?;
     bounded_reads_stop_at_the_byte_budget_and_withhold_what_never_fits(store.as_ref()).await?;
+    summaries_read_the_head_without_its_envelope(store.as_ref()).await?;
     appends_are_create_only(store.as_ref()).await?;
     an_append_with_a_malformed_event_is_all_or_nothing(store.as_ref()).await?;
     heads_are_the_lowest_id_per_queue_in_their_partition(store.as_ref()).await?;
@@ -241,6 +243,55 @@ async fn bounded_reads_stop_at_the_byte_budget_and_withhold_what_never_fits(
     );
     let all: Vec<_> = events.iter().map(|event| (queue, event.id)).collect();
     store.remove_parked(&all).await?;
+    Ok(())
+}
+
+async fn summaries_read_the_head_without_its_envelope(store: &dyn StateStore) -> TestResult {
+    let queue = key(0x24, 1)?;
+    assert_eq!(store.read_parked_summary(&queue).await?, None);
+    let large = ParkedEvent {
+        body: Bytes::from(format!(r#"{{"pad":"{}"}}"#, "x".repeat(1 << 20))),
+        ..event(queue, id(9, 1), ParkStatus::Dead)
+    };
+    let long = ParkedEvent {
+        last_error: "é\"😀\u{1}".repeat(4000),
+        ..event(queue, id(9, 2), ParkStatus::Retrying)
+    };
+    store.append_parked(&[long.clone(), large.clone()]).await?;
+    assert_eq!(
+        store.read_parked_summary(&queue).await?,
+        Some(ParkedSummary {
+            id: large.id,
+            status: ParkStatus::Dead,
+            attempts: large.attempts,
+            first_failure_ms: large.first_failure_ms,
+            last_error: large.last_error.clone(),
+            last_error_cut: false,
+        })
+    );
+    store
+        .set_parked_status(&queue, &large.id, ParkStatus::Retrying)
+        .await?;
+    let redriven = store.read_parked_summary(&queue).await?;
+    assert_eq!(redriven.map(|head| head.status), Some(ParkStatus::Retrying));
+
+    store.remove_parked(&[(queue, large.id)]).await?;
+    let cut = store
+        .read_parked_summary(&queue)
+        .await?
+        .ok_or("the queue has a head")?;
+    assert_eq!(cut.id, long.id);
+    assert!(cut.last_error_cut);
+    assert!(long.last_error.starts_with(&cut.last_error));
+    assert!(
+        (PARKED_SUMMARY_BYTES / 2..PARKED_SUMMARY_BYTES).contains(&cut.last_error.len()),
+        "{} bytes of the last error",
+        cut.last_error.len()
+    );
+    assert_eq!(cut, ParkedSummary::of(&long)?);
+
+    store.remove_parked(&[(queue, long.id)]).await?;
+    assert_eq!(store.read_parked_summary(&queue).await?, None);
     Ok(())
 }
 

@@ -12,8 +12,8 @@ use crate::order::OrderKeyId;
 use crate::payload::{PayloadRef, PayloadStore};
 use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 use crate::state::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StateStore,
-    StoreError, SwapOutcome, Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, ParkedSummary,
+    StateStore, StoreError, SwapOutcome, Version, Versioned,
 };
 
 pub const FENCED: &str = "sink and store writes are fenced";
@@ -238,6 +238,13 @@ impl StateStore for GatedStateStore {
                 .read(self.inner.read_parked_within(key, after, limit, max_bytes))
                 .await,
         )
+    }
+
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError> {
+        or_unavailable(self.gate.read(self.inner.read_parked_summary(key)).await)
     }
 
     async fn set_parked_status(
@@ -477,6 +484,14 @@ mod tests {
                 entries: vec![ParkedEntry::Loaded(parked_event())],
                 full: true,
             })
+        }
+
+        async fn read_parked_summary(
+            &self,
+            _key: &OrderKeyId,
+        ) -> Result<Option<ParkedSummary>, StoreError> {
+            self.run("read_parked_summary").await;
+            Ok(Some(ParkedSummary::of(&parked_event())?))
         }
 
         async fn set_parked_status(
@@ -840,6 +855,10 @@ mod tests {
             Err(unavailable_error())
         );
         assert_eq!(
+            state.read_parked_summary(&key()).await,
+            Err(unavailable_error())
+        );
+        assert_eq!(
             state
                 .set_parked_status(&key(), &id(), ParkStatus::Dead)
                 .await,
@@ -891,6 +910,10 @@ mod tests {
             })
         );
         assert_eq!(
+            state.read_parked_summary(&key()).await,
+            Ok(Some(ParkedSummary::of(&parked_event()).unwrap()))
+        );
+        assert_eq!(
             state
                 .set_parked_status(&key(), &id(), ParkStatus::Dead)
                 .await,
@@ -913,6 +936,7 @@ mod tests {
                 "list_parked_queues",
                 "read_leader",
                 "read_parked",
+                "read_parked_summary",
                 "read_parked_within",
                 "set_parked_status",
                 "swap_leader"

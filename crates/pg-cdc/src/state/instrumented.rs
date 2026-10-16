@@ -6,8 +6,8 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use super::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StateStore,
-    StoreError, SwapOutcome, Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, ParkedSummary,
+    StateStore, StoreError, SwapOutcome, Version, Versioned,
 };
 use crate::event::EventId;
 use crate::lane::Stores;
@@ -126,6 +126,18 @@ impl StateStore for InstrumentedStateStore {
             StoreOperation::ReadParkedWithin,
             1,
             self.inner.read_parked_within(key, after, limit, max_bytes),
+        )
+        .await
+    }
+
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError> {
+        timed(
+            StoreOperation::ReadParkedSummary,
+            1,
+            self.inner.read_parked_summary(key),
         )
         .await
     }
@@ -270,6 +282,13 @@ mod tests {
                 .await
         }
 
+        async fn read_parked_summary(
+            &self,
+            key: &OrderKeyId,
+        ) -> Result<Option<ParkedSummary>, StoreError> {
+            self.call(self.inner.read_parked_summary(key)).await
+        }
+
         async fn set_parked_status(
             &self,
             key: &OrderKeyId,
@@ -373,6 +392,8 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let summary = state.read_parked_summary(&key).await.unwrap();
+        assert_eq!(summary, plain.read_parked_summary(&key).await.unwrap());
         state
             .set_parked_status(&key, &id, ParkStatus::Dead)
             .await
@@ -403,6 +424,7 @@ mod tests {
                 "list_parked_queues",
                 "read_parked",
                 "read_parked_within",
+                "read_parked_summary",
                 "set_parked_status",
                 "remove_parked",
                 "read_leader",
@@ -412,12 +434,13 @@ mod tests {
         );
     }
 
-    const ALL_OPERATIONS: [StoreOperation; 10] = [
+    const ALL_OPERATIONS: [StoreOperation; 11] = [
         StoreOperation::AppendParked,
         StoreOperation::LoadParkedHeads,
         StoreOperation::ListParkedQueues,
         StoreOperation::ReadParked,
         StoreOperation::ReadParkedWithin,
+        StoreOperation::ReadParkedSummary,
         StoreOperation::SetParkedStatus,
         StoreOperation::RemoveParked,
         StoreOperation::ReadLeader,
@@ -439,6 +462,7 @@ mod tests {
                 .read_parked_within(&key, None, 10, 1 << 20)
                 .await
                 .is_ok(),
+            state.read_parked_summary(&key).await.is_ok(),
             state
                 .set_parked_status(&key, &id, ParkStatus::Dead)
                 .await
@@ -462,7 +486,7 @@ mod tests {
     async fn each_store_call_records_exactly_its_own_duration() {
         let seen = recording();
         let inner = Arc::new(Slow::default());
-        assert_eq!(call_each_operation(&inner).await, vec![true; 10]);
+        assert_eq!(call_each_operation(&inner).await, vec![true; 11]);
         assert_eq!(*seen.lock().unwrap(), timed_in_turn());
     }
 
@@ -473,7 +497,7 @@ mod tests {
             fail: true,
             ..Slow::default()
         });
-        assert_eq!(call_each_operation(&inner).await, vec![false; 10]);
+        assert_eq!(call_each_operation(&inner).await, vec![false; 11]);
         assert_eq!(*seen.lock().unwrap(), timed_in_turn());
     }
 }

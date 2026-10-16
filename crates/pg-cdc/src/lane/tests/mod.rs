@@ -12,8 +12,8 @@ use crate::ack::AckTracker;
 use crate::payload::PayloadRef;
 use crate::state::memory::MemoryStateStore;
 use crate::state::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedQueues, ParkedSlice, StoreError, SwapOutcome,
-    Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedQueues, ParkedSlice, ParkedSummary, StoreError,
+    SwapOutcome, Version, Versioned,
 };
 use crate::status::ParkedSnapshot;
 use async_trait::async_trait;
@@ -299,6 +299,13 @@ impl StateStore for TestStore {
         self.inner
             .read_parked_within(key, after, limit, max_bytes)
             .await
+    }
+
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError> {
+        self.inner.read_parked_summary(key).await
     }
 
     async fn set_parked_status(

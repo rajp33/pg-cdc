@@ -1,6 +1,6 @@
 use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write as _};
+use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, oneshot};
 
 use super::{
-    Admission, ByteBudget, LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEntry,
-    ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StateStore, StoreError, SwapOutcome,
-    Version, Versioned, decode_parked, encode_parked,
+    Admission, ByteBudget, LEADER_OBJECT, LeaderRecord, PARKED_DIR, PARKED_SUMMARY_BYTES,
+    ParkStatus, ParkedEntry, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, ParkedSummary,
+    StateStore, StoreError, SwapOutcome, Version, Versioned, decode_parked, decode_parked_summary,
+    encode_parked,
 };
 use crate::event::EventId;
 use crate::order::OrderKeyId;
@@ -449,6 +450,31 @@ fn read_within(
     Ok(slice)
 }
 
+fn read_summary(
+    root: &Path,
+    key: OrderKeyId,
+    cancelled: Cancelled<'_>,
+) -> Result<Option<ParkedSummary>, StoreError> {
+    let dir = key_dir(root, &key);
+    loop {
+        let Some((head, _)) = queue_head(&dir, 1, cancelled)? else {
+            return Ok(None);
+        };
+        check(cancelled)?;
+        let path = dir.join(format!("{head}.json"));
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(unavailable(&path, &error)),
+        };
+        let mut prefix = Vec::with_capacity(PARKED_SUMMARY_BYTES);
+        file.take(u64::try_from(PARKED_SUMMARY_BYTES).unwrap_or(u64::MAX))
+            .read_to_end(&mut prefix)
+            .map_err(|error| unavailable(&path, &error))?;
+        return decode_parked_summary(&super::parked_name(&key, &head), &prefix).map(Some);
+    }
+}
+
 fn set_status(
     root: &Path,
     key: OrderKeyId,
@@ -610,6 +636,15 @@ impl StateStore for FilesystemStateStore {
             read_within(root, key, after, limit, max_bytes, cancelled)
         })
         .await
+    }
+
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError> {
+        let key = *key;
+        self.blocking(move |root, cancelled| read_summary(root, key, cancelled))
+            .await
     }
 
     async fn set_parked_status(

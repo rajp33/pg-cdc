@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pg_cdc_decoder::Lsn;
 use pg_cdc_decoder::lsn::ParseLsnError;
+use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -20,6 +21,7 @@ use crate::sink::{AttributeValue, Attributes, Outbound};
 pub const PARTITIONS: usize = 256;
 pub const LEADER_OBJECT: &str = "leader.json";
 pub const PARKED_DIR: &str = "parked";
+pub const PARKED_SUMMARY_BYTES: usize = 8 << 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,6 +50,30 @@ impl ParkedEvent {
             attributes: self.attributes.clone(),
             body: self.body.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedSummary {
+    pub id: EventId,
+    pub status: ParkStatus,
+    pub attempts: u32,
+    pub first_failure_ms: u64,
+    pub last_error: String,
+    pub last_error_cut: bool,
+}
+
+impl ParkedSummary {
+    pub fn of(event: &ParkedEvent) -> Result<Self, StoreError> {
+        let name = parked_name(&event.order_key, &event.id);
+        let empty: &RawValue =
+            serde_json::from_str("{}").map_err(|error| StoreError::Malformed {
+                key: name.clone(),
+                reason: error.to_string(),
+            })?;
+        let stored = encode_stored(event, Vec::new(), empty)?;
+        let prefix = stored.get(..PARKED_SUMMARY_BYTES).unwrap_or(&stored);
+        decode_parked_summary(&name, prefix)
     }
 }
 
@@ -193,6 +219,10 @@ pub trait StateStore: Send + Sync + fmt::Debug {
         limit: usize,
         max_bytes: u64,
     ) -> Result<ParkedSlice, StoreError>;
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError>;
     async fn set_parked_status(
         &self,
         key: &OrderKeyId,
@@ -270,12 +300,28 @@ struct StoredParked {
 }
 
 pub fn encode_parked(event: &ParkedEvent) -> Result<Vec<u8>, StoreError> {
-    let malformed = |reason: String| StoreError::Malformed {
-        key: parked_name(&event.order_key, &event.id),
-        reason,
-    };
-    let envelope: &RawValue = serde_json::from_slice(&event.body)
-        .map_err(|error| malformed(format!("the envelope is not JSON: {error}")))?;
+    let envelope: &RawValue =
+        serde_json::from_slice(&event.body).map_err(|error| StoreError::Malformed {
+            key: parked_name(&event.order_key, &event.id),
+            reason: format!("the envelope is not JSON: {error}"),
+        })?;
+    let attributes = event
+        .attributes
+        .iter()
+        .map(|(name, value)| StoredAttribute {
+            name: name.clone(),
+            data_type: value.data_type().to_owned(),
+            value: value.as_str().to_owned(),
+        })
+        .collect();
+    encode_stored(event, attributes, envelope)
+}
+
+fn encode_stored(
+    event: &ParkedEvent,
+    attributes: Vec<StoredAttribute>,
+    envelope: &RawValue,
+) -> Result<Vec<u8>, StoreError> {
     let stored = StoredParkedRef {
         order_key: event.order_key.to_string(),
         id: event.id.to_string(),
@@ -283,18 +329,124 @@ pub fn encode_parked(event: &ParkedEvent) -> Result<Vec<u8>, StoreError> {
         attempts: event.attempts,
         first_failure_ms: event.first_failure_ms,
         last_error: &event.last_error,
-        attributes: event
-            .attributes
-            .iter()
-            .map(|(name, value)| StoredAttribute {
-                name: name.clone(),
-                data_type: value.data_type().to_owned(),
-                value: value.as_str().to_owned(),
-            })
-            .collect(),
+        attributes,
         envelope,
     };
-    serde_json::to_vec(&stored).map_err(|error| malformed(error.to_string()))
+    serde_json::to_vec(&stored).map_err(|error| StoreError::Malformed {
+        key: parked_name(&event.order_key, &event.id),
+        reason: error.to_string(),
+    })
+}
+
+#[derive(Default)]
+struct SummaryFields {
+    id: Option<String>,
+    status: Option<ParkStatus>,
+    attempts: Option<u32>,
+    first_failure_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
+impl SummaryFields {
+    fn complete(&self) -> bool {
+        self.id.is_some()
+            && self.status.is_some()
+            && self.attempts.is_some()
+            && self.first_failure_ms.is_some()
+            && self.last_error.is_some()
+    }
+}
+
+const SUMMARY_READ: &str = "the summary fields are read";
+
+struct SummaryVisitor<'a>(&'a mut SummaryFields);
+
+impl<'de> Visitor<'de> for SummaryVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a parked event object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(name) = map.next_key::<String>()? {
+            match name.as_str() {
+                "id" => self.0.id = Some(map.next_value()?),
+                "status" => self.0.status = Some(map.next_value()?),
+                "attempts" => self.0.attempts = Some(map.next_value()?),
+                "first_failure_ms" => self.0.first_failure_ms = Some(map.next_value()?),
+                "last_error" => self.0.last_error = Some(map.next_value()?),
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            if self.0.complete() {
+                return Err(A::Error::custom(SUMMARY_READ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn cut_last_error(prefix: &[u8]) -> String {
+    const MARKER: &[u8] = br#""last_error":""#;
+    let Some(rest) = prefix
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .and_then(|start| prefix.get(start + MARKER.len()..))
+    else {
+        return String::new();
+    };
+    // A cut can split an escape (at most 12 bytes for a surrogate pair) or a UTF-8 sequence.
+    for end in (rest.len().saturating_sub(12)..=rest.len()).rev() {
+        let Some(head) = rest.get(..end) else {
+            continue;
+        };
+        let mut quoted = Vec::with_capacity(end + 2);
+        quoted.push(b'"');
+        quoted.extend_from_slice(head);
+        quoted.push(b'"');
+        if let Ok(text) = serde_json::from_slice::<String>(&quoted) {
+            return text;
+        }
+    }
+    String::new()
+}
+
+pub fn decode_parked_summary(name: &str, prefix: &[u8]) -> Result<ParkedSummary, StoreError> {
+    let malformed = |reason: String| StoreError::Malformed {
+        key: name.to_owned(),
+        reason,
+    };
+    let mut fields = SummaryFields::default();
+    let mut deserializer = serde_json::Deserializer::from_slice(prefix);
+    let outcome =
+        serde::Deserializer::deserialize_map(&mut deserializer, SummaryVisitor(&mut fields));
+    let failure = match outcome {
+        Ok(()) => "a summary field is missing".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    let (last_error, last_error_cut) = match fields.last_error.take() {
+        Some(last_error) => (last_error, false),
+        None if prefix.len() >= PARKED_SUMMARY_BYTES => (cut_last_error(prefix), true),
+        None => return Err(malformed(failure)),
+    };
+    let (Some(id), Some(status), Some(attempts), Some(first_failure_ms)) = (
+        fields.id,
+        fields.status,
+        fields.attempts,
+        fields.first_failure_ms,
+    ) else {
+        return Err(malformed(failure));
+    };
+    Ok(ParkedSummary {
+        id: id.parse().map_err(|error| malformed(format!("{error}")))?,
+        status,
+        attempts,
+        first_failure_ms,
+        last_error,
+        last_error_cut,
+    })
 }
 
 pub fn decode_parked(name: &str, bytes: &[u8]) -> Result<ParkedEvent, StoreError> {
@@ -500,6 +652,73 @@ mod tests {
         assert_eq!(budget.admit(0), Admission::Load);
         assert_eq!(budget.admit(0), Admission::Done);
         assert_eq!(ByteBudget::new(0, 10).admit(0), Admission::Done);
+    }
+
+    fn summary_of(event: &ParkedEvent) -> ParkedSummary {
+        ParkedSummary {
+            id: event.id,
+            status: event.status,
+            attempts: event.attempts,
+            first_failure_ms: event.first_failure_ms,
+            last_error: event.last_error.clone(),
+            last_error_cut: false,
+        }
+    }
+
+    #[test]
+    fn a_summary_reads_the_fields_before_the_envelope() {
+        let mut event = event();
+        event.body = Bytes::from(format!(r#"{{"pad":"{}"}}"#, "x".repeat(64 << 10)));
+        let stored = encode_parked(&event).unwrap();
+        let prefix = &stored[..PARKED_SUMMARY_BYTES];
+        assert_eq!(decode_parked_summary("p", prefix), Ok(summary_of(&event)));
+        assert_eq!(decode_parked_summary("p", &stored), Ok(summary_of(&event)));
+        assert_eq!(ParkedSummary::of(&event), Ok(summary_of(&event)));
+    }
+
+    #[test]
+    fn a_last_error_that_does_not_fit_is_cut_on_a_character_boundary() {
+        let tail = "é\"\u{1}😀\\x".repeat(2000);
+        for pad in 0..24 {
+            let mut event = event();
+            event.last_error = format!("{}{tail}", "a".repeat(pad));
+            let stored = encode_parked(&event).unwrap();
+            let summary = decode_parked_summary("p", &stored[..PARKED_SUMMARY_BYTES]).unwrap();
+            assert!(summary.last_error_cut, "pad {pad}");
+            assert!(
+                event.last_error.starts_with(&summary.last_error),
+                "pad {pad}"
+            );
+            assert!(
+                summary.last_error.len() > PARKED_SUMMARY_BYTES / 2,
+                "pad {pad}: {} bytes",
+                summary.last_error.len()
+            );
+            assert_eq!(
+                ParkedSummary {
+                    last_error: summary.last_error.clone(),
+                    last_error_cut: true,
+                    ..summary_of(&event)
+                },
+                summary
+            );
+            assert_eq!(ParkedSummary::of(&event), Ok(summary), "pad {pad}");
+        }
+    }
+
+    #[test]
+    fn a_summary_of_a_malformed_object_names_it() {
+        let wrong_status = br#"{"order_key":"x","id":"000000001a2b3c4d-00000003","status":"lost","attempts":1,"first_failure_ms":1,"last_error":""}"#;
+        let bad_id =
+            br#"{"id":"nope","status":"dead","attempts":1,"first_failure_ms":1,"last_error":""}"#;
+        let missing = br#"{"id":"000000001a2b3c4d-00000003","status":"dead","attempts":1}"#;
+        for bytes in [&b"{"[..], &b"[]"[..], wrong_status, bad_id, missing] {
+            assert!(
+                matches!(decode_parked_summary("p/q.json", bytes), Err(StoreError::Malformed { key, .. }) if key == "p/q.json"),
+                "{}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
     }
 
     #[test]

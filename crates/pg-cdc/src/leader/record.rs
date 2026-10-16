@@ -186,8 +186,8 @@ mod tests {
     use crate::order::OrderKeyId;
     use crate::state::memory::MemoryStateStore;
     use crate::state::{
-        LeaderState, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StoreError,
-        SwapOutcome, Versioned,
+        LeaderState, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, ParkedSummary,
+        StoreError, SwapOutcome, Versioned,
     };
 
     const FENCE: Duration = Duration::from_secs(10);
@@ -294,6 +294,13 @@ mod tests {
             self.inner
                 .read_parked_within(key, after, limit, max_bytes)
                 .await
+        }
+
+        async fn read_parked_summary(
+            &self,
+            key: &OrderKeyId,
+        ) -> Result<Option<ParkedSummary>, StoreError> {
+            self.inner.read_parked_summary(key).await
         }
 
         async fn set_parked_status(

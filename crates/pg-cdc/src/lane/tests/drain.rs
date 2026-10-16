@@ -95,6 +95,14 @@ impl StateStore for ModelS3 {
             .await
     }
 
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError> {
+        self.requests(1).await;
+        self.inner.read_parked_summary(key).await
+    }
+
     async fn set_parked_status(
         &self,
         key: &OrderKeyId,

@@ -19,8 +19,8 @@ use pg_cdc::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 use pg_cdc::state::filesystem::FilesystemStateStore;
 use pg_cdc::state::memory::MemoryStateStore;
 use pg_cdc::state::{
-    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StateStore,
-    StoreError, SwapOutcome, Version, Versioned,
+    LeaderRecord, ParkStatus, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, ParkedSummary,
+    StateStore, StoreError, SwapOutcome, Version, Versioned,
 };
 use pg_cdc::status::Status;
 use pg_cdc_testkit::Postgres;
@@ -185,6 +185,13 @@ impl StateStore for UnparkableStore {
         self.0
             .read_parked_within(key, after, limit, max_bytes)
             .await
+    }
+
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError> {
+        self.0.read_parked_summary(key).await
     }
 
     async fn set_parked_status(
@@ -355,6 +362,14 @@ impl StateStore for RecordingStore {
         self.inner
             .read_parked_within(key, after, limit, max_bytes)
             .await
+    }
+
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError> {
+        self.record("read_parked_summary");
+        self.inner.read_parked_summary(key).await
     }
 
     async fn set_parked_status(

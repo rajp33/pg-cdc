@@ -13,9 +13,10 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 
 use super::{
-    Admission, ByteBudget, LEADER_OBJECT, LeaderRecord, PARKED_DIR, ParkStatus, ParkedEntry,
-    ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, StateStore, StoreError, SwapOutcome,
-    Version, Versioned, decode_leader, decode_parked, encode_parked, parse_parked_name, store_root,
+    Admission, ByteBudget, LEADER_OBJECT, LeaderRecord, PARKED_DIR, PARKED_SUMMARY_BYTES,
+    ParkStatus, ParkedEntry, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, ParkedSummary,
+    StateStore, StoreError, SwapOutcome, Version, Versioned, decode_leader, decode_parked,
+    decode_parked_summary, encode_parked, parse_parked_name, store_root,
 };
 use crate::aws::aws_loader;
 use crate::event::EventId;
@@ -256,6 +257,35 @@ impl S3StateStore {
             .into_bytes()
             .to_vec();
         Ok(Some((bytes, etag)))
+    }
+
+    async fn fetch_prefix(&self, object: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let _permit = self.permit().await?;
+        let mut output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(object)
+            .range(format!("bytes=0-{}", PARKED_SUMMARY_BYTES - 1))
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) if missing_key(&error) => return Ok(None),
+            Err(error) => return Err(unavailable(&error)),
+        };
+        let mut prefix = Vec::with_capacity(PARKED_SUMMARY_BYTES);
+        while prefix.len() < PARKED_SUMMARY_BYTES
+            && let Some(chunk) = output
+                .body
+                .try_next()
+                .await
+                .map_err(|error| StoreError::Unavailable(format!("{object}: {error}")))?
+        {
+            prefix.extend_from_slice(&chunk);
+        }
+        prefix.truncate(PARKED_SUMMARY_BYTES);
+        Ok(Some(prefix))
     }
 
     async fn delete_batch(&self, objects: Vec<String>) -> Result<(), StoreError> {
@@ -669,6 +699,26 @@ impl StateStore for S3StateStore {
             })
             .collect();
         Ok(ParkedSlice { entries, full })
+    }
+
+    async fn read_parked_summary(
+        &self,
+        key: &OrderKeyId,
+    ) -> Result<Option<ParkedSummary>, StoreError> {
+        let prefix = format!("{}{key}/", self.parked_prefix());
+        let mut start_after = None;
+        loop {
+            let (objects, _) = self.list(&prefix, start_after.take(), None, 1).await?;
+            let Some(object) = objects.into_iter().next() else {
+                return Ok(None);
+            };
+            if let Some((_, id)) = self.parse(&object)
+                && let Some(stored) = self.fetch_prefix(&object).await?
+            {
+                return decode_parked_summary(&super::parked_name(key, &id), &stored).map(Some);
+            }
+            start_after = Some(object);
+        }
     }
 
     async fn set_parked_status(
