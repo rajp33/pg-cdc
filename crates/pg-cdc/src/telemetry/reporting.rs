@@ -107,7 +107,9 @@ mod client {
     use std::fmt;
 
     use sentry::integrations::tracing::EventMapping;
-    use sentry::protocol::{Breadcrumb, Context, Event, Exception, Map, Mechanism, Value};
+    use sentry::protocol::{
+        Breadcrumb, Context, DeviceContext, Event, Exception, Map, Mechanism, Value,
+    };
     use sentry::transports::UreqHttpTransportOptions;
     use sentry::types::Dsn;
     use sentry::{ClientOptions, TransportFactory, TransportOptions};
@@ -408,6 +410,12 @@ mod client {
     fn prepare(mut event: Event<'static>, pipeline: &str, holder: &str) -> Event<'static> {
         event.user = None;
         event.request = None;
+        if let Some(Context::Device(device)) = event.contexts.get_mut("device") {
+            **device = DeviceContext {
+                arch: device.arch.take(),
+                ..DeviceContext::default()
+            };
+        }
         event.message = event.message.map(|message| scrub_text(&message));
         if let Some(entry) = event.logentry.as_mut() {
             entry.message = scrub_text(&entry.message);
@@ -668,6 +676,17 @@ mod tests {
             assert!(event.user.is_none());
             assert_eq!(event.extra.get("lane"), Some(&serde_json::json!(3)));
             assert_eq!(event.logger.as_deref(), Some("pg_cdc::session"));
+            let Some(sentry::protocol::Context::Device(device)) = event.contexts.get("device")
+            else {
+                panic!("no device context: {:?}", event.contexts);
+            };
+            assert_eq!(
+                **device,
+                sentry::protocol::DeviceContext {
+                    arch: Some(std::env::consts::ARCH.to_owned()),
+                    ..sentry::protocol::DeviceContext::default()
+                }
+            );
         }
 
         #[test]
@@ -863,9 +882,12 @@ mod tests {
             let second = TestTransport::new();
             let (second_reporting, _layers) =
                 client::install_with(&plan(), &identity(), Arc::new(Arc::clone(&second)));
-            std::thread::spawn(|| std::panic::catch_unwind(|| panic!("once")).is_err())
-                .join()
-                .unwrap();
+            let hub = sentry::Hub::current();
+            std::thread::spawn(move || {
+                sentry::Hub::run(hub, || std::panic::catch_unwind(|| panic!("once")).is_err())
+            })
+            .join()
+            .unwrap();
             assert_eq!(second.fetch_and_clear_events().len(), 1);
             assert_eq!(first.fetch_and_clear_events().len(), 0);
             assert!(second_reporting.shutdown(Duration::from_secs(1)));
