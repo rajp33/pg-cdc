@@ -76,22 +76,24 @@ impl ErrorReporting {
     }
 
     #[cfg(feature = "sentry")]
-    pub fn shutdown(self, within: Duration) -> bool {
-        let Some(guard) = self.guard else {
-            return true;
-        };
-        let (closed, wait) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("pg-cdc-sentry".to_owned())
-            .spawn(move || {
-                closed.send(guard.close(Some(within))).ok();
-            });
-        spawned.is_ok() && wait.recv_timeout(within).unwrap_or(false)
+    pub fn shutdown(mut self, within: Duration) -> bool {
+        self.guard
+            .take()
+            .is_none_or(|guard| client::close_within(guard, within))
     }
 
     #[cfg(not(feature = "sentry"))]
     pub fn shutdown(self, _within: Duration) -> bool {
         true
+    }
+}
+
+#[cfg(feature = "sentry")]
+impl Drop for ErrorReporting {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            client::close_within(guard, REPORTING_FLUSH_TIMEOUT);
+        }
     }
 }
 
@@ -105,7 +107,7 @@ mod client {
     use std::fmt;
 
     use sentry::integrations::tracing::EventMapping;
-    use sentry::protocol::{Breadcrumb, Context, Event, Map, Value};
+    use sentry::protocol::{Breadcrumb, Context, Event, Exception, Map, Mechanism, Value};
     use sentry::transports::UreqHttpTransportOptions;
     use sentry::types::Dsn;
     use sentry::{ClientOptions, TransportFactory, TransportOptions};
@@ -151,6 +153,7 @@ mod client {
         "tuple",
     ];
     const OUR_TARGET: &str = "pg_cdc";
+    const PANIC_MESSAGE: &str = "pg-cdc panicked";
     const MESSAGE_FIELD: &str = "message";
     const FOREIGN_ERROR: &str = "a dependency logged an error";
     const FOREIGN_WARNING: &str = "a dependency logged a warning";
@@ -188,6 +191,7 @@ mod client {
         let mut options = options(plan, identity)?;
         options.transport = transport.or_else(|| bounded_transport(&options));
         let guard = sentry::init(options);
+        install_panic_hook();
         let layer = sentry::integrations::tracing::layer()
             .event_mapper(|event, _| allowlisted(event))
             .span_filter(|_| false)
@@ -198,6 +202,46 @@ mod client {
                 layers: vec![Box::new(layer)],
             }),
         ))
+    }
+
+    pub(super) fn close_within(guard: sentry::ClientInitGuard, within: Duration) -> bool {
+        let (closed, wait) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("pg-cdc-sentry".to_owned())
+            .spawn(move || {
+                closed.send(guard.close(Some(within))).ok();
+            });
+        spawned.is_ok() && wait.recv_timeout(within).unwrap_or(false)
+    }
+
+    fn install_panic_hook() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            sentry::capture_event(panic_event(info));
+            previous(info);
+        }));
+    }
+
+    fn panic_event(info: &std::panic::PanicHookInfo<'_>) -> Event<'static> {
+        let exception = Exception {
+            ty: "panic".to_owned(),
+            value: info
+                .location()
+                .map(|location| format!("at {}:{}", location.file(), location.line())),
+            stacktrace: sentry::integrations::backtrace::current_stacktrace(),
+            mechanism: Some(Mechanism {
+                ty: "panic".to_owned(),
+                handled: Some(false),
+                ..Mechanism::default()
+            }),
+            ..Exception::default()
+        };
+        Event {
+            level: sentry::Level::Fatal,
+            message: Some(PANIC_MESSAGE.to_owned()),
+            exception: vec![exception].into(),
+            ..Event::default()
+        }
     }
 
     #[derive(Default)]
@@ -746,25 +790,33 @@ mod tests {
         }
 
         #[test]
-        fn a_panic_is_captured() {
+        fn a_panic_is_captured_by_location_without_its_payload() {
             let transport = TestTransport::new();
             let (reporting, _layers) =
                 client::install_with(&plan(), &identity(), Arc::new(Arc::clone(&transport)));
-            let panicked = std::panic::catch_unwind(|| panic!("the lane invariant broke"));
+            let line = line!() + 1;
+            let panicked = std::panic::catch_unwind(|| panic!("row value {}", "customer-secret"));
             assert!(panicked.is_err());
             assert!(reporting.shutdown(Duration::from_secs(2)));
             let events = transport.fetch_and_clear_events();
             assert_eq!(events.len(), 1, "{events:?}");
+            let sent = fields(&events[0]);
+            assert!(!sent.contains("customer-secret"), "{sent}");
+            assert_eq!(events[0].level, Level::Fatal);
+            assert_eq!(events[0].message.as_deref(), Some("pg-cdc panicked"));
             let exception = &events[0].exception.values[0];
-            assert_eq!(exception.value.as_deref(), Some("the lane invariant broke"));
+            assert_eq!(exception.ty, "panic");
+            assert_eq!(
+                exception.value.as_deref(),
+                Some(format!("at {}:{line}", file!()).as_str())
+            );
             assert_eq!(
                 events[0].tags.get("pipeline").map(String::as_str),
                 Some("orders")
             );
         }
 
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn shutdown_against_a_blackholed_sentry_gives_up_at_its_deadline() {
+        async fn blackholed() -> (ErrorReporting, tokio::task::JoinHandle<()>) {
             let (endpoint, server) = pg_cdc_testkit::blackhole().await.unwrap();
             let address = endpoint.trim_start_matches("http://");
             let plan = ReportingPlan {
@@ -778,20 +830,73 @@ mod tests {
                     tracing::error!(target: "pg_cdc::lane", attempt, "the sink rejected the event for good");
                 }
             });
+            (reporting, server)
+        }
+
+        async fn within<T: Send + 'static>(
+            bound: Duration,
+            work: impl FnOnce() -> T + Send + 'static,
+        ) -> T {
             let started = std::time::Instant::now();
-            let finished =
-                tokio::task::spawn_blocking(move || reporting.shutdown(Duration::from_millis(300)));
-            let flushed = tokio::time::timeout(Duration::from_secs(5), finished)
+            let finished = tokio::task::spawn_blocking(work);
+            let output = tokio::time::timeout(Duration::from_secs(10), finished)
                 .await
-                .expect("shutdown must not outlive its budget")
+                .expect("the call must stay within its bound")
                 .unwrap();
+            assert!(started.elapsed() < bound, "{:?}", started.elapsed());
+            output
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shutdown_against_a_blackholed_sentry_gives_up_at_its_deadline() {
+            let (reporting, server) = blackholed().await;
+            let flushed = within(Duration::from_millis(500), move || {
+                reporting.shutdown(Duration::from_millis(300))
+            })
+            .await;
             assert!(!flushed);
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "{:?}",
-                started.elapsed()
-            );
             server.abort();
+        }
+
+        #[derive(Debug)]
+        struct Stalled;
+
+        impl sentry::Transport for Stalled {
+            fn send_envelope(&self, _envelope: sentry::Envelope) {}
+
+            fn flush(&self, _timeout: Duration) -> bool {
+                std::thread::sleep(Duration::from_secs(10));
+                false
+            }
+        }
+
+        fn stalled() -> ErrorReporting {
+            let (reporting, _layers) =
+                client::install_with(&plan(), &identity(), Arc::new(Arc::new(Stalled)));
+            reporting
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn dropping_the_reporter_with_a_stalled_transport_is_bounded() {
+            let reporting = stalled();
+            within(
+                REPORTING_FLUSH_TIMEOUT + Duration::from_millis(500),
+                move || {
+                    drop(reporting);
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_panic_with_a_stalled_transport_returns_at_once() {
+            let reporting = stalled();
+            let panicked = within(Duration::from_secs(3), || {
+                std::panic::catch_unwind(|| panic!("the lane invariant broke")).is_err()
+            })
+            .await;
+            assert!(panicked);
+            assert!(!reporting.shutdown(Duration::from_millis(10)));
         }
 
         #[test]

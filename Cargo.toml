@@ -85,7 +85,6 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 sentry = { version = "0.49.3", default-features = false, features = [
   "backtrace",
   "contexts",
-  "panic",
   "tracing",
   "ureq",
   "rustls",
