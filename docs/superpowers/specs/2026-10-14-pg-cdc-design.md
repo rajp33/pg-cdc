@@ -284,7 +284,9 @@ The xid is left out of the envelope: it is 32 bits and wraps, and `commit_lsn` a
 - **Per-table overrides.** `delivery.order_by_tables` maps `schema.table` to `key`, `table` or `column:<name>` (not `pipeline`); other tables use `delivery.order_by`.
   - The effective mode is resolved once per Relation message and cached with the relation, so events never look it up by name.
   - Fallbacks and truncates (§7.4) follow the table's effective mode.
-  - Startup validation (§13.2) warns about a named table outside the publication or a missing column.
+  - Startup validation (§13.2) fails on an override column the publication does not replicate, and warns about a named table outside the publication.
+  - Each key's events stay in commit order, but a row's events stay on one key only while its order column keeps its value; a changed or nulled value, a rename or a column the stream stops carrying moves later events to another key.
+  - A mapping change gives rows new keys while parked queues keep their old ones, so parked events can be delivered out of order relative to new events. pg-cdc does not check for this; operators drain parked events before changing the mapping.
 - **The canonical order key** is a compact JSON array:
   - `[schema, table, v1, v2, …]` for `key`, with values in key column order;
   - `[schema, table]` for `table`, and for any fallback to the table;
@@ -673,7 +675,7 @@ At process start, in any role, pg-cdc checks over the control connection that:
 - the slot exists, uses `pgoutput`, belongs to the configured database, and has a `wal_status` other than `lost`;
 - the publication exists.
 
-It also looks up each `delivery.order_by_tables` table. One that is not in the publication, or that lacks its `column:<name>` column, logs a warning and does not block: the override never applies, or the table's events fall back to its table key, as with `column:<name>` at runtime.
+It also reads, in one query, every published table and the columns the publication replicates (its column list on Postgres 15 and later; generated columns only from 18). An override whose `column:<name>` is not replicated fails validation, since every event of that table would fall back to its table key. A named table that is not in the publication logs a warning and does not block.
 
 It then opens a replication connection and closes it without `START_REPLICATION`, to check that the role can log in for replication.
 
