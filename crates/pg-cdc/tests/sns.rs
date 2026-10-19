@@ -6,7 +6,7 @@ use pg_cdc::order::{OrderBy, order_key};
 use pg_cdc::sink::sns::SnsSink;
 use pg_cdc::sink::{Outbound, Outcome, Sink, SinkCapabilities};
 use pg_cdc_decoder::Lsn;
-use pg_cdc_testkit::AwsEmulator;
+use pg_cdc_testkit::{AwsEmulator, TestkitError};
 use serde_json::json;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -185,10 +185,16 @@ async fn a_body_filter_on_changed_selects_updates_that_touched_the_column() -> T
     assert_eq!(sink.send(&batch).await, vec![Outcome::Delivered; 4]);
     aws.receive(&route.queue_url, 4, WAIT).await?;
     let matched = aws.receive(&revisions, 1, WAIT).await?;
-    let body: serde_json::Value = serde_json::from_str(matched[0].body().ok_or("no body")?)?;
-    assert_eq!(body["id"], batch[0].id.to_string());
+    let bodies: Vec<serde_json::Value> = matched
+        .iter()
+        .map(|message| serde_json::from_str(message.body().unwrap_or_default()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        bodies.iter().map(|body| &body["id"]).collect::<Vec<_>>(),
+        [&json!(batch[0].id.to_string())]
+    );
     let more = aws.receive(&revisions, 1, Duration::from_secs(2)).await;
-    assert!(more.is_err(), "{more:?}");
+    assert!(matches!(more, Err(TestkitError::Timeout(_))), "{more:?}");
     Ok(())
 }
 
