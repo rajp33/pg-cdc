@@ -286,6 +286,7 @@ mod tests {
         TelemetryConfig {
             otlp_endpoint: endpoint.map(str::to_owned),
             trace_sample_ratio: ratio,
+            sentry: crate::config::SentryConfig::default(),
         }
     }
 
