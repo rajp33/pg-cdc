@@ -3,23 +3,28 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aws_config::SdkConfig;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::config::interceptors::BeforeDeserializationInterceptorContextRef;
+use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
+use aws_sdk_s3::error::{BoxError, DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 
+use super::instrumented::{carry_operation, current_operation};
 use super::{
     Admission, ByteBudget, LEADER_OBJECT, LeaderRecord, PARKED_DIR, PARKED_SUMMARY_BYTES,
     ParkStatus, ParkedEntry, ParkedEvent, ParkedHead, ParkedQueues, ParkedSlice, ParkedSummary,
     StateStore, StoreError, SwapOutcome, Version, Versioned, decode_leader, decode_parked,
     decode_parked_summary, encode_parked, parse_parked_name, store_root,
 };
-use crate::aws::aws_loader;
+use crate::aws::{aws_loader, throttle_reason};
 use crate::event::EventId;
+use crate::metrics::{self, Measurement};
 use crate::order::OrderKeyId;
 
 pub const S3_MAX_ATTEMPTS: u32 = 3;
@@ -40,7 +45,37 @@ pub async fn s3_client(region: Option<String>) -> Client {
                 .operation_timeout(S3_OPERATION_TIMEOUT)
                 .build(),
         );
-    Client::new(&loader.load().await)
+    Client::from_conf(s3_config(&loader.load().await))
+}
+
+pub fn s3_config(sdk: &SdkConfig) -> aws_sdk_s3::Config {
+    aws_sdk_s3::config::Builder::from(sdk)
+        .interceptor(ThrottleCounter)
+        .build()
+}
+
+#[derive(Debug)]
+struct ThrottleCounter;
+
+impl Intercept for ThrottleCounter {
+    fn name(&self) -> &'static str {
+        "pg-cdc throttle counter"
+    }
+
+    fn read_before_deserialization(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let status = context.response().status().as_u16();
+        if throttle_reason(None, Some(status)).is_some()
+            && let Some(operation) = current_operation()
+        {
+            metrics::record(Measurement::StoreThrottled { operation });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -464,7 +499,9 @@ impl S3StateStore {
         let mut tasks = JoinSet::new();
         for id in ids {
             let store = self.clone();
-            tasks.spawn(async move { store.read_event(key, id).await });
+            tasks.spawn(carry_operation(
+                async move { store.read_event(key, id).await },
+            ));
         }
         Self::join(tasks).await
     }
@@ -538,7 +575,9 @@ impl StateStore for S3StateStore {
         for (key, mut queue) in queues {
             queue.sort_by_key(|(id, _)| *id);
             let store = self.clone();
-            tasks.spawn(async move { store.append_queue(key, queue).await });
+            tasks.spawn(carry_operation(async move {
+                store.append_queue(key, queue).await
+            }));
         }
         let appended = Self::join(tasks).await.map(drop);
         let mut read_ahead = self.read_ahead();
@@ -588,7 +627,9 @@ impl StateStore for S3StateStore {
         let mut tasks = JoinSet::new();
         for key in keys {
             let store = self.clone();
-            tasks.spawn(async move { store.queue_head(key, length_cap).await });
+            tasks.spawn(carry_operation(async move {
+                store.queue_head(key, length_cap).await
+            }));
         }
         let mut queues: Vec<ParkedHead> = Self::join(tasks).await?.into_iter().flatten().collect();
         queues.sort_unstable_by_key(|queue| queue.order_key);
@@ -766,7 +807,9 @@ impl StateStore for S3StateStore {
         for batch in events.chunks(S3_DELETE_BATCH) {
             let store = self.clone();
             let objects = batch.iter().map(|(key, id)| self.object(key, id)).collect();
-            tasks.spawn(async move { store.delete_batch(objects).await });
+            tasks.spawn(carry_operation(
+                async move { store.delete_batch(objects).await },
+            ));
         }
         Self::join(tasks).await?;
         let mut read_ahead = self.read_ahead();
@@ -835,9 +878,85 @@ impl StateStore for S3StateStore {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::config::Credentials;
     use pg_cdc_decoder::Lsn;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::metrics::{Measurement, Recorder, StoreOperation};
+    use crate::state::instrumented::InstrumentedStateStore;
+
+    #[derive(Debug)]
+    struct Throttles(Arc<Mutex<Vec<StoreOperation>>>);
+
+    impl Recorder for Throttles {
+        fn record(&self, measurement: Measurement<'_>) {
+            if let Measurement::StoreThrottled { operation } = measurement {
+                self.0.lock().unwrap().push(operation);
+            }
+        }
+    }
+
+    const SLOW_DOWN: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>";
+
+    async fn slow_down_endpoint() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&buffer[..read]),
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 503 Slow Down\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{SLOW_DOWN}",
+                        SLOW_DOWN.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn every_throttled_attempt_counts_against_the_store_operation_in_flight() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        crate::metrics::install(Box::new(Throttles(Arc::clone(&seen)))).unwrap();
+        let (endpoint, server) = slow_down_endpoint().await;
+        let sdk = aws_loader(Some("us-east-1".to_owned()))
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .retry_config(
+                RetryConfig::standard()
+                    .with_max_attempts(S3_MAX_ATTEMPTS)
+                    .with_initial_backoff(Duration::from_millis(1)),
+            )
+            .load()
+            .await;
+        let client = Client::from_conf(s3_config(&sdk).to_builder().force_path_style(true).build());
+        let plain = S3StateStore::new(client, "bucket".to_owned(), "pgcdc", "orders", 4);
+        let store = InstrumentedStateStore::new(Arc::new(plain.clone()));
+        let error = store.read_leader().await.unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Unavailable(message) if message.contains("SlowDown")),
+            "{error}"
+        );
+        let attempts = usize::try_from(S3_MAX_ATTEMPTS).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![StoreOperation::ReadLeader; attempts]
+        );
+        plain.read_leader().await.unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), attempts);
+        server.abort();
+    }
 
     fn ids(lsn: u64, count: usize) -> Vec<EventId> {
         (0..u32::try_from(count).unwrap())

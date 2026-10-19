@@ -15,6 +15,18 @@ use crate::metrics::{self, Measurement, StoreOperation};
 use crate::order::OrderKeyId;
 use crate::payload::{PayloadRef, PayloadStore};
 
+tokio::task_local! {
+    static OPERATION: Option<StoreOperation>;
+}
+
+pub(crate) fn current_operation() -> Option<StoreOperation> {
+    OPERATION.try_with(|operation| *operation).ok().flatten()
+}
+
+pub(crate) fn carry_operation<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    OPERATION.scope(current_operation(), future)
+}
+
 #[derive(Debug)]
 pub struct InstrumentedStateStore {
     inner: Arc<dyn StateStore>,
@@ -54,7 +66,7 @@ async fn timed<F: Future>(operation: StoreOperation, count: usize, call: F) -> F
     );
     async move {
         let started = metrics::enabled().then(Instant::now);
-        let output = call.await;
+        let output = OPERATION.scope(Some(operation), call).await;
         if let Some(started) = started {
             metrics::record(Measurement::Store {
                 operation,
@@ -203,6 +215,32 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn the_operation_in_flight_is_visible_to_its_calls_and_to_the_tasks_they_carry_it_to() {
+        assert_eq!(current_operation(), None);
+        let seen = timed(StoreOperation::ReadParked, 1, async {
+            let direct = current_operation();
+            let carried = tokio::spawn(carry_operation(async { current_operation() }))
+                .await
+                .unwrap();
+            let uncarried = tokio::spawn(async { current_operation() }).await.unwrap();
+            (direct, carried, uncarried)
+        })
+        .await;
+        assert_eq!(
+            seen,
+            (
+                Some(StoreOperation::ReadParked),
+                Some(StoreOperation::ReadParked),
+                None
+            )
+        );
+        let outside = tokio::spawn(carry_operation(async { current_operation() }))
+            .await
+            .unwrap();
+        assert_eq!(outside, None);
+    }
 
     #[derive(Debug)]
     struct Collecting(Arc<Mutex<Vec<(StoreOperation, Duration)>>>);
