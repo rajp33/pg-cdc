@@ -35,6 +35,7 @@ enum Seen {
     Takeover(TakeoverKind),
     DecodeFallback(u32),
     Sink,
+    Other,
 }
 
 #[derive(Debug)]
@@ -59,6 +60,7 @@ impl Recorder for Collecting {
             Measurement::Takeover(kind) => Seen::Takeover(kind),
             Measurement::DecodeFallback { type_oid } => Seen::DecodeFallback(type_oid),
             Measurement::Sink { .. } => Seen::Sink,
+            _ => Seen::Other,
         };
         self.0
             .lock()
