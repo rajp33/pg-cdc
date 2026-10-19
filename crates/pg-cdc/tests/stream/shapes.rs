@@ -37,6 +37,9 @@ async fn toast_unchanged_under_default_identity_is_listed() -> TestResult {
     assert_eq!(new_key["after"], json!({"id": 2, "title": "b"}));
     assert_eq!(new_key["key"], json!({"id": 2}));
     assert_eq!(new_key["unchanged_toast"], json!(["body"]));
+    for event in [&insert, &same_key, &new_key] {
+        assert!(event.get("changed").is_none(), "{event}");
+    }
     session.stop().await
 }
 
@@ -70,6 +73,50 @@ async fn toast_filled_under_full_identity() -> TestResult {
         json!({"id": 1, "title": "b", "body": body})
     );
     assert!(update.get("unchanged_toast").is_none());
+    session.stop().await
+}
+
+#[tokio::test]
+async fn changed_under_full_identity_compares_old_and_new_text() -> TestResult {
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &[
+            "CREATE TABLE docs (id int PRIMARY KEY, title text, body text, note text, amount numeric)",
+            "ALTER TABLE docs ALTER COLUMN body SET STORAGE EXTERNAL",
+            "ALTER TABLE docs REPLICA IDENTITY FULL",
+        ],
+        &["docs"],
+    )
+    .await?;
+    let mut session = support::spawn_session(support::params(&pg), FAST, BUFFER);
+    let steps = [
+        (
+            "INSERT INTO docs VALUES (1, 'a', repeat('y', 5000), NULL, 1.50)",
+            None,
+        ),
+        ("UPDATE docs SET title = 'b'", Some(json!(["title"]))),
+        (
+            "UPDATE docs SET note = 'n', title = 'c'",
+            Some(json!(["title", "note"])),
+        ),
+        ("UPDATE docs SET note = NULL", Some(json!(["note"]))),
+        ("UPDATE docs SET title = title", Some(json!([]))),
+        ("UPDATE docs SET amount = 1.5", Some(json!(["amount"]))),
+        (
+            "UPDATE docs SET body = repeat('z', 5000)",
+            Some(json!(["body"])),
+        ),
+        ("UPDATE docs SET id = 2", Some(json!(["id"]))),
+        ("DELETE FROM docs", None),
+    ];
+    for (statement, _) in &steps {
+        pg.execute(statement).await?;
+    }
+    for (statement, changed) in steps {
+        let event = session.next_event().await?;
+        assert_eq!(event.get("changed").cloned(), changed, "{statement}");
+    }
     session.stop().await
 }
 
