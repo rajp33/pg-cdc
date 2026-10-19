@@ -141,7 +141,7 @@ The dead head is marked retrying and sent again; if the sink rejects it again it
 pg-cdc parked discard <order key id> --id <event id>
 ```
 
-Discard removes the head only if it is still that event (409 with the current head otherwise), so you never discard an event you have not inspected. The key's next event goes out next. A discarded event is gone from the sink's point of view, but if pg-cdc crashes before the event's transaction is confirmed, the replay sends it again, after every such crash, until the transaction is confirmed.
+Discard removes the head only if it is still that event (409 with the current head otherwise), so you never discard an event you have not inspected. The key's next event goes out next. A discarded event is gone from the sink's point of view, but if pg-cdc crashes before the event's transaction is confirmed, the replay can resend it, repeatedly, until the transaction is confirmed.
 
 **Answers:**
 
