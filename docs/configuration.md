@@ -82,6 +82,7 @@ telemetry:
 | `source.slot`, `source.publication` | required | 1 to 63 lowercase letters, digits or underscores. pg-cdc never creates or drops either. |
 | `source.status_interval` | `10s` | How often the confirmed position is reported to Postgres. |
 | `delivery.order_by` | `key` | `key`, `table`, `column:<name>` or `pipeline` (see [Order keys](#order-keys)). |
+| `delivery.order_by_tables` | `{}` | Per-table overrides of `order_by`: `schema.table` to `key`, `table` or `column:<name>` (see [Order keys](#order-keys)). In the environment, comma-separated `schema.table=order_by` pairs. |
 | `delivery.lanes` | `64` | 1 to 4,096. An event goes to lane `order key id mod lanes`. |
 | `delivery.max_inflight_bytes` | `256MiB` | The reader stops when in-flight events (their encoded bodies) reach this size. |
 | `delivery.park_after` | `30s` | How long an event may stay undelivered after its first failure before it is parked. |
@@ -126,6 +127,22 @@ The order key decides ordering and lane placement. Events of one order key are d
 | `pipeline` | one key for everything: total order, one event in flight at a time |
 
 A truncate has no key: its order key is its table under `key`, `table` and the `column:<name>` fallback, and the one constant key under `pipeline`. Under `key` and `column:<name>` it is therefore not ordered relative to that table's row events that use a different order key. One order key moves at most one event per sink round trip, roughly 20 to 50 events/s against SNS, so choose `order_by` so that no single key carries a high rate.
+
+`delivery.order_by_tables` overrides `order_by` for the tables it names; every other table keeps `order_by`:
+
+```yaml
+delivery:
+  order_by: key
+  order_by_tables:
+    public.orders: column:id
+    public.order_items: column:order_id
+```
+
+- **Values.** Each table is `schema.table`, matched exactly. A value is `key`, `table` or `column:<name>`; `pipeline` is rejected, since it orders the whole pipeline. From the environment, set the map as one variable: `PGCDC__DELIVERY__ORDER_BY_TABLES=public.orders=column:id,public.order_items=column:order_id`.
+- **The same rules per table.** The fallback to the table and the truncate rule above follow each table's own mode.
+- **Grouping across tables.** `column:<name>` keys by the value alone, so above an order and its items share one order key, one lane and, on a FIFO topic, one message group, also within one transaction. The two columns must hold equal JSON values: an `int` and a `text` column never match. Unrelated `column:<name>` tables whose values coincide share a key too, which only serializes them. A delete carries a non-key column only under `REPLICA IDENTITY FULL`; otherwise it falls back to its table.
+- **Startup check.** Validation logs a warning, and carries on, when a named table is not in the publication or lacks its `column:<name>` column.
+- **Changing it** moves rows to new keys while parked and in-flight events keep their old ones; see the [runbook](runbook.md#5-parked-and-dead-events) before changing `order_by` or `order_by_tables` on a running pipeline.
 
 ## Sinks
 
