@@ -100,7 +100,7 @@ impl Drop for ErrorReporting {
 #[cfg(feature = "sentry")]
 mod client {
     use std::borrow::Cow;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
     use secrecy::ExposeSecret as _;
@@ -201,14 +201,39 @@ mod client {
         ))
     }
 
+    type Closer = Box<dyn FnOnce() + Send>;
+
     pub(super) fn close_within(guard: sentry::ClientInitGuard, within: Duration) -> bool {
+        close_within_using(guard, within, |closer| {
+            std::thread::Builder::new()
+                .name("pg-cdc-sentry".to_owned())
+                .spawn(closer)
+                .map(drop)
+        })
+    }
+
+    pub(super) fn close_within_using(
+        guard: sentry::ClientInitGuard,
+        within: Duration,
+        spawn: impl FnOnce(Closer) -> std::io::Result<()>,
+    ) -> bool {
+        let slot = Arc::new(Mutex::new(Some(guard)));
+        let handed = Arc::clone(&slot);
         let (closed, wait) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("pg-cdc-sentry".to_owned())
-            .spawn(move || {
+        let spawned = spawn(Box::new(move || {
+            let guard = handed.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(guard) = guard {
                 closed.send(guard.close(Some(within))).ok();
-            });
-        spawned.is_ok() && wait.recv_timeout(within).unwrap_or(false)
+            }
+        }));
+        if spawned.is_err() {
+            // Dropping a ClientInitGuard closes the client synchronously with no bound.
+            if let Some(guard) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                std::mem::forget(guard);
+            }
+            return false;
+        }
+        wait.recv_timeout(within).unwrap_or(false)
     }
 
     fn install_panic_hook() {
@@ -923,6 +948,19 @@ mod tests {
                 },
             )
             .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_close_whose_thread_cannot_start_abandons_the_client_at_once() {
+            let mut reporting = stalled();
+            let guard = reporting.guard.take().unwrap();
+            let closed = within(Duration::from_millis(500), move || {
+                client::close_within_using(guard, Duration::from_millis(100), |_closer| {
+                    Err(std::io::Error::other("no more threads"))
+                })
+            })
+            .await;
+            assert!(!closed);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
