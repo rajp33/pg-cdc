@@ -151,3 +151,62 @@ async fn an_override_on_a_column_the_publication_does_not_replicate_fails_startu
     assert!(!health.snapshot().validated, "{:?}", health.snapshot());
     Ok(())
 }
+
+#[tokio::test]
+async fn an_unchanged_toasted_order_column_keeps_its_key_only_under_full_identity() -> TestResult {
+    let pg = Postgres::start().await?;
+    let mut statements = Vec::new();
+    for (table, identity) in [("full_items", "FULL"), ("plain_items", "DEFAULT")] {
+        statements.push(format!(
+            "CREATE TABLE {table} (id int PRIMARY KEY, order_ref text, note text)"
+        ));
+        statements.push(format!(
+            "ALTER TABLE {table} ALTER COLUMN order_ref SET STORAGE EXTERNAL"
+        ));
+        statements.push(format!("ALTER TABLE {table} REPLICA IDENTITY {identity}"));
+    }
+    let statements: Vec<&str> = statements.iter().map(String::as_str).collect();
+    support::prepare(&pg, &statements, &["full_items", "plain_items"]).await?;
+    let by_ref = OrderBy::Column("order_ref".to_owned());
+    let config = SessionConfig {
+        order_by_tables: BTreeMap::from([
+            (table("full_items"), by_ref.clone()),
+            (table("plain_items"), by_ref),
+        ]),
+        ..support::config(FAST, BUFFER)
+    };
+    let mut session = support::spawn_with(support::params(&pg), config);
+    for table in ["full_items", "plain_items"] {
+        pg.execute(&format!(
+            "INSERT INTO {table} VALUES (1, repeat('k', 5000), 'a');
+             UPDATE {table} SET note = 'b' WHERE id = 1;"
+        ))
+        .await?;
+    }
+    let by_value = OrderKeyId::of(json!([&"k".repeat(5000)]).to_string().as_bytes());
+    let mut keys = Vec::new();
+    for _ in 0..4 {
+        let (key, event) = session.next_keyed_event().await?;
+        let (table, op, _) = summary(&event);
+        let id = event["id"].as_str().unwrap_or_default().to_owned();
+        keys.push((id, (table, op, key, event["unchanged_toast"].clone())));
+    }
+    keys.sort_by(|left, right| left.0.cmp(&right.0));
+    let keys: Vec<_> = keys.into_iter().map(|(_, keyed)| keyed).collect();
+    assert_eq!(
+        keys,
+        [
+            ("full_items", "insert", by_value, Value::Null),
+            ("full_items", "update", by_value, Value::Null),
+            ("plain_items", "insert", by_value, Value::Null),
+            (
+                "plain_items",
+                "update",
+                OrderKeyId::of(br#"["public","plain_items"]"#),
+                json!(["order_ref"])
+            ),
+        ]
+        .map(|(table, op, key, toast)| (table.to_owned(), op.to_owned(), key, toast))
+    );
+    session.stop().await
+}
