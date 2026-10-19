@@ -917,11 +917,18 @@ mod tests {
         body.len() >= length
     }
 
+    type Answer = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
     async fn slow_down_endpoint() -> (String, tokio::task::JoinHandle<()>) {
+        answering_endpoint(Arc::new(|_| None)).await
+    }
+
+    async fn answering_endpoint(answer: Answer) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                let answer = Arc::clone(&answer);
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buffer = [0_u8; 4096];
@@ -931,9 +938,18 @@ mod tests {
                             Ok(read) => request.extend_from_slice(&buffer[..read]),
                         }
                     }
+                    let line = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let (status, body) = match answer(&line) {
+                        Some(body) => ("200 OK", body),
+                        None => ("503 Slow Down", SLOW_DOWN.to_owned()),
+                    };
                     let response = format!(
-                        "HTTP/1.1 503 Slow Down\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{SLOW_DOWN}",
-                        SLOW_DOWN.len()
+                        "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
                 });
@@ -1004,6 +1020,62 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             vec![StoreOperation::RemoveParked; attempts]
+        );
+        server.abort();
+    }
+
+    fn listing(entries: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>bucket</Name><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>"
+        )
+    }
+
+    fn listed_store(client: Client) -> InstrumentedStateStore {
+        InstrumentedStateStore::new(Arc::new(S3StateStore::new(
+            client,
+            "bucket".to_owned(),
+            "pgcdc",
+            "orders",
+            4,
+        )))
+    }
+
+    #[tokio::test]
+    async fn throttled_reads_in_spawned_tasks_count_against_the_read_in_flight() {
+        let seen = recording_throttles();
+        let attempts = usize::try_from(S3_MAX_ATTEMPTS).unwrap();
+        let queue = format!("pgcdc/orders/parked/{}/", key(1));
+        let object = format!("{queue}{}.json", EventId::new(Lsn(0x10), 0));
+        let one_queue = listing(&format!(
+            "<CommonPrefixes><Prefix>{queue}</Prefix></CommonPrefixes>"
+        ));
+        let one_object = listing(&format!(
+            "<Contents><Key>{object}</Key><Size>2</Size></Contents>"
+        ));
+
+        let (endpoint, server) = answering_endpoint(Arc::new(move |line: &str| {
+            (line.contains("list-type=2") && !line.contains("delimiter="))
+                .then(|| one_object.clone())
+        }))
+        .await;
+        let store = listed_store(throttled_client(endpoint).await);
+        store.read_parked(&key(1), None, 1).await.unwrap_err();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![StoreOperation::ReadParked; attempts]
+        );
+        server.abort();
+        seen.lock().unwrap().clear();
+
+        let (endpoint, server) = answering_endpoint(Arc::new(move |line: &str| {
+            line.contains("delimiter=").then(|| one_queue.clone())
+        }))
+        .await;
+        let store = listed_store(throttled_client(endpoint).await);
+        store.list_parked_queues(None, 10, 10).await.unwrap_err();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![StoreOperation::ListParkedQueues; attempts]
         );
         server.abort();
     }
