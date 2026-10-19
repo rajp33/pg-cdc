@@ -4,9 +4,9 @@ pg-cdc reads one YAML file, passed as `pg-cdc run --config <file>`. The [runbook
 
 ## Loading rules
 
-- **Environment overrides.** Any key can be set or overridden with `PGCDC__<SECTION>__<KEY>`, for example `PGCDC__DELIVERY__PARK_AFTER=60s` or `PGCDC__SINK__ATTRIBUTE_COLUMNS=tenant_id,region` (lists as comma-separated values). A `PGCDC__` variable that does not name a configuration key is an error.
+- **Environment overrides.** Any key can be set or overridden with `PGCDC__<SECTION>__<KEY>`, for example `PGCDC__DELIVERY__PARK_AFTER=60s` or `PGCDC__SINK__ATTRIBUTE_COLUMNS=tenant_id,region` (lists as comma-separated values). A `PGCDC__` variable that does not name a configuration key is treated like an unknown key in the file; one with an empty segment, such as `PGCDC__SOURCE____PORT`, is an error.
 - **Secrets come from the environment only.** With `credentials.type: password`, the password is read from `PGCDC__SOURCE__CREDENTIALS__PASSWORD`; a password in the file is rejected.
-- **Unknown keys are rejected.**
+- **Unknown keys are ignored with a warning.** A key this version does not know, in the file or from a `PGCDC__` variable, does not stop startup. pg-cdc logs one warning, `ignoring unknown configuration keys`, whose `keys` field names each one as a dotted path (`delivery.order_by_tables`) without its value, and carries on. That lets a key added by a newer version, or left behind after a rollback, through without a crash loop. The trade-off is that a misspelled key or section name is ignored too and its setting quietly keeps its default, so check the startup log for that warning after every configuration change. A known key with an invalid value still stops startup.
 - **Units.** Durations are whole numbers with `ms`, `s`, `m` or `h` (`30s`); sizes are whole numbers with `B`, `KiB`, `MiB` or `GiB` (`256MiB`).
 
 ## Full example
