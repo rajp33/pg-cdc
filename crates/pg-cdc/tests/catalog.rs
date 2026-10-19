@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use pg_cdc::catalog::{
     SlotActivity, TypeResolver, key_columns, published_columns, slot_activity,
     slot_confirmed_flush, slot_retained_bytes, tables_without_full_identity,
 };
+use pg_cdc::order::TableName;
 use pg_cdc_decoder::Lsn;
 use pg_cdc_decoder::value::TypeKind;
 use pg_cdc_replication::{ReplicationConfig, ReplicationStream};
@@ -159,11 +161,11 @@ async fn reads_slot_position_and_identity_warnings() -> TestResult {
 }
 
 #[tokio::test]
-async fn published_columns_list_a_published_tables_live_columns() -> TestResult {
+async fn published_columns_map_each_published_table_to_its_replicated_columns() -> TestResult {
     let pg = Postgres::start().await?;
     pg.execute(
-        "CREATE TABLE orders (id int PRIMARY KEY, status text);
-         CREATE TABLE order_items (id int PRIMARY KEY, gone int, order_id int);
+        "CREATE TABLE orders (id int PRIMARY KEY, status text, total int GENERATED ALWAYS AS (id * 2) STORED);
+         CREATE TABLE order_items (id int PRIMARY KEY, gone int, order_id int, sku text);
          ALTER TABLE order_items DROP COLUMN gone;
          CREATE TABLE empty_t ();
          CREATE TABLE unpublished (id int PRIMARY KEY);",
@@ -172,22 +174,31 @@ async fn published_columns_list_a_published_tables_live_columns() -> TestResult 
     pg.create_publication("cat_pub", &["orders", "order_items", "empty_t"])
         .await?;
     let client = pg.client().await?;
-    let columns = |table: &'static str| published_columns(&client, "cat_pub", "public", table);
+    let table = |name: &str| TableName {
+        schema: "public".to_owned(),
+        table: name.to_owned(),
+    };
+    let names = |columns: &[&str]| columns.iter().map(|&c| c.to_owned()).collect::<Vec<_>>();
     assert_eq!(
-        columns("order_items").await?,
-        Some(vec!["id".to_owned(), "order_id".to_owned()])
+        published_columns(&client, "cat_pub").await?,
+        BTreeMap::from([
+            (table("empty_t"), Vec::new()),
+            (table("order_items"), names(&["id", "order_id", "sku"])),
+            (table("orders"), names(&["id", "status"])),
+        ])
     );
     assert_eq!(
-        columns("orders").await?,
-        Some(vec!["id".to_owned(), "status".to_owned()])
+        published_columns(&client, "missing_pub").await?,
+        BTreeMap::new()
     );
-    assert_eq!(columns("empty_t").await?, Some(Vec::new()));
-    assert_eq!(columns("unpublished").await?, None);
-    assert_eq!(columns("missing").await?, None);
-    assert_eq!(
-        published_columns(&client, "other_pub", "public", "orders").await?,
-        None
-    );
+    if pg.version() >= 15 {
+        pg.execute("CREATE PUBLICATION listed_pub FOR TABLE order_items (id, sku)")
+            .await?;
+        assert_eq!(
+            published_columns(&client, "listed_pub").await?,
+            BTreeMap::from([(table("order_items"), names(&["id", "sku"]))])
+        );
+    }
     Ok(())
 }
 

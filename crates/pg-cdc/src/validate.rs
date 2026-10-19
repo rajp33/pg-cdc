@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
+
 use tokio_postgres::Client;
 
 use crate::catalog::CatalogError;
-use crate::order::OrderBy;
+use crate::order::{OrderBy, TableName, missing_order_column};
 
 pub const PGOUTPUT: &str = "pgoutput";
 
@@ -52,6 +54,10 @@ pub enum Invalid {
     PublicationMissing(String),
     #[error("the configured role cannot open a replication connection: {0}")]
     ReplicationDenied(String),
+    #[error(
+        "delivery.order_by_tables orders {table} by column {column}, which publication does not replicate; publish the column or order the table by table"
+    )]
+    OrderColumnUnpublished { table: String, column: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,27 +140,24 @@ pub async fn validate(
     Ok(assess(&facts, slot, publication)?)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum OrderOverrideGap {
-    #[error("the table is not in the publication, so the override never applies")]
-    Unpublished,
-    #[error("the table has no column {0}, so its events order by table")]
-    MissingColumn(String),
-}
-
-pub fn order_override_gap(
-    order_by: &OrderBy,
-    published_columns: Option<&[String]>,
-) -> Option<OrderOverrideGap> {
-    let Some(columns) = published_columns else {
-        return Some(OrderOverrideGap::Unpublished);
-    };
-    match order_by {
-        OrderBy::Column(name) if !columns.contains(name) => {
-            Some(OrderOverrideGap::MissingColumn(name.clone()))
+pub fn judge_order_overrides<'a>(
+    overrides: &'a BTreeMap<TableName, OrderBy>,
+    published: &BTreeMap<TableName, Vec<String>>,
+) -> Result<Vec<&'a TableName>, Invalid> {
+    let mut unpublished = Vec::new();
+    for (table, order_by) in overrides {
+        let Some(columns) = published.get(table) else {
+            unpublished.push(table);
+            continue;
+        };
+        if let Some(column) = missing_order_column(order_by, columns) {
+            return Err(Invalid::OrderColumnUnpublished {
+                table: table.to_string(),
+                column: column.to_owned(),
+            });
         }
-        _ => None,
     }
+    Ok(unpublished)
 }
 
 fn assess(facts: &SourceFacts, slot: &str, publication: &str) -> Result<Verdict, Invalid> {
@@ -319,23 +322,39 @@ mod tests {
     }
 
     #[test]
-    fn a_table_override_needs_a_published_table_with_its_column() {
-        let columns = ["id".to_owned(), "order_id".to_owned()];
-        let by_order = OrderBy::Column("order_id".to_owned());
-        let by_tenant = OrderBy::Column("tenant_id".to_owned());
-        assert_eq!(order_override_gap(&by_order, Some(&columns)), None);
-        assert_eq!(order_override_gap(&OrderBy::Key, Some(&columns)), None);
-        assert_eq!(order_override_gap(&OrderBy::Table, Some(&[])), None);
+    fn an_override_column_the_publication_does_not_replicate_fails_validation() {
+        let table = |name: &str| TableName {
+            schema: "public".to_owned(),
+            table: name.to_owned(),
+        };
+        let published = BTreeMap::from([
+            (table("orders"), vec!["id".to_owned(), "status".to_owned()]),
+            (
+                table("order_items"),
+                vec!["id".to_owned(), "sku".to_owned()],
+            ),
+        ]);
+        let column = |name: &str| OrderBy::Column(name.to_owned());
+        let fine = BTreeMap::from([
+            (table("orders"), column("id")),
+            (table("order_items"), OrderBy::Key),
+            (table("staged"), column("order_id")),
+        ]);
         assert_eq!(
-            order_override_gap(&by_tenant, Some(&columns)),
-            Some(OrderOverrideGap::MissingColumn("tenant_id".to_owned()))
+            judge_order_overrides(&fine, &published),
+            Ok(vec![&table("staged")])
         );
-        for order_by in [OrderBy::Key, by_order] {
-            assert_eq!(
-                order_override_gap(&order_by, None),
-                Some(OrderOverrideGap::Unpublished)
-            );
-        }
+        let unpublished_column = BTreeMap::from([
+            (table("orders"), column("id")),
+            (table("order_items"), column("order_id")),
+        ]);
+        assert_eq!(
+            judge_order_overrides(&unpublished_column, &published),
+            Err(Invalid::OrderColumnUnpublished {
+                table: "public.order_items".to_owned(),
+                column: "order_id".to_owned(),
+            })
+        );
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

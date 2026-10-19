@@ -32,12 +32,14 @@ use crate::leader::standby::{
     AcquireError, OBJECT_IN_USE, ProbeError, SlotHolder, SlotProbe, StartError, acquire,
 };
 use crate::metrics::{self, ErrorComponent, ErrorKind, EventOutcome, Measurement};
-use crate::order::{OrderBy, OrderKeyId, TableName, order_key, table_order_by};
+use crate::order::{
+    OrderBy, OrderKeyId, TableName, missing_order_column, order_key, table_order_by, table_override,
+};
 use crate::sink::{Outbound, Sink, metric_labels};
 use crate::state::StateStore;
 use crate::state::instrumented::instrumented;
 use crate::status::{ParkedAccess, Status};
-use crate::validate::{Invalid, ValidationError, order_override_gap, validate};
+use crate::validate::{Invalid, ValidationError, judge_order_overrides, validate};
 
 pub const REPLICATION_BUFFER: usize = 64;
 pub const HANDOVER_TAIL: Duration = Duration::from_secs(3);
@@ -583,16 +585,18 @@ async fn check_source(
         tracing::warn!(%schema, %table, "published table does not use REPLICA IDENTITY FULL");
     }
     status.set_tables_without_full_identity(u64::try_from(unsafe_tables.len()).unwrap_or(u64::MAX));
-    for (table, order_by) in &config.order_by_tables {
-        let columns = catalog::published_columns(
-            control.client(),
-            &config.publication,
-            &table.schema,
-            &table.table,
-        )
-        .await?;
-        if let Some(gap) = order_override_gap(order_by, columns.as_deref()) {
-            tracing::warn!(%table, %gap, "delivery.order_by_tables override does not apply as configured");
+    if !config.order_by_tables.is_empty() {
+        let published = catalog::published_columns(control.client(), &config.publication).await?;
+        match judge_order_overrides(&config.order_by_tables, &published) {
+            Ok(unpublished) => {
+                for table in unpublished {
+                    tracing::warn!(%table, "delivery.order_by_tables names a table that is not in the publication");
+                }
+            }
+            Err(invalid) => {
+                health.set_validated(false);
+                return Err(invalid.into());
+            }
         }
     }
     Ok(())
@@ -1086,6 +1090,19 @@ impl Session<'_> {
         } else {
             relation.namespace
         };
+        if let Some(column) = table_override(self.order_by_tables, &schema, &relation.name)
+            .and_then(|order_by| {
+                let names: Vec<&str> = columns.iter().map(|column| column.name.as_str()).collect();
+                missing_order_column(order_by, &names)
+            })
+        {
+            tracing::warn!(
+                %schema,
+                table = %relation.name,
+                %column,
+                "the replication stream no longer carries this table's delivery.order_by_tables column; its events order by table"
+            );
+        }
         let order_by =
             table_order_by(self.order_by, self.order_by_tables, &schema, &relation.name).clone();
         let info = RelationInfo {

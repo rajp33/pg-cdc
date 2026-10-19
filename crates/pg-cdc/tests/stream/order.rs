@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use pg_cdc::order::{OrderBy, OrderKeyId, TableName};
-use pg_cdc::session::SessionConfig;
+use pg_cdc::session::{SessionConfig, SessionError};
+use pg_cdc::validate::Invalid;
 use pg_cdc_testkit::Postgres;
 use serde_json::{Value, json};
 
@@ -118,4 +119,35 @@ async fn table_overrides_deliver_a_parent_and_its_children_on_one_order_key_in_c
         ))
     );
     session.stop().await
+}
+
+#[tokio::test]
+async fn an_override_on_a_column_the_publication_does_not_replicate_fails_startup() -> TestResult {
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &["CREATE TABLE order_items (id int PRIMARY KEY, order_id int, sku text)"],
+        &["order_items"],
+    )
+    .await?;
+    let config = SessionConfig {
+        order_by_tables: BTreeMap::from([(
+            table("order_items"),
+            OrderBy::Column("order_ref".to_owned()),
+        )]),
+        ..support::config(FAST, BUFFER)
+    };
+    let session = support::spawn_with(support::params(&pg), config);
+    let health = session.health();
+    let result = session.finished(support::WAIT).await?;
+    assert!(
+        matches!(
+            &result,
+            Err(SessionError::Invalid(Invalid::OrderColumnUnpublished { table, column }))
+                if table == "public.order_items" && column == "order_ref"
+        ),
+        "{result:?}"
+    );
+    assert!(!health.snapshot().validated, "{:?}", health.snapshot());
+    Ok(())
 }

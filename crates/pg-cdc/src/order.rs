@@ -66,16 +66,36 @@ impl fmt::Display for TableName {
     }
 }
 
+pub fn table_override<'a>(
+    tables: &'a BTreeMap<TableName, OrderBy>,
+    schema: &str,
+    table: &str,
+) -> Option<&'a OrderBy> {
+    tables
+        .iter()
+        .find(|(name, _)| name.schema == schema && name.table == table)
+        .map(|(_, order_by)| order_by)
+}
+
 pub fn table_order_by<'a>(
     default: &'a OrderBy,
     tables: &'a BTreeMap<TableName, OrderBy>,
     schema: &str,
     table: &str,
 ) -> &'a OrderBy {
-    tables
-        .iter()
-        .find(|(name, _)| name.schema == schema && name.table == table)
-        .map_or(default, |(_, order_by)| order_by)
+    table_override(tables, schema, table).unwrap_or(default)
+}
+
+pub fn missing_order_column<'a, S: AsRef<str>>(
+    order_by: &'a OrderBy,
+    columns: &[S],
+) -> Option<&'a str> {
+    match order_by {
+        OrderBy::Column(name) if !columns.iter().any(|column| column.as_ref() == name) => {
+            Some(name)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -390,6 +410,19 @@ mod tests {
             table_order_by(&OrderBy::Pipeline, &BTreeMap::new(), "public", "orders"),
             &OrderBy::Pipeline
         );
+    }
+
+    #[test]
+    fn only_a_column_mode_can_miss_its_column() {
+        let columns = ["id", "order_id"];
+        assert_eq!(missing_order_column(&column("order_id"), &columns), None);
+        assert_eq!(
+            missing_order_column(&column("order_ref"), &columns),
+            Some("order_ref")
+        );
+        for order_by in [OrderBy::Key, OrderBy::Table, OrderBy::Pipeline] {
+            assert_eq!(missing_order_column(&order_by, &columns), None);
+        }
     }
 
     #[test]
