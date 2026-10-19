@@ -8,6 +8,9 @@ const NOT_MEASURED: &str = "not measured";
 const NOT_RESOLVED: &str = "not resolved";
 const UNVERIFIED: &str = "unverified (emulator-bound)";
 const RESOLUTION_SPREAD: f64 = 1.01;
+const CPU_OVERHEAD: &str = "overhead";
+const INSTRUCTION_OVERHEAD: &str = "overhead-instructions";
+const BOTH_OVERHEADS: &str = "overhead, overhead-instructions";
 const HEADER: [&str; 5] = ["Criterion", "Target", "Measured", "Verdict", "Scenario"];
 
 struct Row {
@@ -243,6 +246,35 @@ fn overhead(report: &Value) -> Option<Measurement> {
     })
 }
 
+fn instructions(report: &Value) -> Option<String> {
+    let percent = number(report, &["overhead_percent"])?;
+    let noise = number(report, &["noise_percent"])?;
+    let rule = text(report, "noise_rule_verdict")?;
+    Some(format!(
+        "supporting, not a verdict: {percent:+.2}% instructions per event under cachegrind, \
+         middle runs spread {noise:.2}%, {rule} by the noise rule"
+    ))
+}
+
+fn telemetry_overhead(reports: &[Value]) -> Row {
+    let mut row = row(
+        reports,
+        "7. Telemetry overhead",
+        "within 1% of a build without the otel feature when unconfigured",
+        CPU_OVERHEAD,
+        overhead,
+    );
+    if let Some(supporting) = find(reports, INSTRUCTION_OVERHEAD).and_then(instructions) {
+        if row.verdict == NOT_MEASURED {
+            "CPU time not measured".clone_into(&mut row.measured);
+            NOT_RESOLVED.clone_into(&mut row.verdict);
+        }
+        row.measured = format!("{}; {supporting}", row.measured);
+        row.scenario = BOTH_OVERHEADS;
+    }
+    row
+}
+
 pub fn summary_table(reports: &[Value]) -> String {
     let rows = [
         row(
@@ -273,13 +305,7 @@ pub fn summary_table(reports: &[Value]) -> String {
             "memory",
             memory,
         ),
-        row(
-            reports,
-            "7. Telemetry overhead",
-            "within 1% of a build without the otel feature when unconfigured",
-            "overhead",
-            overhead,
-        ),
+        telemetry_overhead(reports),
     ];
     let mut table = format!(
         "| {} |\n|{}\n",
@@ -579,6 +605,47 @@ mod tests {
         assert_eq!(quiet[3], "pass");
         let failing = cells(&summary_table(&[overhead(1.004, "fail")]), "7");
         assert_eq!(failing[3], "fail");
+    }
+
+    fn instructions(rule: &str) -> Value {
+        json!({
+            "scenario": "overhead-instructions",
+            "overhead_percent": 0.123,
+            "noise_percent": 0.456,
+            "noise_rule_verdict": rule,
+        })
+    }
+
+    #[test]
+    fn instruction_counts_support_criterion_seven_without_deciding_it() {
+        let alone = cells(&summary_table(&[instructions("pass")]), "7");
+        assert_eq!(alone[3], "not resolved");
+        assert_eq!(
+            alone[2],
+            "CPU time not measured; supporting, not a verdict: +0.12% instructions per event \
+             under cachegrind, middle runs spread 0.46%, pass by the noise rule"
+        );
+        assert_eq!(alone[4], "overhead, overhead-instructions");
+
+        let noisy_cpu = cells(
+            &summary_table(&[overhead(1.14, "pass"), instructions("pass")]),
+            "7",
+        );
+        assert_eq!(noisy_cpu[3], "not resolved");
+        assert!(
+            noisy_cpu[2].starts_with("-0.73% CPU per event"),
+            "{noisy_cpu:?}"
+        );
+        assert!(
+            noisy_cpu[2].contains("pass by the noise rule"),
+            "{noisy_cpu:?}"
+        );
+
+        let quiet_cpu = cells(
+            &summary_table(&[overhead(1.004, "fail"), instructions("pass")]),
+            "7",
+        );
+        assert_eq!(quiet_cpu[3], "fail");
     }
 
     #[test]

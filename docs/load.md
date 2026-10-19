@@ -8,7 +8,7 @@ The section 4 criteria this milestone measures, in the format `loadgen report` w
 | 4. Throughput against SNS | at least 5,000 events/s with p99 commit-to-acknowledgement under 1 s | delivered 3822 events/s, p99 upper bound 60.00 s; moto's own ceiling 4364 messages/s; pending the real-SNS check (R128) | unverified (emulator-bound) | sns |
 | 5. Handover | a deploy handover under 10 s with nothing lost | 5 handovers: worst SIGTERM to /readyz 1.85 s, worst delivery gap 1.95 s, worst exit 0.10 s; evidence intact | pass | handover |
 | 6. Memory | within max_inflight_bytes plus fixed overhead whatever the transaction size | peak RSS 122.3 MiB with max_inflight_bytes 64 MiB, flat from 50,000 to 500,000 rows | pass | memory |
-| 7. Telemetry overhead | within 1% of a build without the otel feature when unconfigured | -0.73% CPU per event, runs spread 14.0%, beyond the 1% to resolve | not resolved | overhead |
+| 7. Telemetry overhead | within 1% of a build without the otel feature when unconfigured | -0.73% CPU per event, runs spread 14.0%, beyond the 1% to resolve; supporting, not a verdict: +0.41% instructions per event under cachegrind pooled over five invocations, middle runs spread 1.97%, not resolved by the noise rule | not resolved | overhead, overhead-instructions |
 
 Numbers recorded here come from the `loadgen` binary, which drives pg-cdc as a child process against Postgres and moto in Docker. Nothing here touches real AWS. Each section states its machine, versions and command so a reader can repeat it.
 
@@ -83,13 +83,13 @@ Reading the numbers:
 
 ## Load
 
-`loadgen load <scenario>` measures criteria 3 to 7 of section 4. Each scenario starts its own Postgres (and moto where it needs one), writes a pg-cdc config into a temp directory (`status_interval: 1s`, `order_by: key`, `lanes: 64`, `admin.listen: 127.0.0.1:0`), drives a release build of `pg-cdc` as a child process, reads its progress from `/status`, and writes `<report-dir>/<scenario>.json` with the config, the machine and the numbers. `mise run load` builds the default and `--no-default-features` binaries and runs every scenario into `target/load`; `LOAD_SCENARIO=ceiling|sns|overhead|memory|outage|brownout|handover` runs one. `loadgen report --report-dir <dir> --out <file>` writes the summary table at the top of this page from every report in a directory.
+`loadgen load <scenario>` measures criteria 3 to 7 of section 4. Each scenario starts its own Postgres (and moto where it needs one), writes a pg-cdc config into a temp directory (`status_interval: 1s`, `order_by: key`, `lanes: 64`, `admin.listen: 127.0.0.1:0`), drives a release build of `pg-cdc` as a child process, reads its progress from `/status`, and writes `<report-dir>/<scenario>.json` with the config, the machine and the numbers. `mise run load` builds the default and `--no-default-features` binaries and runs every scenario into `target/load`; `LOAD_SCENARIO=ceiling|sns|overhead|overhead-instructions|memory|outage|brownout|handover` runs one. `overhead-instructions` ignores those binaries and builds its own for Linux in Docker. `loadgen report --report-dir <dir> --out <file>` writes the summary table at the top of this page from every report in a directory.
 
 Machine: Apple M3 Max, 16 cores, 64 GiB, macOS 26.5.2. Docker: OrbStack 29.4.0 (linux/arm64). Postgres 17.11 (`postgres:17-alpine`, `fsync=off`), moto 5.2.4, Rust 1.99.0, pg-cdc and loadgen release builds at commit `933a205`. Postgres and moto run in Docker on the same machine as pg-cdc and the load generator, and other jobs shared the machine (load average 3 to 5 during the runs), so absolute numbers are this machine's and the runs are noisy.
 
 CPU time and resident memory are read from outside the process with `ps -o rss=,time=`, so they cover everything pg-cdc does, including startup. The workload is the one from the chaos section without TOAST or oversize rows: upserts into `loadgen_items` from one connection in transactions of exactly 100 changes (`row_bytes 200`, 1,000 keys, uniform), with `REPLICA IDENTITY FULL`.
 
-The summary at the top of this page gives each criterion's verdict. For criterion 7 it reads the second overhead run; the first failed (+1.71%), and the 36 runs of both pooled give -0.31%.
+The summary at the top of this page gives each criterion's verdict. For criterion 7 it reads the second overhead run; the first failed (+1.71%), and the 36 runs of both pooled give -0.31%. Its supporting cachegrind note pools the five `overhead-instructions` invocations below, which no single report holds, so that part is written by hand in the format `loadgen report` uses.
 
 Criterion 4 stays unmet against SNS until `loadgen load sns --topic-arn <arn> --real-aws` passes (the pre-production check in the runbook).
 
@@ -141,6 +141,37 @@ Command: `LOAD_SCENARIO=overhead mise run load`, run twice. 18 slots are created
 Run 1 gives an overhead of +1.71% (fail by the method); run 2 gives -0.73% (pass). Pooling the 18 runs of each build from both invocations gives medians of 9.52 and 9.55 CPU s per million events, -0.31%.
 
 Cause: the runs of one build spread by 8% to 14% in CPU time, an order of magnitude above the 1% that criterion 7 asks the method to resolve, so single invocations fall on either side of 1% by chance and the two builds' medians swap places between invocations. The spread is run-to-run variation on a machine shared with other jobs and with Docker; there is no consistent sign to the difference between the builds. Nothing here shows telemetry costing more than the noise, and nothing here can prove it costs less than 1%. Resolving 1% needs a quiet machine or a hardware instruction counter, neither of which this method has.
+
+### Telemetry overhead in instructions (supporting evidence for criterion 7)
+
+Command: `LOAD_SCENARIO=overhead-instructions mise run load`. It took 2 to 3 minutes here once the image was built; building `crates/loadgen/cachegrind.Dockerfile` the first time took under 2 minutes.
+
+This scenario counts instructions instead of CPU time. It is supporting evidence only: criterion 7 asks about throughput, and an equal instruction count does not imply equal throughput. It builds both pg-cdc variants for linux/arm64 with the release profile, the baseline with `--no-default-features`, in `rust:1.99.0-slim-trixie`, and copies them into `debian:trixie-20260918-slim` with valgrind 3.24.0 and jemalloc 5.3.0 from Debian. Every container in one invocation runs the image ID that this build produced, which the report records with the source commit and whether the working tree had uncommitted changes. Postgres is the same container as the other scenarios. Ten slots are created, then one backlog of 50,000 events is written. Each run starts a container in Postgres's network namespace that runs `valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/tmp/cachegrind.out pg-cdc run` with the discard sink, a filesystem store and no telemetry configured. When the slot's `confirmed_flush_lsn` reaches the backlog's end LSN, loadgen sends SIGTERM and reads the total instruction count (Ir) from the `summary:` line of cachegrind's output. There are five rounds, and in each round each build gets two runs:
+
+- a startup run on a slot created after the backlog, stopped 2 s after the slot becomes active
+- a backlog run on its own slot
+
+The build that goes first alternates from round to round. Invocations 1 to 4 below predate that change and always ran the default build first.
+
+Instructions per event are the backlog run's Ir minus the build's median startup Ir, divided by 50,000. Startup costs 16 to 19 million instructions, under 1% of a backlog run. The report also gives the counts before subtraction. Subtracting assumes the startup run is the fixed part of a backlog run, which has not been checked: it includes 2 s idle and a shutdown that the backlog runs do not share.
+
+pg-cdc runs under valgrind with `TOKIO_WORKER_THREADS=1` and with jemalloc preloaded (`MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`). With glibc malloc and ten workers, runs of one build differed by 1 to 2%. Most of that difference was in glibc's `_int_malloc` and `malloc_consolidate`, whose cost depends on a heap layout that follows timing, and in hand-offs between workers. Both builds run with the same settings, but the production image uses glibc malloc and one worker per core, so neither the absolute counts nor the relative overhead are shown to carry over to production. With telemetry unconfigured, pg-cdc installs no OpenTelemetry SDK and no tracing layer (`TelemetryPlan::Disabled` in `crates/pg-cdc/src/telemetry/mod.rs`), so no telemetry code path is known to depend on the worker count.
+
+Counts are still not exact repeats. Lanes flush a batch 5 ms of wall-clock time after its first event arrives, so how many events share a batch depends on how fast valgrind happens to run. The difference shows up in `Lane::run`, key hashing and tokio's timers, and it puts single runs of one build up to 1.1% apart. Each report applies a noise rule. The rule drops each build's highest and lowest run and takes the wider of the two builds' remaining spreads (max / min - 1) as the noise. It passes when the overhead plus the noise is below 1%, fails when the overhead minus the noise is 1% or more, and is otherwise not resolved. The rule has no stated confidence level and does not carry the uncertainty of the startup subtraction, so it is a heuristic.
+
+Five invocations on 2026-10-19, VM kernel 7.0.14-orbstack (aarch64), load average 3 to 18 from other jobs. The commit is the one each report records:
+
+| Invocation | Commit in the report | Default median instructions/event | Baseline median instructions/event | Overhead | Middle-runs spread, default / baseline | All-runs spread, default / baseline | Noise rule |
+|---|---|---|---|---|---|---|---|
+| 1 | `68d0524`, with the five-round code uncommitted | 43,677 | 43,719 | -0.10% | 0.62% / 0.19% | 1.11% / 0.75% | pass |
+| 2 | `68d0524`, with the five-round code uncommitted | 44,129 | 43,986 | +0.33% | 0.46% / 0.58% | 0.49% / 1.07% | pass |
+| 3 | `bce26db` | 44,134 | 43,825 | +0.70% | 0.47% / 0.35% | 0.88% / 0.93% | not resolved |
+| 4 | `bce26db` | 43,969 | 43,767 | +0.46% | 0.34% / 0.32% | 0.92% / 0.58% | pass |
+| 5 | `f596864`, clean, image `sha256:aeb7ef36e75e` | 43,398 | 43,336 | +0.14% | 0.70% / 0.39% | 1.01% / 0.90% | pass |
+
+`68d0524` and `bce26db` are earlier versions of the scenario commit and are no longer on the branch. The measuring code of invocations 1 to 4 matches `f596864` except for the fixed build order, the image ID, the provenance fields and the report wording. Invocation 2's pass depends on the startup subtraction. Without it the overhead is +0.46%, and the same rule on the gross counts gives 1.03%, which is not resolved.
+
+Pooling the 25 runs of each build gives medians of 43,927 and 43,748 instructions per event, +0.41%. The same noise rule on the pooled runs gives 1.97%, so the pooled result is not resolved, and invocations also differ from one another in level (invocation 5 sits 0.6% to 1.7% below the others). Every invocation puts the overhead under 1%, and four of the five pass the noise rule alone. Criterion 7 stays not resolved: these counts support an overhead below 1% but do not bound throughput. Valgrind ran pg-cdc on arm64 without reporting an unsupported instruction. Instruction counts cover only pg-cdc's own user-space instructions, so they leave out kernel time and the effects of caches and branch prediction.
 
 ### Memory (criterion 6)
 

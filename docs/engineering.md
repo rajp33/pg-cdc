@@ -54,7 +54,7 @@ Outside the gate:
 
 - `mise run chaos-smoke` runs the chaos harness for 15 s (seed 1) against two debug instances, Postgres and moto, and checks that nothing was lost and per-key order held; CI runs it as its own job.
 - `mise run chaos` runs it on a release build with `CHAOS_SEED` (default: the current Unix time) for about 5 minutes: the opening takeovers, 3 minutes of chaos and at most 1 minute to settle. Whatever is still parked or not yet delivered then must be in S3 or retained by the slot.
-- `mise run load` builds the release and `--no-default-features` binaries and runs the load scenarios into `target/load`; `LOAD_SCENARIO=ceiling|sns|overhead|memory|outage|brownout|handover` runs one. `cargo run -p pg-cdc-loadgen -- report --report-dir target/load --out summary.md` writes the summary table. Results are in [docs/load.md](load.md).
+- `mise run load` builds the release and `--no-default-features` binaries and runs the load scenarios into `target/load`; `LOAD_SCENARIO=ceiling|sns|overhead|overhead-instructions|memory|outage|brownout|handover` runs one. `cargo run -p pg-cdc-loadgen -- report --report-dir target/load --out summary.md` writes the summary table. Results are in [docs/load.md](load.md).
 - `cargo run -p pg-cdc-loadgen -- write --database <db> --user <user> --slot <slot> --rate 1000 --duration 60s` writes the chaos workload (upserts into `loadgen_items` from one connection) against any Postgres, with the password from `PGPASSWORD`; given `--slot`, it first creates the table with FULL identity, the `loadgen` publication and each slot.
 
 ## CI

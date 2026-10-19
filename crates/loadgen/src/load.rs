@@ -6,6 +6,7 @@ use serde::Serialize;
 
 mod ceiling;
 mod handover;
+mod instructions;
 mod memory;
 mod outage;
 mod overhead;
@@ -17,6 +18,7 @@ pub enum Scenario {
     Ceiling,
     Sns,
     Overhead,
+    OverheadInstructions,
     Memory,
     Outage,
     Brownout,
@@ -34,10 +36,11 @@ pub struct LoadOptions {
     pub drain_limit: std::time::Duration,
 }
 
-const EVERY_SCENARIO: [Scenario; 7] = [
+const EVERY_SCENARIO: [Scenario; 8] = [
     Scenario::Ceiling,
     Scenario::Sns,
     Scenario::Overhead,
+    Scenario::OverheadInstructions,
     Scenario::Memory,
     Scenario::Outage,
     Scenario::Brownout,
@@ -49,6 +52,7 @@ pub async fn run(scenario: Scenario, options: &LoadOptions) -> anyhow::Result<()
         Scenario::Ceiling => Box::pin(ceiling::run(options)).await,
         Scenario::Sns => Box::pin(sns::run(options)).await,
         Scenario::Overhead => Box::pin(overhead::run(options)).await,
+        Scenario::OverheadInstructions => Box::pin(instructions::run(options)).await,
         Scenario::Memory => Box::pin(memory::run(options)).await,
         Scenario::Outage => Box::pin(outage::run_outage(options)).await,
         Scenario::Brownout => Box::pin(outage::run_brownout(options)).await,
@@ -88,6 +92,8 @@ pub enum Verdict {
     Fail,
     #[serde(rename = "unverified (emulator-bound)")]
     Unverified,
+    #[serde(rename = "not resolved")]
+    NotResolved,
 }
 
 pub const CRITERION_FOUR_RATE: f64 = 5_000.0;
@@ -153,6 +159,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Verdict::Unverified).unwrap(),
             "\"unverified (emulator-bound)\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Verdict::NotResolved).unwrap(),
+            "\"not resolved\""
         );
     }
 }
