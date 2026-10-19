@@ -7,11 +7,13 @@ use async_trait::async_trait;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_sns::Client;
-use aws_sdk_sns::error::DisplayErrorContext;
+use aws_sdk_sns::config::http::HttpResponse;
+use aws_sdk_sns::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_sns::operation::publish_batch::PublishBatchError;
 use aws_sdk_sns::types::{MessageAttributeValue, PublishBatchRequestEntry};
 
-use crate::aws::aws_loader;
+use crate::aws::{aws_loader, throttle_reason};
+use crate::metrics::{self, Measurement, ThrottleReason};
 
 use super::{AttributeValue, Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 
@@ -47,6 +49,7 @@ struct BatchResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PublishFailure {
     TooLong(String),
+    Throttled(ThrottleReason, String),
     Request(String),
 }
 
@@ -224,6 +227,9 @@ fn results(
                 let Some(position) = index(&failure.id) else {
                     continue;
                 };
+                if let Some(reason) = throttle_reason(Some(&failure.code), None) {
+                    record_throttled(reason, 1);
+                }
                 let error = SinkError(format!("{}: {}", failure.code, failure.message));
                 let outcome = if failure.sender_fault {
                     Outcome::Terminal(error)
@@ -235,9 +241,34 @@ fn results(
             outcomes
         }
         Err(PublishFailure::TooLong(message)) => every_entry(Outcome::Terminal(SinkError(message))),
+        Err(PublishFailure::Throttled(reason, message)) => {
+            record_throttled(reason, u64::try_from(entries.len()).unwrap_or(u64::MAX));
+            every_entry(Outcome::Retryable(SinkError(message)))
+        }
         Err(PublishFailure::Request(message)) => {
             every_entry(Outcome::Retryable(SinkError(message)))
         }
+    }
+}
+
+fn record_throttled(reason: ThrottleReason, count: u64) {
+    metrics::record(Measurement::SinkThrottled { reason, count });
+}
+
+fn publish_failure(error: &SdkError<PublishBatchError, HttpResponse>) -> PublishFailure {
+    let message = DisplayErrorContext(error).to_string();
+    if matches!(
+        error.as_service_error(),
+        Some(PublishBatchError::BatchRequestTooLongException(_))
+    ) {
+        return PublishFailure::TooLong(message);
+    }
+    let status = error
+        .raw_response()
+        .map(|response| response.status().as_u16());
+    match throttle_reason(error.code(), status) {
+        Some(reason) => PublishFailure::Throttled(reason, message),
+        None => PublishFailure::Request(message),
     }
 }
 
@@ -360,18 +391,7 @@ impl SnsApi for AwsSns {
                     })
                     .collect(),
             }),
-            Err(error) => {
-                let too_long = matches!(
-                    error.as_service_error(),
-                    Some(PublishBatchError::BatchRequestTooLongException(_))
-                );
-                let message = DisplayErrorContext(&error).to_string();
-                Err(if too_long {
-                    PublishFailure::TooLong(message)
-                } else {
-                    PublishFailure::Request(message)
-                })
-            }
+            Err(error) => Err(publish_failure(&error)),
         }
     }
 }
@@ -399,7 +419,9 @@ fn sdk_entry(entry: &Entry) -> Result<PublishBatchRequestEntry, PublishFailure> 
 mod tests {
     use super::*;
     use crate::event::{EventId, Op, sample_envelope};
+    use crate::metrics::{Measurement, Recorder};
     use crate::order::OrderKeyId;
+    use aws_sdk_sns::error::ErrorMetadata;
     use bytes::Bytes;
     use pg_cdc_decoder::Lsn;
     use serde_json::json;
@@ -711,12 +733,137 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(Err(PublishFailure::Request(
-                "Throttling: slow down".to_owned(),
+                "InternalError: try again".to_owned(),
             )));
         let (sink, _) = preflighted(fake, None).await;
         let outcomes = sink.send(&[outbound(0, "a"), outbound(1, "b")]).await;
-        let retry = Outcome::Retryable(SinkError("Throttling: slow down".to_owned()));
+        let retry = Outcome::Retryable(SinkError("InternalError: try again".to_owned()));
         assert_eq!(outcomes, vec![retry.clone(), retry]);
+    }
+
+    #[derive(Debug)]
+    struct Throttles(Arc<Mutex<Vec<(ThrottleReason, u64)>>>);
+
+    impl Recorder for Throttles {
+        fn record(&self, measurement: Measurement<'_>) {
+            if let Measurement::SinkThrottled { reason, count } = measurement {
+                self.0.lock().unwrap().push((reason, count));
+            }
+        }
+    }
+
+    fn recording_throttles() -> Arc<Mutex<Vec<(ThrottleReason, u64)>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        crate::metrics::install(Box::new(Throttles(Arc::clone(&seen)))).unwrap();
+        seen
+    }
+
+    fn sdk_error(code: &str, status: u16) -> SdkError<PublishBatchError, HttpResponse> {
+        let metadata = ErrorMetadata::builder()
+            .code(code)
+            .message("Rate exceeded")
+            .build();
+        SdkError::service_error(
+            PublishBatchError::generic(metadata),
+            HttpResponse::new(status.try_into().unwrap(), "".into()),
+        )
+    }
+
+    #[test]
+    fn throttling_responses_are_classified_by_their_error_code_and_status() {
+        let cases = [
+            ("Throttling", 400, Some(ThrottleReason::Throttling)),
+            ("KMSThrottling", 400, Some(ThrottleReason::KmsThrottling)),
+            (
+                "ServiceUnavailable",
+                503,
+                Some(ThrottleReason::ServiceUnavailable),
+            ),
+            ("InternalError", 500, None),
+            ("InvalidParameter", 400, None),
+        ];
+        for (code, status, reason) in cases {
+            match (publish_failure(&sdk_error(code, status)), reason) {
+                (PublishFailure::Throttled(found, message), Some(expected)) => {
+                    assert_eq!(found, expected, "{code}");
+                    assert!(message.contains(code), "{message}");
+                }
+                (PublishFailure::Request(message), None) => {
+                    assert!(message.contains(code), "{message}");
+                }
+                (failure, _) => panic!("{code}: {failure:?}"),
+            }
+        }
+        let too_long = SdkError::service_error(
+            PublishBatchError::BatchRequestTooLongException(
+                aws_sdk_sns::types::error::BatchRequestTooLongException::builder().build(),
+            ),
+            HttpResponse::new(400.try_into().unwrap(), "".into()),
+        );
+        assert!(matches!(
+            publish_failure(&too_long),
+            PublishFailure::TooLong(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_throttled_request_is_retryable_and_counts_every_entry_as_throttled() {
+        let seen = recording_throttles();
+        let fake = FakeSns {
+            attributes: Some(topic(&[])),
+            ..FakeSns::default()
+        };
+        fake.responses
+            .lock()
+            .unwrap()
+            .push_back(Err(PublishFailure::Throttled(
+                ThrottleReason::Throttling,
+                "Throttling: Rate exceeded".to_owned(),
+            )));
+        let (sink, _) = preflighted(fake, None).await;
+        let outcomes = sink.send(&[outbound(0, "a"), outbound(1, "b")]).await;
+        let retry = Outcome::Retryable(SinkError("Throttling: Rate exceeded".to_owned()));
+        assert_eq!(outcomes, vec![retry.clone(), retry]);
+        assert_eq!(*seen.lock().unwrap(), vec![(ThrottleReason::Throttling, 2)]);
+    }
+
+    #[tokio::test]
+    async fn entries_failed_for_throttling_count_as_throttled_and_others_do_not() {
+        let seen = recording_throttles();
+        let fake = FakeSns {
+            attributes: Some(topic(&[])),
+            ..FakeSns::default()
+        };
+        let throttled = |id: &str, code: &str| EntryFailure {
+            id: id.to_owned(),
+            code: code.to_owned(),
+            message: "slow down".to_owned(),
+            sender_fault: false,
+        };
+        fake.responses.lock().unwrap().push_back(Ok(BatchResult {
+            successful: vec!["0".to_owned()],
+            failed: vec![
+                throttled("1", "KMSThrottling"),
+                throttled("2", "Throttled"),
+                failure("3", false),
+            ],
+        }));
+        let (sink, _) = preflighted(fake, None).await;
+        let batch: Vec<Outbound> = (0..4).map(|ordinal| outbound(ordinal, "acme")).collect();
+        let outcomes = sink.send(&batch).await;
+        assert!(
+            outcomes[1..]
+                .iter()
+                .all(|outcome| matches!(outcome, Outcome::Retryable(_))),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (ThrottleReason::KmsThrottling, 1),
+                (ThrottleReason::Throttling, 1)
+            ]
+        );
     }
 
     #[tokio::test]
