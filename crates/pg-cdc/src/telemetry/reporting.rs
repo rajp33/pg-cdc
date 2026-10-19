@@ -102,12 +102,15 @@ mod client {
     use std::time::Duration;
 
     use secrecy::ExposeSecret as _;
-    use sentry::integrations::tracing::EventFilter;
+    use std::fmt;
+
+    use sentry::integrations::tracing::EventMapping;
     use sentry::protocol::{Breadcrumb, Context, Event, Map, Value};
     use sentry::transports::UreqHttpTransportOptions;
     use sentry::types::Dsn;
     use sentry::{ClientOptions, TransportFactory, TransportOptions};
     use tracing::Level;
+    use tracing::field::{Field, Visit};
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::Layer as _;
     use ureq::tls::{TlsConfig, TlsProvider};
@@ -147,6 +150,30 @@ mod client {
         "envelope",
         "tuple",
     ];
+    const OUR_TARGET: &str = "pg_cdc";
+    const MESSAGE_FIELD: &str = "message";
+    const FOREIGN_ERROR: &str = "a dependency logged an error";
+    const FOREIGN_WARNING: &str = "a dependency logged a warning";
+    const MAX_LABEL_BYTES: usize = 64;
+    const NUMBER_FIELDS: [&str; 16] = [
+        "lane",
+        "partition",
+        "attempts",
+        "delay_ms",
+        "epoch",
+        "own_pid",
+        "since_last_ok_ms",
+        "type_oid",
+        "sent",
+        "outcomes",
+        "entries",
+        "count",
+        "dead",
+        "fifo",
+        "max_message_bytes",
+        "limit_from_topic",
+    ];
+    const LABEL_FIELDS: [&str; 4] = ["id", "operation", "kind", "sink"];
     const SENSITIVE_SUFFIXES: [&str; 4] = ["password", "passwd", "secret", "token"];
     const SENSITIVE_PAIRS: [&str; 4] = ["api_key", "access_key", "private_key", "session_key"];
 
@@ -162,11 +189,7 @@ mod client {
         options.transport = transport.or_else(|| bounded_transport(&options));
         let guard = sentry::init(options);
         let layer = sentry::integrations::tracing::layer()
-            .event_filter(|metadata| match *metadata.level() {
-                Level::ERROR => EventFilter::Event,
-                Level::WARN => EventFilter::Breadcrumb,
-                _ => EventFilter::Ignore,
-            })
+            .event_mapper(|event, _| allowlisted(event))
             .span_filter(|_| false)
             .with_filter(LevelFilter::WARN);
         Ok((
@@ -175,6 +198,107 @@ mod client {
                 layers: vec![Box::new(layer)],
             }),
         ))
+    }
+
+    #[derive(Default)]
+    struct Allowed {
+        message: Option<String>,
+        fields: Map<String, Value>,
+    }
+
+    fn label_shaped(text: &str) -> bool {
+        (1..=MAX_LABEL_BYTES).contains(&text.len())
+            && text.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+    }
+
+    impl Allowed {
+        fn label(&mut self, field: &Field, text: String) {
+            if LABEL_FIELDS.contains(&field.name()) && label_shaped(&text) {
+                self.fields
+                    .insert(field.name().to_owned(), Value::String(text));
+            }
+        }
+
+        fn number(&mut self, field: &Field, value: Value) {
+            if NUMBER_FIELDS.contains(&field.name()) {
+                self.fields.insert(field.name().to_owned(), value);
+            }
+        }
+    }
+
+    impl Visit for Allowed {
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.number(field, Value::from(value));
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.number(field, Value::from(value));
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.number(field, Value::from(value));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == MESSAGE_FIELD {
+                self.message = Some(value.to_owned());
+            } else {
+                self.label(field, value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            if field.name() == MESSAGE_FIELD {
+                self.message = Some(format!("{value:?}"));
+            } else if LABEL_FIELDS.contains(&field.name()) {
+                self.label(field, format!("{value:?}"));
+            }
+        }
+    }
+
+    fn allowlisted(event: &tracing::Event<'_>) -> EventMapping {
+        let metadata = event.metadata();
+        let ours = metadata.target().starts_with(OUR_TARGET);
+        let mut allowed = Allowed::default();
+        if ours {
+            event.record(&mut allowed);
+        }
+        let message = |foreign: &str| {
+            if ours {
+                allowed.message.as_deref().map(scrub_text)
+            } else {
+                Some(foreign.to_owned())
+            }
+        };
+        match *metadata.level() {
+            Level::ERROR => {
+                let mut location = Map::new();
+                location.insert("module_path".to_owned(), metadata.module_path().into());
+                location.insert("file".to_owned(), metadata.file().into());
+                location.insert("line".to_owned(), metadata.line().into());
+                let mut contexts = Map::new();
+                contexts.insert("location".to_owned(), Context::Other(location));
+                EventMapping::Event(Box::new(Event {
+                    level: sentry::Level::Error,
+                    logger: Some(metadata.target().to_owned()),
+                    message: message(FOREIGN_ERROR),
+                    extra: allowed.fields.clone(),
+                    contexts,
+                    ..Event::default()
+                }))
+            }
+            Level::WARN => EventMapping::Breadcrumb(Breadcrumb {
+                ty: "log".to_owned(),
+                category: Some(metadata.target().to_owned()),
+                level: sentry::Level::Warning,
+                message: message(FOREIGN_WARNING),
+                data: allowed.fields.clone(),
+                ..Breadcrumb::default()
+            }),
+            _ => EventMapping::Ignore,
+        }
     }
 
     fn bounded_transport(options: &ClientOptions) -> Option<Arc<dyn TransportFactory>> {
@@ -431,7 +555,7 @@ mod tests {
     mod capturing {
         use std::sync::Arc;
 
-        use sentry::protocol::{Context, Event, Level};
+        use sentry::protocol::{Event, Level};
         use sentry::test::TestTransport;
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -484,6 +608,8 @@ mod tests {
             );
             assert_eq!(event.tags.get("holder").map(String::as_str), Some("task-1"));
             assert!(event.user.is_none());
+            assert_eq!(event.extra.get("lane"), Some(&serde_json::json!(3)));
+            assert_eq!(event.logger.as_deref(), Some("pg_cdc::session"));
         }
 
         #[test]
@@ -547,16 +673,76 @@ mod tests {
             ] {
                 assert!(!sent.contains(leaked), "{leaked} leaked: {sent}");
             }
-            assert!(sent.contains("ab000000000000000000000000000001"), "{sent}");
-            assert!(sent.contains("db.internal:5432/app"), "{sent}");
             assert_eq!(
                 events[0].message.as_deref(),
                 Some("pg-cdc stopped: cannot reach postgresql://[redacted]@db.internal/app")
             );
-            let Some(Context::Other(traced)) = events[0].contexts.get("Rust Tracing Fields") else {
-                panic!("no tracing fields: {sent}");
-            };
-            assert_eq!(traced["password"], "[redacted]");
+            assert!(!events[0].extra.contains_key("password"), "{sent}");
+            assert!(!sent.contains("ab000000000000000000000000000001"), "{sent}");
+        }
+
+        #[test]
+        fn provider_error_text_never_reaches_events_or_breadcrumbs() {
+            let events = captured(|| {
+                tracing::warn!(
+                    target: "pg_cdc::supervisor",
+                    error = "replication stream failed: db error: ERROR: unrecognized encoding: \"customer-row-value\"",
+                    delay_ms = 250_u64,
+                    "replication session ended; reconnecting"
+                );
+                tracing::error!(
+                    target: "pg_cdc::session",
+                    error = "connection failed: password='two words' password=\"double quoted\" password=abc,leftover",
+                    id = "000000001a2b3c4d-00000003",
+                    operation = "append_parked",
+                    "cannot take over the slot; releasing it"
+                );
+                tracing::error!(
+                    target: "tokio_postgres::connection",
+                    "db error: duplicate key value (secret-key-42) violates a constraint"
+                );
+            });
+            assert_eq!(events.len(), 2, "{events:?}");
+            let sent: String = events.iter().map(fields).collect();
+            for leaked in [
+                "customer-row-value",
+                "two words",
+                "double quoted",
+                "leftover",
+                "secret-key-42",
+                "unrecognized encoding",
+            ] {
+                assert!(!sent.contains(leaked), "{leaked} leaked: {sent}");
+            }
+            let ours = &events[0];
+            assert_eq!(
+                ours.message.as_deref(),
+                Some("cannot take over the slot; releasing it")
+            );
+            assert_eq!(
+                ours.extra.get("id"),
+                Some(&serde_json::json!("000000001a2b3c4d-00000003"))
+            );
+            assert_eq!(
+                ours.extra.get("operation"),
+                Some(&serde_json::json!("append_parked"))
+            );
+            assert!(!ours.extra.contains_key("error"), "{sent}");
+            let crumb = &ours.breadcrumbs.values[0];
+            assert_eq!(
+                crumb.message.as_deref(),
+                Some("replication session ended; reconnecting")
+            );
+            assert_eq!(crumb.data.keys().collect::<Vec<_>>(), vec!["delay_ms"]);
+            let foreign = &events[1];
+            assert_eq!(
+                foreign.logger.as_deref(),
+                Some("tokio_postgres::connection")
+            );
+            assert_eq!(
+                foreign.message.as_deref(),
+                Some("a dependency logged an error")
+            );
         }
 
         #[test]

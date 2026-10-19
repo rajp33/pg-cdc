@@ -157,7 +157,7 @@ pub async fn supervise<A: Attempt>(
 }
 
 pub async fn preflight(sink: &dyn Sink, shutdown: &CancellationToken) -> bool {
-    retry_until_ok("sink preflight failed; retrying", shutdown, || async {
+    retry_until_ok(StartupCheck::Sink, shutdown, || async {
         let checked = sink.preflight().await;
         if checked.is_err() {
             record_error(ErrorComponent::Sink, ErrorKind::Retryable);
@@ -177,14 +177,20 @@ fn record_error(component: ErrorComponent, kind: ErrorKind) {
 
 pub async fn store_ready(store: &Arc<dyn StateStore>, shutdown: &CancellationToken) -> bool {
     let store = InstrumentedStateStore::new(Arc::clone(store));
-    retry_until_ok("state store check failed; retrying", shutdown, || async {
+    retry_until_ok(StartupCheck::Store, shutdown, || async {
         store.read_leader().await.map(drop)
     })
     .await
 }
 
+#[derive(Debug, Clone, Copy)]
+enum StartupCheck {
+    Sink,
+    Store,
+}
+
 async fn retry_until_ok<F, Fut, E>(
-    failure: &'static str,
+    check: StartupCheck,
     shutdown: &CancellationToken,
     mut attempt: F,
 ) -> bool
@@ -204,7 +210,14 @@ where
         };
         let delay = backoff.next_delay();
         let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-        tracing::warn!(%error, delay_ms, "{failure}");
+        match check {
+            StartupCheck::Sink => {
+                tracing::warn!(%error, delay_ms, "sink preflight failed; retrying");
+            }
+            StartupCheck::Store => {
+                tracing::warn!(%error, delay_ms, "state store check failed; retrying");
+            }
+        }
         if !sleep_unless_cancelled(delay, shutdown).await {
             return false;
         }

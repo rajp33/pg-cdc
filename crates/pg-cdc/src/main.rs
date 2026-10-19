@@ -370,7 +370,7 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<PendingLog
         match run(config, Arc::clone(&signalled), board).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                tracing::error!("pg-cdc stopped: {error:#}");
+                tracing::error!(error = format!("{error:#}"), "pg-cdc stopped");
                 ExitCode::FAILURE
             }
         }
@@ -401,7 +401,7 @@ fn warn_when_telemetry_is_degraded(plan: &TelemetryPlan, telemetry: &Telemetry) 
     {
         tracing::warn!(
             %protocol,
-            "{OTLP_PROTOCOL_VARIABLE} is not grpc; only OTLP over gRPC is supported, so grpc is used"
+            "OTEL_EXPORTER_OTLP_PROTOCOL is not grpc; only OTLP over gRPC is supported, so grpc is used"
         );
     }
 }
