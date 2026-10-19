@@ -4,7 +4,7 @@
 |---|---|
 | Date | 2026-10-14 |
 | Status | Draft for review |
-| Repository | github.com/rajp33/pg-cdc (public) |
+| Repository | github.com/theia-vision-inc/pg-cdc (public) |
 | License | MIT OR Apache-2.0 |
 
 ## 1. Summary
