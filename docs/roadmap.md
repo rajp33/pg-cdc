@@ -14,7 +14,7 @@ What pg-cdc does not do today, and what is planned or possible. The [design](sup
 - A Postgres state store, as an alternative to S3 and the filesystem.
 - More sinks: SQS, then Kafka, then webhooks; later Kinesis, NATS, Redis Streams and Google Pub/Sub. Today the only production sink is SNS.
 - Several pipelines per process, each with its own slot. Today one process serves one publication and one slot.
-- Release engineering: tagged releases and versioned images (only `main` and `sha-` image tags exist so far), release binaries, crates.io publishing and a docs site.
+- Release engineering: release binaries, crates.io publishing and a docs site. Tagged releases ship as signed, versioned container images.
 - Composite types as JSON objects. Today they are sent as their Postgres text form, which differs from `to_jsonb`.
 - Transaction annotations through `pg_logical_emit_message`, carrying actor and request context.
 - Static transforms: column exclusion and masking, and per-table routing. Today filtering is whatever the publication expresses (tables, row filters, column lists).
@@ -31,8 +31,8 @@ These follow from the design and have no planned change.
 - **A lane waits for its store calls.** Parking, head loading, removals and admin operations run inside the lane that owns the key, so while one waits on the state store the lane sends nothing, for its healthy keys too. Other lanes keep flowing.
 - **Parked keys cost memory** outside `max_inflight_bytes`, about 0.5 to 1 KB each, bounded by `delivery.max_parked_events` ([runbook](runbook.md#5-parked-and-dead-events)).
 - **A paused process** longer than `fence_delay` can cause duplicates and, rarely, one key's events out of order, never loss.
-- **A discarded event can come back** once if pg-cdc crashes before the event's transaction is confirmed.
-- **Primary keys are read from the current catalog,** not as of the WAL position, so a key change during traffic can mis-key a few events.
+- **A discarded event can come back.** Discard leaves no tombstone, so the event is replayed again after each crash until its transaction is confirmed.
+- **Primary keys are read from the current catalog,** not as of the WAL position, so after a key change, events decoded against the changed key definition can be mis-keyed.
 - **Change a publication only when caught up.** Changing its table list while transactions are unacknowledged can renumber the ordinals of replayed events.
 
 ## Not yet verified in production
