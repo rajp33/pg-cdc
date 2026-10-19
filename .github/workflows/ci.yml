@@ -16,7 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  IMAGE: ghcr.io/rajp33/pg-cdc
+  IMAGE: ghcr.io/theia-vision-inc/pg-cdc
 
 jobs:
   lint:

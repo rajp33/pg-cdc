@@ -52,12 +52,14 @@ With none free, the new task logs SQLSTATE 53300 (`number of requested standby c
 - **Verify the image.** Every published image is signed keylessly by the `ci` workflow. Before deploying a tag, resolve it to a digest, check the signature, and deploy by digest:
 
   ```sh
-  cosign verify ghcr.io/rajp33/pg-cdc@sha256:<digest> \
+  cosign verify ghcr.io/theia-vision-inc/pg-cdc@sha256:<digest> \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity-regexp '^https://github\.com/rajp33/pg-cdc/\.github/workflows/ci\.yml@refs/(heads/main|tags/v.+)$'
+    --certificate-identity-regexp '^https://github\.com/theia-vision-inc/pg-cdc/\.github/workflows/ci\.yml@refs/(heads/main|tags/v.+)$'
   ```
 
-  `docker buildx imagetools inspect ghcr.io/rajp33/pg-cdc@sha256:<digest> --format '{{json .SBOM}}'` (or `.Provenance`) shows the attached SBOM and build provenance.
+  `docker buildx imagetools inspect ghcr.io/theia-vision-inc/pg-cdc@sha256:<digest> --format '{{json .SBOM}}'` (or `.Provenance`) shows the attached SBOM and build provenance.
+
+  Images up to and including 0.1.0 were published as `ghcr.io/rajp33/pg-cdc`, before the repository moved to `theia-vision-inc`; verify those with `rajp33` in place of `theia-vision-inc` in both the image and the identity pattern.
 
 ## 3. Clean handover and crash takeover
 
@@ -279,14 +281,14 @@ Spans: `transaction` (`commit_lsn`, `xid`, `events`), `sink_send` (`sink`, `size
 
 ## 11. Container image
 
-`ghcr.io/rajp33/pg-cdc` is built for linux/amd64 and linux/arm64 on distroless (`gcr.io/distroless/cc-debian13:nonroot`) and runs as the `nonroot` user. Tags: `main` for the main branch, `sha-<short commit>`, and for release tags `<version>`, `<major>.<minor>` and, for a release tag `vX.Y.Z` without a pre-release suffix, `latest`. The `ci` workflow builds both architectures on every pull request without pushing, and publishes only after every CI job passes for that commit. Each published image carries an SBOM and build provenance and is signed with cosign (section 2 shows how to verify it).
+`ghcr.io/theia-vision-inc/pg-cdc` is built for linux/amd64 and linux/arm64 on distroless (`gcr.io/distroless/cc-debian13:nonroot`) and runs as the `nonroot` user. Tags: `main` for the main branch, `sha-<short commit>`, and for release tags `<version>`, `<major>.<minor>` and, for a release tag `vX.Y.Z` without a pre-release suffix, `latest`. The `ci` workflow builds both architectures on every pull request without pushing, and publishes only after every CI job passes for that commit. Each published image carries an SBOM and build provenance and is signed with cosign (section 2 shows how to verify it).
 
 The entrypoint is `/usr/local/bin/pg-cdc` and the default command is `run --config /etc/pg-cdc/config.yaml`. The image's `HEALTHCHECK` runs `pg-cdc health`; ECS ignores image health checks, so set the same command in the task definition (section 2).
 
 ```sh
 docker run --rm -v "$PWD/pg-cdc.yaml:/etc/pg-cdc/config.yaml:ro" \
   -e PGCDC__SOURCE__CREDENTIALS__PASSWORD -p 127.0.0.1:9187:9187 \
-  -e PGCDC__ADMIN__LISTEN=0.0.0.0:9187 ghcr.io/rajp33/pg-cdc:main
+  -e PGCDC__ADMIN__LISTEN=0.0.0.0:9187 ghcr.io/theia-vision-inc/pg-cdc:main
 ```
 
 Binding the admin endpoint to `0.0.0.0` inside a container exposes it to the container's network; publish its port only to trusted hosts, since it has no authentication.

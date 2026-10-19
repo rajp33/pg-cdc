@@ -65,7 +65,7 @@ Run the image (linux/amd64 and linux/arm64), or build the binary with `cargo bui
 docker run --rm -v "$PWD/pg-cdc.yaml:/etc/pg-cdc/config.yaml:ro" \
   -e PGCDC__SOURCE__CREDENTIALS__PASSWORD \
   -e AWS_REGION -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-  ghcr.io/rajp33/pg-cdc:0.1.0
+  ghcr.io/theia-vision-inc/pg-cdc:main
 ```
 
 To try it locally without AWS, run the binary with `sink: { type: stdout }` and `state_store: { type: filesystem, path: ./pg-cdc-state }`, and set `source.tls.mode: disable` for a Postgres without TLS.
