@@ -788,6 +788,10 @@ admin:
 telemetry:
   otlp_endpoint: http://localhost:4317
   trace_sample_ratio: 0.01
+  sentry:
+    dsn: https://<public key>@<org>.ingest.sentry.io/<project>
+    environment: production
+    sample_rate: 1.0
 ```
 
 With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDENTIALS__PASSWORD`. A filesystem store is configured as `state_store: { type: filesystem, path: /var/lib/pg-cdc }`.
@@ -810,6 +814,9 @@ With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDE
 | `admin.listen` | `127.0.0.1:9187` |
 | `telemetry.otlp_endpoint` | unset (telemetry disabled) |
 | `telemetry.trace_sample_ratio` | `0.01` |
+| `telemetry.sentry.dsn` | unset (error reporting disabled; `SENTRY_DSN` is the fallback) |
+| `telemetry.sentry.environment` | unset |
+| `telemetry.sentry.sample_rate` | `1.0` |
 
 Fixed internal values:
 
@@ -913,7 +920,14 @@ Suggested alerts:
 - sustained SNS or S3 throttling;
 - any terminal error.
 
-### 17.4 Logs
+### 17.4 Error reporting
+
+- **Switching it on.** Sentry reporting is enabled when `telemetry.sentry.dsn` or `SENTRY_DSN` is set, independently of OTLP. The `sentry` cargo feature (default on) gates the dependency: `sentry` with default features off and only backtrace, contexts, panic, tracing and the ureq transport over rustls with ring.
+- **What is sent.** ERROR events become Sentry events; WARN events become breadcrumbs; panics are captured. No spans or performance traces. Events carry release `pg-cdc@<version>`, the environment, `server_name` set to the holder id, and tags `pipeline` and `holder`. `sample_rate` samples error events.
+- **Privacy.** `send_default_pii` is off. A `before_send` and `before_breadcrumb` scrubber redacts fields named like credentials or row data, URL userinfo, and secret `key=value` pairs. pg-cdc never logs row values at WARN or ERROR.
+- **Shutdown.** The client is closed with at most 2 s to flush, bounded by what remains of the SIGTERM budget.
+
+### 17.5 Logs
 
 - **Logs.** `tracing` writes JSON logs with trace and span ids, and they export over OTLP when telemetry is enabled.
 - **Logs never block.** Lines go through a bounded buffer of 8,192 lines to their own writer thread; a line that does not fit is dropped. At exit the buffer is flushed for at most 1 s, and after SIGTERM only within what remains of the shutdown budget (`2 × drain_timeout + 3 s`).

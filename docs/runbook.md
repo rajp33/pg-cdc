@@ -216,6 +216,27 @@ The counters overlap on purpose, so do not add them up: a throttled SNS publish 
 
 Without telemetry, the same signals are in the logs and `/status`: `delivery failed; retrying` (warn, first failure per key), parking (`/status` `parked`), `lost the slot; fenced` (error), `took over the slot` with `kind`, validation errors, and `/healthz`. pg-cdc logs one `delivery failed; retrying` per key when a sink outage starts, so expect a burst of warnings with many keys.
 
+**Error reporting (Sentry).** Optional and off unless a DSN is set, in the config or the environment (`PGCDC__TELEMETRY__SENTRY__DSN`, or the standard `SENTRY_DSN` when the config sets none). It works with or without `telemetry.otlp_endpoint`.
+
+```yaml
+telemetry:
+  sentry:
+    dsn: https://<public key>@<org>.ingest.sentry.io/<project>
+    environment: production   # optional; Sentry's default otherwise
+    sample_rate: 1.0          # share of error events sent, 0 to 1; default 1.0
+```
+
+| Key | Default |
+|---|---|
+| `telemetry.sentry.dsn` | unset (reporting off); an `http://` or `https://` DSN |
+| `telemetry.sentry.environment` | unset |
+| `telemetry.sentry.sample_rate` | `1.0` |
+
+- **Sent:** every ERROR log line as an event (message, target, file and line, its fields), the WARN lines before it as breadcrumbs, and panics with their stack. Each event carries the release `pg-cdc@<version>`, the environment, the task's holder id as `server_name`, the tags `pipeline` and `holder`, and the OS and Rust runtime. INFO and DEBUG lines, spans and performance traces are never sent. Check the setup with a dead event or a failed startup: the error shows up within seconds.
+- **Never sent:** row data. pg-cdc logs no column values, event bodies or message attributes at WARN or ERROR, and `send_default_pii` is off. Before each event leaves, fields whose names look like credentials or row data (`password`, `token`, `secret`, `dsn`, `url`, `body`, `payload`, `row`, `before`, `after`, `value`, ...) are replaced with `[redacted]`, and in every message, field and breadcrumb the user and password of a URL (`postgres://user:pass@host`) and the values of `password=`, `token=`, `secret=` and signature pairs (an RDS IAM token's `X-Amz-Security-Token` and `X-Amz-Signature`) are redacted. Error text from SNS, S3 and Postgres is forwarded after that scrubbing.
+- **Shutdown:** queued events are flushed for at most 2 s at exit, and after SIGTERM only within what remains of the `2 x drain_timeout + 3 s` budget, so a 15 s `stopTimeout` still holds. A Sentry outage never blocks delivery: events go through a bounded queue on their own thread and are dropped when it is full.
+- **Builds:** the `sentry` cargo feature (default on, in the published image) compiles it in. A build with `--no-default-features` ignores the DSN and logs `error reporting is configured, but this build has no sentry feature`.
+
 ## 7. Pre-production checklist
 
 Run these once against real AWS before production. Nothing in CI runs them.
