@@ -121,6 +121,52 @@ async fn changed_under_full_identity_compares_old_and_new_text() -> TestResult {
 }
 
 #[tokio::test]
+async fn changed_follows_the_relation_across_added_and_dropped_columns() -> TestResult {
+    let pg = Postgres::start().await?;
+    support::prepare(
+        &pg,
+        &[
+            "CREATE TABLE docs (id int PRIMARY KEY, title text, body text)",
+            "ALTER TABLE docs REPLICA IDENTITY FULL",
+        ],
+        &["docs"],
+    )
+    .await?;
+    let mut session = support::spawn_session(support::params(&pg), FAST, BUFFER);
+    let steps = [
+        ("INSERT INTO docs VALUES (1, 'a', 'b')", None),
+        (
+            "ALTER TABLE docs ADD COLUMN note text, ADD COLUMN tag text DEFAULT 'x'",
+            None,
+        ),
+        ("UPDATE docs SET title = 'c'", Some(json!(["title"]))),
+        (
+            "UPDATE docs SET note = 'n', tag = 'y'",
+            Some(json!(["note", "tag"])),
+        ),
+        ("ALTER TABLE docs DROP COLUMN title", None),
+        ("UPDATE docs SET body = 'd'", Some(json!(["body"]))),
+        ("UPDATE docs SET tag = 'z'", Some(json!(["tag"]))),
+    ];
+    for (statement, _) in &steps {
+        pg.execute(statement).await?;
+    }
+    let mut last = Value::Null;
+    for (statement, changed) in steps {
+        if statement.starts_with("ALTER") {
+            continue;
+        }
+        last = session.next_event().await?;
+        assert_eq!(last.get("changed").cloned(), changed, "{statement}");
+    }
+    assert_eq!(
+        last["after"],
+        json!({"id": 1, "body": "d", "note": "n", "tag": "z"})
+    );
+    session.stop().await
+}
+
+#[tokio::test]
 async fn truncate_emits_one_event_per_relation() -> TestResult {
     let pg = Postgres::start().await?;
     support::prepare(
