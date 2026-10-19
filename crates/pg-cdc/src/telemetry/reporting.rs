@@ -100,7 +100,7 @@ impl Drop for ErrorReporting {
 #[cfg(feature = "sentry")]
 mod client {
     use std::borrow::Cow;
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use std::time::Duration;
 
     use secrecy::ExposeSecret as _;
@@ -236,12 +236,16 @@ mod client {
         wait.recv_timeout(within).unwrap_or(false)
     }
 
+    static PANIC_HOOK: OnceLock<()> = OnceLock::new();
+
     fn install_panic_hook() {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            sentry::capture_event(panic_event(info));
-            previous(info);
-        }));
+        PANIC_HOOK.get_or_init(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                sentry::capture_event(panic_event(info));
+                previous(info);
+            }));
+        });
     }
 
     fn panic_event(info: &std::panic::PanicHookInfo<'_>) -> Event<'static> {
@@ -849,6 +853,23 @@ mod tests {
                     "{sent}"
                 );
             }
+        }
+
+        #[test]
+        fn reinstalling_keeps_one_panic_hook_and_one_event_per_panic() {
+            let first = TestTransport::new();
+            let (first_reporting, _layers) =
+                client::install_with(&plan(), &identity(), Arc::new(Arc::clone(&first)));
+            let second = TestTransport::new();
+            let (second_reporting, _layers) =
+                client::install_with(&plan(), &identity(), Arc::new(Arc::clone(&second)));
+            std::thread::spawn(|| std::panic::catch_unwind(|| panic!("once")).is_err())
+                .join()
+                .unwrap();
+            assert_eq!(second.fetch_and_clear_events().len(), 1);
+            assert_eq!(first.fetch_and_clear_events().len(), 0);
+            assert!(second_reporting.shutdown(Duration::from_secs(1)));
+            assert!(first_reporting.shutdown(Duration::from_secs(1)));
         }
 
         #[test]
