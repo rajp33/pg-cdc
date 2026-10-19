@@ -58,6 +58,11 @@ pub async fn hold_lease(
             () = sleep_until(limit) => None,
             answer = probe.holder() => Some(answer),
         };
+        match &answer {
+            Some(Err(_)) => record_error(ErrorKind::Unavailable),
+            None => record_error(ErrorKind::Timeout),
+            Some(Ok(_)) => {}
+        }
         if Instant::now() >= deadline {
             break FenceReason::Expired;
         }
@@ -68,14 +73,8 @@ pub async fn hold_lease(
                 tracing::debug!(own_pid, "lease renewed");
             }
             Some(Ok(holder)) => break FenceReason::Lost(holder),
-            Some(Err(error)) => {
-                record_error(ErrorKind::Unavailable);
-                tracing::warn!(%error, "lease check failed");
-            }
-            None => {
-                record_error(ErrorKind::Timeout);
-                tracing::warn!("lease check timed out");
-            }
+            Some(Err(error)) => tracing::warn!(%error, "lease check failed"),
+            None => tracing::warn!("lease check timed out"),
         }
     };
     gate.fence();
@@ -282,6 +281,22 @@ mod tests {
             ]
         );
         lease.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_check_cut_off_by_the_expiry_still_counts_as_a_timeout() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        crate::metrics::install(Box::new(Errors(Arc::clone(&seen)))).unwrap();
+        let lease = start(secs(6), vec![(secs(0), Step::Hang)]);
+        let (reason, returned_at, gate_state) = lease.task.await.unwrap();
+        assert_eq!(reason, FenceReason::Expired);
+        assert_eq!(returned_at, secs(6));
+        assert_eq!(gate_state, GateState::Fenced);
+        assert_eq!(lease.probe.calls(), vec![secs(2), secs(4)]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(ErrorComponent::Leader, ErrorKind::Timeout); 2]
+        );
     }
 
     #[test]
