@@ -6,7 +6,7 @@ ENV RUSTUP_TOOLCHAIN=1.99.0
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/src/target,id=cachegrind-target-${TARGETARCH} \
+    --mount=type=cache,target=/src/target,id=cachegrind-target-${TARGETARCH},sharing=locked \
     cargo build --release --locked --package pg-cdc \
     && cargo build --release --locked --package pg-cdc --no-default-features --target-dir target/baseline \
     && cp target/release/pg-cdc /usr/local/bin/pg-cdc-default \

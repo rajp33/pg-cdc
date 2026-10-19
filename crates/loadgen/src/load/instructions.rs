@@ -442,12 +442,26 @@ async fn one_run(
     Ok((record, text))
 }
 
+async fn source_dirty() -> anyhow::Result<bool> {
+    let status = git(&[
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--",
+        ".",
+        ":(exclude).serena",
+        ":(exclude).superpowers",
+        ":(exclude)fuzz/corpus",
+        ":(exclude)fuzz/artifacts",
+    ])
+    .await?;
+    Ok(!status.is_empty())
+}
+
 pub(super) async fn run(options: &LoadOptions) -> anyhow::Result<()> {
     let image_id = build_image().await?;
     let source_commit = git(&["rev-parse", "HEAD"]).await?;
-    let source_dirty = !git(&["status", "--porcelain", "--untracked-files=no"])
-        .await?
-        .is_empty();
+    let source_dirty = source_dirty().await?;
     let valgrind = docker(&["run", "--rm", &image_id, "valgrind", "--version"]).await?;
     let container_kernel = docker(&["run", "--rm", &image_id, "uname", "-srm"]).await?;
     let per_round = round_order(0).len();
