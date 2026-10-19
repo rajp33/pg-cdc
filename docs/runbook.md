@@ -1,6 +1,6 @@
 # pg-cdc runbook
 
-How to set up, deploy, watch and repair a pg-cdc pipeline. The [README](../README.md) describes the configuration; [docs/load.md](load.md) has the measured numbers quoted here. Commands assume the pipeline `orders`, the slot and publication `pgcdc_orders`, and the role `pgcdc`.
+How to set up, deploy, watch and repair a pg-cdc pipeline. [docs/configuration.md](configuration.md) describes the configuration; [docs/load.md](load.md) has the measured numbers quoted here. Commands assume the pipeline `orders`, the slot and publication `pgcdc_orders`, and the role `pgcdc`.
 
 ## 1. Setup
 
@@ -141,7 +141,7 @@ The dead head is marked retrying and sent again; if the sink rejects it again it
 pg-cdc parked discard <order key id> --id <event id>
 ```
 
-Discard removes the head only if it is still that event (409 with the current head otherwise), so you never discard an event you have not inspected. The key's next event goes out next. A discarded event is gone from the sink's point of view, but if pg-cdc crashes before the event's transaction is confirmed, the replay can send it once more.
+Discard removes the head only if it is still that event (409 with the current head otherwise), so you never discard an event you have not inspected. The key's next event goes out next. A discarded event is gone from the sink's point of view, but if pg-cdc crashes before the event's transaction is confirmed, the replay sends it again, after every such crash, until the transaction is confirmed.
 
 **Answers:**
 
@@ -155,6 +155,12 @@ Discard removes the head only if it is still that event (409 with the current he
 **Oversize events.** With a `payload_store`, an event larger than the sink's limit is delivered as a pointer (`payload_ref`) to `s3://<bucket>/<prefix>/<pipeline>/payloads/<event id>.json`. Without one it parks dead; configure a payload store and redrive.
 
 **Limits.** At `delivery.max_parked_events` (default 10,000,000) or while the state store is down, pg-cdc stops parking; events stay in flight, the reader stops at `max_inflight_bytes`, and Postgres retains WAL. Near the limit, a key parks only its oldest events that fit and keeps the rest in flight until room frees. After a start or takeover nothing parks until every partition's parked queues have been counted; a state store that keeps failing that count (`cannot load parked queue heads; retrying`) keeps parking off.
+
+**Startup and takeover.** Reading starts at once; delivery for an order key waits until the parked queue heads of its partition (the first byte of the order key id, 256 partitions) have loaded. Replayed events below a queue's head are skipped. Store calls, including the listing during head loading, are bounded by `state_store.max_concurrency`.
+
+**The parked count is approximate.** It is loaded from the store at startup and can over-count replayed events until the next restart, so `max_parked_events` errs towards stalling early. During a large parking backlog it also trails the store.
+
+**Memory bound.** Memory is bounded by `delivery.max_inflight_bytes`, measured on encoded event bodies, plus one event above the bound, up to 65 raw replication messages read ahead of the bound (so the read-ahead depends on the widest row, not the transaction size), one sink batch of parked events per lane loaded for redelivery (`delivery.lanes` x 10 for SNS, x 1,024 for stdout and discard), and the parked order keys below. Measurements are in [docs/load.md](load.md#memory-criterion-6).
 
 **Memory per parked key.** Every order key with a parked queue holds about 0.5 to 1 KB of lane memory while it is parked, outside `max_inflight_bytes`, and a task that takes over loads every parked queue's head before it delivers. `max_parked_events` is the only bound on it (each parked key holds at least one event): budget `max_parked_events` x 1 KB on top of `max_inflight_bytes`, about 10 GB at the default 10,000,000 if every parked event is on its own key, or lower `max_parked_events` to fit the task. A task that runs out of memory after a long outage over many keys crash-loops, and so does its successor, since it loads the same keys; nothing is lost while the slot holds the WAL. Raise the task's memory to recover.
 
@@ -203,3 +209,84 @@ Run these once against real AWS before production. Nothing in CI runs them.
 3. **Topic limits.** Check the `SNS topic ready` log line: `max_message_bytes` and `limit_from_topic` show the limit read from `MaximumMessageSize`. For a topic configured above 256 KiB (up to 1 MiB), publish a batch whose total exceeds 256 KiB and confirm SNS accepts it; that `PublishBatch` limit is unverified.
 4. **Aurora failover.** In staging, fail the writer over while pg-cdc streams. Record whether the slot survives: if it does, pg-cdc reconnects through the cluster endpoint and resumes; if not, follow section 4 and keep that procedure ready for production.
 5. **Deploy.** Run one ECS deploy under load and check the handover in the logs (`released the leader record`, then `took over the slot` with `kind` `clean`).
+
+## 8. Shutdown, health and startup validation
+
+**Standby.** A task that finds the slot held logs `waiting as standby`. It holds one control connection, polls `pg_replication_slots` every 2 s and takes the slot when it frees; if another standby wins the race, it keeps polling. A standby never writes to the sink or the state store.
+
+**Shutdown on SIGTERM.** The active task stops reading, gives in-flight events `leadership.drain_timeout` (default 5 s) to deliver, parks whatever remains within at most another `drain_timeout`, stops its lanes, sends a final status update, marks the leader record `released` with the confirmed LSN, closes the replication connection and exits 0. The whole sequence takes at most `2 x drain_timeout + 3 s`, 13 s at the defaults. Events that could neither deliver nor park replay on the next start. A clean handover leaves the successor a gap of the old task's shutdown plus one standby poll. If the task was fenced, abandoned a write, could not stop its lanes within the 3 s tail or could not send the final status update, the record stays `active` and the successor waits `fence_delay` (section 3 lists the log lines).
+
+**Health endpoints.**
+
+- `GET /healthz` is 200 when the sink preflight, the state store check and startup validation have passed and, for an active task, the lease is valid; otherwise 503. A standby is healthy.
+- `GET /readyz` is 200 only when the task is healthy, active and delivering, so a standby answers 503.
+- `pg-cdc health [--addr <ip:port>]` exits 0 only when `/healthz` answers 200 within 2 s, and exits 1 with one line on stderr otherwise. It takes its address from `--addr`, else `PGCDC__ADMIN__LISTEN`, else `127.0.0.1:9187`. Use it as the container health check, since the distroless image has no curl.
+
+**Startup validation.** Before a task goes standby or active, it checks `wal_level`, the slot (exists, `pgoutput`, this database, not `lost`) and the publication, then opens and closes a replication connection without starting replication, so a role that cannot authenticate for replication or lacks `REPLICATION` (`rds_replication` on RDS) fails here instead of after the old task stops. A failure keeps the task unhealthy and retrying; it never exits and never creates or drops anything. In a start-first deploy, a misconfigured new task never turns healthy and the old task keeps running. The check needs a spare WAL sender (section 1).
+
+**Paused processes.** A process paused for longer than `fence_delay` (a frozen VM, a stopped container) can land writes that were already in flight when it resumes, and a request S3 already received can be applied after `fence_delay` even without a pause. The result is duplicate deliveries and, rarely, one key's events out of order, never loss; consumers should dedupe on the event `id`.
+
+## 9. Admin API reference
+
+The admin endpoint (`admin.listen`, default `127.0.0.1:9187`) serves health, status and the parked queues. It has no authentication, and parked events hold row data: keep it on loopback or a private network.
+
+| Endpoint | Answer |
+|---|---|
+| `GET /healthz`, `GET /readyz` | `200 ok` / `200 ready`, or 503 (section 8) |
+| `GET /status` | `{"pipeline", "slot", "holder", "role", "healthy", "ready", "epoch", "confirmed_lsn", "inflight": {"events", "bytes"}, "parked": {"events", "keys", "dead", "oldest_age_seconds"}, "status_update_age_seconds", "slot_retained_bytes", "tables_without_full_identity"}`; `role` is `standby`, `active` or `draining` |
+| `GET /parked?status=dead\|retrying&limit=N&after=<order key id>` | `{"queues": [{"order_key", "head", "status", "length", "length_capped", "attempts", "first_failure_ms", "last_error", "last_error_cut"}], "next"}`; a listing reads at most 8 KiB of each head, never its envelope, and cuts a longer last error (`last_error_cut`) |
+| `GET /parked/{order key id}?after=<event id>&limit=N` | `{"order_key", "events": [{"id", "status", "attempts", "first_failure_ms", "last_error", "attributes", "envelope"}], "next"}`; an event stored larger than 8 MiB appears as `{"id", "bytes", "withheld": true}` |
+| `POST /parked/{order key id}/redrive` | `{"order_key", "id", "status": "retrying"}`: the dead head is retried, and dies again if the sink still rejects it |
+| `POST /parked/{order key id}/discard?id=<event id>` | `{"order_key", "discarded"}`: removes the head only if it is still that event |
+
+- **Pages.** `limit` is 1 to 1,000 (default 100). Pass `next` back as `after` for the next page; `next` is `null` at the end. One listing examines at most 1,000 queues, so a `status=dead` filter over many retrying queues can return fewer than `limit` with a `next` to continue from. A queue page also stops at 8 MiB of stored events. At most two listings and queue pages are read at once and others wait their turn; each keeps its turn until its reply has been sent or its connection has closed (after at most 60 s).
+- **Lengths are capped.** `length` counts up to 1,000 events, and `length_capped` is `true` for a queue at least that long; `pgcdc.parked.events` and `/status` give the total. With the S3 state store each listing does work bounded by its page, whatever the backlog. The filesystem store has no ordered index: a listing reads every key directory under `parked/` and every file name in each queue it returns, and finding a head reads all of its queue's entries, so `--limit 1` over a queue of a million events still scans a million names.
+- **Only the active task answers.** A standby, a task waiting `fence_delay`, a draining task and a fenced task answer every parked endpoint with `409 {"error": "this task is not the active holder", "role", "holder", "leader_state", "epoch"}`, where the last three come from the leader record. Before the state store is ready the endpoints answer `503 {"error": "pg-cdc is starting"}`. An operation runs inside the lane that owns the key, at most 4 between deliveries; one that takes longer than 30 s answers `504`, and is skipped if the lane has not started it by then. Each lane queues at most 16 redrive and discard requests; past that the endpoints answer `503` with `Retry-After: 1`.
+- **Ids.** An order key id is 32 hex digits; an event id is `<commit LSN as 16 hex digits>-<ordinal as 8 hex digits>`, for example `000000001a2b3c4d-00000003`.
+
+`pg-cdc parked list | show | redrive | discard` is a client for these endpoints (section 5 has the procedure). It takes `--addr` like `pg-cdc health`, prints a successful reply as JSON on stdout and exits 0, prints `pg-cdc: <code> <reason>: <error>` on stderr and exits 1 otherwise (adding `(active holder: <holder>)` to a 409), and exits 2 on a malformed id before sending anything. It waits up to 40 s.
+
+```sh
+pg-cdc parked list --status dead
+pg-cdc parked list --limit 50 --after 6b1f0c2d9e8a7b6c5d4e3f2a1b0c9d8e
+pg-cdc parked show 6b1f0c2d9e8a7b6c5d4e3f2a1b0c9d8e --limit 10
+pg-cdc parked redrive 6b1f0c2d9e8a7b6c5d4e3f2a1b0c9d8e
+pg-cdc parked discard 6b1f0c2d9e8a7b6c5d4e3f2a1b0c9d8e --id 000000001a2b3c4d-00000003
+```
+
+## 10. Telemetry reference
+
+Telemetry is configured under `telemetry` ([docs/configuration.md](configuration.md#telemetry)). Metrics use the meter `pg-cdc`; durations are histograms in seconds with buckets from 1 ms to 60 s.
+
+| Metric | Kind | Attributes |
+|---|---|---|
+| `pgcdc.events` | counter | `table`, `op`, `outcome` (`received`, `delivered`, `parked`, `dead`) |
+| `pgcdc.commit_to_delivery` | histogram (s) | (live deliveries only, from the transaction's commit time) |
+| `pgcdc.sink.duration` | histogram (s) | `outcome` (`delivered`, `retryable`, `terminal`) |
+| `pgcdc.store.duration` | histogram (s) | `operation` |
+| `pgcdc.takeovers` | counter | `kind` (`clean`, `unclean`; a first takeover counts as `clean`) |
+| `pgcdc.decode.fallbacks` | counter | `type` |
+| `pgcdc.parked.events`, `pgcdc.parked.keys`, `pgcdc.parked.dead` | gauge | |
+| `pgcdc.parked.oldest_age` | gauge (s) | |
+| `pgcdc.inflight.events`, `pgcdc.inflight.bytes` | gauge | |
+| `pgcdc.slot.retained_bytes` | gauge | (polled every 10 s, standbys included) |
+| `pgcdc.status_update.age` | gauge (s) | |
+| `pgcdc.role` | gauge | 0 standby, 1 active, 2 draining |
+| `pgcdc.leader.epoch` | gauge | |
+| `pgcdc.tables_without_full_identity` | gauge | |
+
+Spans: `transaction` (`commit_lsn`, `xid`, `events`), `sink_send` (`sink`, `size`, `delivered`, `retryable`, `terminal`), `store` (`operation`, `count`), `park` and `drain` (`events`) and `status_update` (`lsn`) at debug; `takeover` (`holder`, `kind`, `epoch`) and `role_change` (`from`, `to`) at info. Only pg-cdc's own spans at debug and above are exported, sampled by `trace_sample_ratio`. Logs at info and above are exported too, and while telemetry is enabled a JSON log line written inside a sampled span gains `"trace_id"` (32 hex digits) and `"span_id"` (16 hex digits).
+
+## 11. Container image
+
+`ghcr.io/rajp33/pg-cdc` is built for linux/amd64 and linux/arm64 on distroless (`gcr.io/distroless/cc-debian13:nonroot`) and runs as the `nonroot` user. Tags: `main` for the main branch, `sha-<short commit>`, and for release tags `<version>`, `<major>.<minor>` and, for a release tag `vX.Y.Z` without a pre-release suffix, `latest`. The `ci` workflow builds both architectures on every pull request without pushing, and publishes only after every CI job passes for that commit. Each published image carries an SBOM and build provenance and is signed with cosign (section 2 shows how to verify it).
+
+The entrypoint is `/usr/local/bin/pg-cdc` and the default command is `run --config /etc/pg-cdc/config.yaml`. The image's `HEALTHCHECK` runs `pg-cdc health`; ECS ignores image health checks, so set the same command in the task definition (section 2).
+
+```sh
+docker run --rm -v "$PWD/pg-cdc.yaml:/etc/pg-cdc/config.yaml:ro" \
+  -e PGCDC__SOURCE__CREDENTIALS__PASSWORD -p 127.0.0.1:9187:9187 \
+  -e PGCDC__ADMIN__LISTEN=0.0.0.0:9187 ghcr.io/rajp33/pg-cdc:main
+```
+
+Binding the admin endpoint to `0.0.0.0` inside a container exposes it to the container's network; publish its port only to trusted hosts, since it has no authentication.
