@@ -25,6 +25,7 @@ fn outbound(ordinal: u32, tenant: &str) -> Result<Outbound, serde_json::Error> {
         before: None,
         after: row.as_object().cloned(),
         unchanged_toast: Vec::new(),
+        changed: None,
         source: Source {
             pipeline: "orders".to_owned(),
             commit_lsn: "0/1A2B3C4D".to_owned(),
