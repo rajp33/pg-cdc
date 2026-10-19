@@ -356,6 +356,12 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<PendingLog
         }
     };
     warn_when_telemetry_is_degraded(&plan, &telemetry);
+    if !config.unknown_keys.is_empty() {
+        tracing::warn!(
+            keys = %config.unknown_keys.join(", "),
+            "ignoring unknown configuration keys"
+        );
+    }
     if reporting_plan.is_some() && !reporting.is_enabled() {
         tracing::warn!("error reporting is configured, but this build has no sentry feature");
     }
