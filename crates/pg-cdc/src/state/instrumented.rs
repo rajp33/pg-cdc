@@ -11,7 +11,7 @@ use super::{
 };
 use crate::event::EventId;
 use crate::lane::Stores;
-use crate::metrics::{self, Measurement, StoreOperation};
+use crate::metrics::{self, ErrorComponent, ErrorKind, Measurement, StoreOperation};
 use crate::order::OrderKeyId;
 use crate::payload::{PayloadRef, PayloadStore};
 
@@ -58,7 +58,19 @@ pub fn instrumented(stores: &Stores) -> Stores {
     }
 }
 
-async fn timed<F: Future>(operation: StoreOperation, count: usize, call: F) -> F::Output {
+fn error_kind(error: &StoreError) -> ErrorKind {
+    match error {
+        StoreError::Unavailable(_) => ErrorKind::Unavailable,
+        StoreError::NotFound(_) => ErrorKind::NotFound,
+        StoreError::Conflict(_) => ErrorKind::Conflict,
+        StoreError::Malformed { .. } => ErrorKind::Malformed,
+    }
+}
+
+async fn timed<T, F>(operation: StoreOperation, count: usize, call: F) -> Result<T, StoreError>
+where
+    F: Future<Output = Result<T, StoreError>>,
+{
     let span = tracing::debug_span!(
         "store",
         operation = operation.as_str(),
@@ -72,6 +84,13 @@ async fn timed<F: Future>(operation: StoreOperation, count: usize, call: F) -> F
                 operation,
                 elapsed: started.elapsed(),
             });
+            if let Err(error) = &output {
+                metrics::record(Measurement::Error {
+                    component: ErrorComponent::Store,
+                    kind: error_kind(error),
+                    count: 1,
+                });
+            }
         }
         output
     }
@@ -206,7 +225,7 @@ impl PayloadStore for InstrumentedPayloadStore {
 mod tests {
     use super::*;
     use crate::event::EventId;
-    use crate::metrics::{Measurement, Recorder};
+    use crate::metrics::{ErrorComponent, ErrorKind, Measurement, Recorder};
     use crate::order::OrderKeyId;
     use crate::state::memory::MemoryStateStore;
     use crate::state::{LeaderRecord, LeaderState, ParkStatus, ParkedEvent};
@@ -225,9 +244,10 @@ mod tests {
                 .await
                 .unwrap();
             let uncarried = tokio::spawn(async { current_operation() }).await.unwrap();
-            (direct, carried, uncarried)
+            Ok::<_, StoreError>((direct, carried, uncarried))
         })
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             seen,
             (
@@ -240,6 +260,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outside, None);
+    }
+
+    #[derive(Debug)]
+    struct Errors(Arc<Mutex<Vec<(ErrorComponent, ErrorKind, u64)>>>);
+
+    impl Recorder for Errors {
+        fn record(&self, measurement: Measurement<'_>) {
+            if let Measurement::Error {
+                component,
+                kind,
+                count,
+            } = measurement
+            {
+                self.0.lock().unwrap().push((component, kind, count));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn each_failed_store_call_counts_one_store_error_of_its_kind() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        crate::metrics::install(Box::new(Errors(Arc::clone(&seen)))).unwrap();
+        let failures = [
+            (
+                StoreError::Unavailable("down".to_owned()),
+                ErrorKind::Unavailable,
+            ),
+            (StoreError::NotFound("k".to_owned()), ErrorKind::NotFound),
+            (StoreError::Conflict("k".to_owned()), ErrorKind::Conflict),
+            (
+                StoreError::Malformed {
+                    key: "k".to_owned(),
+                    reason: "bad".to_owned(),
+                },
+                ErrorKind::Malformed,
+            ),
+        ];
+        for (error, _) in &failures {
+            let failed = timed(StoreOperation::ReadParked, 1, async {
+                Err::<(), _>(error.clone())
+            })
+            .await;
+            assert_eq!(failed, Err(error.clone()));
+        }
+        timed(StoreOperation::ReadParked, 1, async {
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+        let expected: Vec<(ErrorComponent, ErrorKind, u64)> = failures
+            .iter()
+            .map(|(_, kind)| (ErrorComponent::Store, *kind, 1))
+            .collect();
+        assert_eq!(*seen.lock().unwrap(), expected);
     }
 
     #[derive(Debug)]

@@ -8,6 +8,7 @@ use crate::health::Health;
 use crate::leader::POLL_INTERVAL;
 use crate::leader::gate::WriteGate;
 use crate::leader::standby::{SlotHolder, SlotProbe};
+use crate::metrics::{self, ErrorComponent, ErrorKind, Measurement};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceReason {
@@ -22,6 +23,14 @@ impl fmt::Display for FenceReason {
             Self::Lost(holder) => write!(f, "the slot is {holder}"),
         }
     }
+}
+
+fn record_error(kind: ErrorKind) {
+    metrics::record(Measurement::Error {
+        component: ErrorComponent::Leader,
+        kind,
+        count: 1,
+    });
 }
 
 pub async fn hold_lease(
@@ -59,8 +68,14 @@ pub async fn hold_lease(
                 tracing::debug!(own_pid, "lease renewed");
             }
             Some(Ok(holder)) => break FenceReason::Lost(holder),
-            Some(Err(error)) => tracing::warn!(%error, "lease check failed"),
-            None => tracing::warn!("lease check timed out"),
+            Some(Err(error)) => {
+                record_error(ErrorKind::Unavailable);
+                tracing::warn!(%error, "lease check failed");
+            }
+            None => {
+                record_error(ErrorKind::Timeout);
+                tracing::warn!("lease check timed out");
+            }
         }
     };
     gate.fence();
@@ -85,6 +100,7 @@ mod tests {
     use super::*;
     use crate::leader::gate::{Fenced, GateState};
     use crate::leader::standby::ProbeError;
+    use crate::metrics::{ErrorComponent, ErrorKind, Measurement, Recorder as MetricsRecorder};
 
     const OWN: u32 = 41;
 
@@ -229,6 +245,43 @@ mod tests {
             sleep(self.delay).await;
             self.log.lock().unwrap()[index].completed = Some(self.origin.elapsed());
         }
+    }
+
+    #[derive(Debug)]
+    struct Errors(Arc<Mutex<Vec<(ErrorComponent, ErrorKind)>>>);
+
+    impl MetricsRecorder for Errors {
+        fn record(&self, measurement: Measurement<'_>) {
+            if let Measurement::Error {
+                component, kind, ..
+            } = measurement
+            {
+                self.0.lock().unwrap().push((component, kind));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_and_timed_out_lease_checks_count_as_leader_errors() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        crate::metrics::install(Box::new(Errors(Arc::clone(&seen)))).unwrap();
+        let lease = start(
+            secs(30),
+            vec![
+                (secs(0), failing()),
+                (secs(3), Step::Hang),
+                (secs(5), held(OWN)),
+            ],
+        );
+        sleep(secs(9)).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (ErrorComponent::Leader, ErrorKind::Unavailable),
+                (ErrorComponent::Leader, ErrorKind::Timeout),
+            ]
+        );
+        lease.task.abort();
     }
 
     #[test]
