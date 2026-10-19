@@ -75,6 +75,86 @@ impl StoreOperation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrottleReason {
+    Throttling,
+    KmsThrottling,
+    ServiceUnavailable,
+}
+
+impl ThrottleReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Throttling => "throttling",
+            Self::KmsThrottling => "kms_throttling",
+            Self::ServiceUnavailable => "service_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorComponent {
+    Source,
+    Decoder,
+    Leader,
+    Delivery,
+    Sink,
+    Store,
+}
+
+impl ErrorComponent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Decoder => "decoder",
+            Self::Leader => "leader",
+            Self::Delivery => "delivery",
+            Self::Sink => "sink",
+            Self::Store => "store",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    Retryable,
+    Terminal,
+    Timeout,
+    Unavailable,
+    Conflict,
+    NotFound,
+    Malformed,
+}
+
+impl ErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::Terminal => "terminal",
+            Self::Timeout => "timeout",
+            Self::Unavailable => "unavailable",
+            Self::Conflict => "conflict",
+            Self::NotFound => "not_found",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminOperation {
+    Redrive,
+    Discard,
+}
+
+impl AdminOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Redrive => "redrive",
+            Self::Discard => "discard",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Measurement<'a> {
     Event {
@@ -95,6 +175,21 @@ pub enum Measurement<'a> {
     Takeover(TakeoverKind),
     DecodeFallback {
         type_oid: u32,
+    },
+    SinkThrottled {
+        reason: ThrottleReason,
+        count: u64,
+    },
+    StoreThrottled {
+        operation: StoreOperation,
+    },
+    Error {
+        component: ErrorComponent,
+        kind: ErrorKind,
+        count: u64,
+    },
+    AdminRejected {
+        operation: AdminOperation,
     },
 }
 
@@ -153,6 +248,21 @@ mod tests {
             },
             Measurement::Takeover(TakeoverKind::Unclean),
             Measurement::DecodeFallback { type_oid: 1700 },
+            Measurement::SinkThrottled {
+                reason: ThrottleReason::KmsThrottling,
+                count: 10,
+            },
+            Measurement::StoreThrottled {
+                operation: StoreOperation::AppendParked,
+            },
+            Measurement::Error {
+                component: ErrorComponent::Store,
+                kind: ErrorKind::Unavailable,
+                count: 1,
+            },
+            Measurement::AdminRejected {
+                operation: AdminOperation::Redrive,
+            },
         ]
     }
 
@@ -219,6 +329,44 @@ mod tests {
             (StoreOperation::PutPayload, "put_payload"),
         ];
         for (operation, label) in operations {
+            assert_eq!(operation.as_str(), label);
+        }
+        let reasons = [
+            (ThrottleReason::Throttling, "throttling"),
+            (ThrottleReason::KmsThrottling, "kms_throttling"),
+            (ThrottleReason::ServiceUnavailable, "service_unavailable"),
+        ];
+        for (reason, label) in reasons {
+            assert_eq!(reason.as_str(), label);
+        }
+        let components = [
+            (ErrorComponent::Source, "source"),
+            (ErrorComponent::Decoder, "decoder"),
+            (ErrorComponent::Leader, "leader"),
+            (ErrorComponent::Delivery, "delivery"),
+            (ErrorComponent::Sink, "sink"),
+            (ErrorComponent::Store, "store"),
+        ];
+        for (component, label) in components {
+            assert_eq!(component.as_str(), label);
+        }
+        let kinds = [
+            (ErrorKind::Retryable, "retryable"),
+            (ErrorKind::Terminal, "terminal"),
+            (ErrorKind::Timeout, "timeout"),
+            (ErrorKind::Unavailable, "unavailable"),
+            (ErrorKind::Conflict, "conflict"),
+            (ErrorKind::NotFound, "not_found"),
+            (ErrorKind::Malformed, "malformed"),
+        ];
+        for (kind, label) in kinds {
+            assert_eq!(kind.as_str(), label);
+        }
+        let admin = [
+            (AdminOperation::Redrive, "redrive"),
+            (AdminOperation::Discard, "discard"),
+        ];
+        for (operation, label) in admin {
             assert_eq!(operation.as_str(), label);
         }
     }

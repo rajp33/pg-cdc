@@ -275,7 +275,10 @@ mod tests {
     use super::*;
     use crate::health::Role;
     use crate::leader::record::TakeoverKind;
-    use crate::metrics::{self, EventOutcome, Measurement, SinkOutcome, StoreOperation};
+    use crate::metrics::{
+        self, AdminOperation, ErrorComponent, ErrorKind, EventOutcome, Measurement, SinkOutcome,
+        StoreOperation, ThrottleReason,
+    };
     use crate::state::now_ms;
     use crate::status::{LaneCounts, ParkedGauges};
 
@@ -605,6 +608,76 @@ mod tests {
                 assert_eq!(bounds, DURATION_BUCKETS);
                 assert_eq!(count, 1);
             }
+            assert!(telemetry.shutdown(FLUSH));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn throttle_error_and_rejection_counters_export_with_their_labels() {
+            let receiver = OtlpReceiver::start().await.unwrap();
+            let (telemetry, _layers) =
+                install(&receiver.endpoint(), &Status::new(), &Health::new());
+            metrics::record(Measurement::SinkThrottled {
+                reason: ThrottleReason::Throttling,
+                count: 10,
+            });
+            metrics::record(Measurement::SinkThrottled {
+                reason: ThrottleReason::KmsThrottling,
+                count: 1,
+            });
+            metrics::record(Measurement::StoreThrottled {
+                operation: StoreOperation::AppendParked,
+            });
+            metrics::record(Measurement::StoreThrottled {
+                operation: StoreOperation::AppendParked,
+            });
+            metrics::record(Measurement::Error {
+                component: ErrorComponent::Sink,
+                kind: ErrorKind::Retryable,
+                count: 10,
+            });
+            metrics::record(Measurement::Error {
+                component: ErrorComponent::Store,
+                kind: ErrorKind::Unavailable,
+                count: 1,
+            });
+            metrics::record(Measurement::AdminRejected {
+                operation: AdminOperation::Discard,
+            });
+            assert!(telemetry.flush(FLUSH));
+            let exports = receiver
+                .wait_for(SETTLE, |exports| {
+                    exports.sum("pgcdc.admin.rejected", &[]).is_some()
+                })
+                .await
+                .unwrap();
+            for (name, labels, value) in [
+                ("pgcdc.sink.throttled", vec![("reason", "throttling")], 10.0),
+                (
+                    "pgcdc.sink.throttled",
+                    vec![("reason", "kms_throttling")],
+                    1.0,
+                ),
+                (
+                    "pgcdc.store.throttled",
+                    vec![("operation", "append_parked")],
+                    2.0,
+                ),
+                (
+                    "pgcdc.errors",
+                    vec![("component", "sink"), ("kind", "retryable")],
+                    10.0,
+                ),
+                (
+                    "pgcdc.errors",
+                    vec![("component", "store"), ("kind", "unavailable")],
+                    1.0,
+                ),
+                ("pgcdc.admin.rejected", vec![("operation", "discard")], 1.0),
+            ] {
+                assert_eq!(exports.sum(name, &labels), Some(value), "{name} {labels:?}");
+            }
+            assert_eq!(exports.sum("pgcdc.sink.throttled", &[]), Some(11.0));
+            assert_eq!(exports.sum("pgcdc.errors", &[]), Some(11.0));
             assert!(telemetry.shutdown(FLUSH));
         }
 
