@@ -896,6 +896,12 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
 | `pgcdc.takeovers` | counter | `kind` (clean, unclean; a first takeover counts as clean) |
 | `pgcdc.decode.fallbacks` | counter | `type` |
 | `pgcdc.tables_without_full_identity` | gauge | |
+| `pgcdc.sink.throttled` | counter | `reason` (throttling, kms_throttling, service_unavailable); messages SNS refused for throttling |
+| `pgcdc.store.throttled` | counter | `operation`; S3 attempts answered 503 or 429, retried ones included |
+| `pgcdc.errors` | counter | `component` (source, decoder, leader, delivery, sink, store), `kind` (retryable, terminal, timeout, unavailable, conflict, not_found, malformed) |
+| `pgcdc.admin.rejected` | counter | `operation` (redrive, discard); refused because the lane's operation queue is full |
+
+Every attribute value comes from a fixed set. A throttle counts in its `*.throttled` counter and also in `pgcdc.errors` when the failure reaches pg-cdc (a throttled SNS publish is a retryable sink error; a throttled S3 attempt only when the S3 client's retries also fail).
 
 Suggested alerts:
 
@@ -903,7 +909,9 @@ Suggested alerts:
 - the oldest parked event older than 10 minutes;
 - slot retained bytes above a threshold;
 - status update age above 30 s;
-- no active task, or more than one.
+- no active task, or more than one;
+- sustained SNS or S3 throttling;
+- any terminal error.
 
 ### 17.4 Logs
 

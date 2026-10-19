@@ -190,6 +190,29 @@ The metrics need telemetry on (`telemetry.otlp_endpoint`). Starting thresholds:
 | No active task, or more than one | the number of `service.instance.id`s with `pgcdc.role == 1` over 1 minute is not 1 |
 | Reader falls behind | `pgcdc.slot.retained_bytes` rising for 10 minutes while the parked counts are flat, or the 99th percentile of `pgcdc.commit_to_delivery` above 60 s for 10 minutes |
 | Takeovers | any `pgcdc.takeovers{kind="unclean"}` |
+| SNS throttling | `rate(pgcdc.sink.throttled)` above 0 for 5 minutes; `reason="kms_throttling"` points at the topic's KMS key quota, `throttling` at the account's SNS publish quota |
+| S3 throttling | `rate(pgcdc.store.throttled)` above 0 for 5 minutes; lower `state_store.max_concurrency`, or expect `503 SlowDown` to fade as S3 scales the prefixes out |
+| Terminal errors | any `pgcdc.errors{kind="terminal"}` (an event parked dead, or the process stopping) |
+| Store failing | `rate(pgcdc.errors{component="store",kind="unavailable"})` above 0 for 5 minutes |
+| Admin refusals | any `pgcdc.admin.rejected`: a script is sending redrives or discards faster than the lane answers them |
+
+**Throttle and error counters.** Every label value comes from a fixed set; none is a table, key, error message or request id.
+
+| Metric | Attributes | Counts |
+|---|---|---|
+| `pgcdc.sink.throttled` | `reason`: `throttling`, `kms_throttling`, `service_unavailable` | messages SNS refused for throttling: a whole `PublishBatch` refused counts each of its messages, and an entry failed with a throttling code counts one. The SNS client does not retry, so every throttle is counted once |
+| `pgcdc.store.throttled` | `operation`: the `pgcdc.store.duration` operations | S3 attempts answered 503 or 429, including the attempts the S3 client retries by itself (up to 3 per call) |
+| `pgcdc.errors` | `component` and `kind`, below | failures pg-cdc acts on, after any client retries |
+| `pgcdc.admin.rejected` | `operation`: `redrive`, `discard` | requests answered 503 because the key's lane already had 16 waiting |
+
+| `component` | `kind` | Counted when |
+|---|---|---|
+| `sink` | `retryable`, `terminal` | per message the sink did not deliver; also each failed sink preflight (`retryable`) |
+| `store` | `unavailable`, `not_found`, `conflict`, `malformed` | per failed state or payload store call, admin reads included; `conflict` is often a benign race that pg-cdc reloads from |
+| `leader` | `unavailable`, `timeout` | per failed or timed out lease check |
+| `source`, `decoder`, `leader`, `delivery` | `retryable`, `timeout`, `malformed`, `terminal` | per ended replication session, by the part that failed; `terminal` when the error stops the process, including the third decode fault at one position |
+
+The counters overlap on purpose, so do not add them up: a throttled SNS publish counts in `pgcdc.sink.throttled` and, for the same messages, in `pgcdc.errors{component="sink",kind="retryable"}`. A throttled S3 attempt that a retry recovers counts only in `pgcdc.store.throttled`; one whose call still fails also counts once in `pgcdc.errors{component="store",kind="unavailable"}`.
 
 Without telemetry, the same signals are in the logs and `/status`: `delivery failed; retrying` (warn, first failure per key), parking (`/status` `parked`), `lost the slot; fenced` (error), `took over the slot` with `kind`, validation errors, and `/healthz`. pg-cdc logs one `delivery failed; retrying` per key when a sink outage starts, so expect a burst of warnings with many keys.
 
