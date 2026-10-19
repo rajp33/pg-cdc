@@ -179,7 +179,7 @@ Discard removes the head only if it is still that event (409 with the current he
 
 ## 6. Alerts
 
-The metrics need telemetry on (`telemetry.otlp_endpoint`). Starting thresholds:
+The metrics need telemetry on (`telemetry.otlp_endpoint`); section 10 lists them. Starting thresholds:
 
 | Alert | Metric and condition |
 |---|---|
@@ -196,52 +196,7 @@ The metrics need telemetry on (`telemetry.otlp_endpoint`). Starting thresholds:
 | Store failing | `rate(pgcdc.errors{component="store",kind="unavailable"})` above 0 for 5 minutes |
 | Admin refusals | any `pgcdc.admin.rejected`: a script is sending redrives or discards faster than the lane answers them |
 
-**Throttle and error counters.** Every label value comes from a fixed set; none is a table, key, error message or request id.
-
-| Metric | Attributes | Counts |
-|---|---|---|
-| `pgcdc.sink.throttled` | `reason`: `throttling`, `kms_throttling`, `service_unavailable` | messages SNS refused for throttling: a whole `PublishBatch` refused counts each of its messages, and an entry failed with a throttling code counts one. The SNS client does not retry, so every throttle is counted once |
-| `pgcdc.store.throttled` | `operation`: the `pgcdc.store.duration` operations | S3 attempts answered 503 or 429, including the attempts the S3 client retries by itself (up to 3 per call) |
-| `pgcdc.errors` | `component` and `kind`, below | failures pg-cdc acts on, after any client retries |
-| `pgcdc.admin.rejected` | `operation`: `redrive`, `discard` | requests answered 503 because the key's lane already had 16 waiting |
-
-| `component` | `kind` | Counted when |
-|---|---|---|
-| `sink` | `retryable`, `terminal` | per message the sink did not deliver, and per event pg-cdc parks dead itself because it is larger than the sink accepts (`terminal`); also each failed sink preflight (`retryable`) |
-| `store` | `unavailable`, `not_found`, `conflict`, `malformed` | per failed state or payload store call, admin reads included; `conflict` is often a benign race that pg-cdc reloads from |
-| `leader` | `unavailable`, `timeout` | per failed or timed out lease check, including the one cut off by the lease expiring |
-| `source`, `decoder`, `leader`, `delivery` | `retryable`, `timeout`, `malformed`, `terminal` | per ended replication session, by the part that failed; `terminal` when the error stops the process, including the third decode fault at one position |
-
-The counters overlap on purpose, so do not add them up: a throttled SNS publish counts in `pgcdc.sink.throttled` and, for the same messages, in `pgcdc.errors{component="sink",kind="retryable"}`. A throttled S3 attempt that a retry recovers counts only in `pgcdc.store.throttled`; one whose call still fails also counts once in `pgcdc.errors{component="store",kind="unavailable"}`.
-
 Without telemetry, the same signals are in the logs and `/status`: `delivery failed; retrying` (warn, first failure per key), parking (`/status` `parked`), `lost the slot; fenced` (error), `took over the slot` with `kind`, validation errors, and `/healthz`. pg-cdc logs one `delivery failed; retrying` per key when a sink outage starts, so expect a burst of warnings with many keys.
-
-**Error reporting (Sentry).** Optional and off unless a DSN is set, in the config or the environment (`PGCDC__TELEMETRY__SENTRY__DSN`, or the standard `SENTRY_DSN` when the config sets none). It works with or without `telemetry.otlp_endpoint`.
-
-```yaml
-telemetry:
-  sentry:
-    dsn: https://<public key>@<org>.ingest.sentry.io/<project>
-    environment: production   # optional; Sentry's default otherwise
-    sample_rate: 1.0          # share of error events sent, 0 to 1; default 1.0
-```
-
-| Key | Default |
-|---|---|
-| `telemetry.sentry.dsn` | unset (reporting off); an `http://` or `https://` DSN |
-| `telemetry.sentry.environment` | unset |
-| `telemetry.sentry.sample_rate` | `1.0` |
-
-- **Sent, and nothing else:** an allowlist, not a filter.
-  - ERROR lines become events and the WARN lines before them breadcrumbs. Their message is the line's call site, never its text: `<target> at <file>:<line>`, for example `pg_cdc::lane at crates/pg-cdc/src/lane/mod.rs:655`, built from tracing's static metadata, so no logged value can reach it. Events also carry the level and module. Lines from other crates (the AWS SDK, tokio-postgres, hyper) get the same call-site message and none of their fields. Open the file and line, or the task's logs at the same timestamp, for the wording and the cause.
-  - From pg-cdc's lines, only these fields: the numbers and flags `lane`, `partition`, `attempts`, `delay_ms`, `epoch`, `own_pid`, `since_last_ok_ms`, `type_oid`, `sent`, `outcomes`, `entries`, `count`, `dead`, `fifo`, `max_message_bytes` and `limit_from_topic`, and the labels `id` (an event id such as `000000001a2b3c4d-00000003`), `operation`, `kind` and `sink` when the value is at most 64 lowercase letters, digits, `_` and `-`.
-  - Panics, as a fatal event with the fixed message `pg-cdc panicked`, the panic's source location and the stack of function names. The panic message itself is not sent.
-  - Every event's release `pg-cdc@<version>`, environment, the task's holder id as `server_name`, the tags `pipeline` and `holder`, and the OS and Rust runtime.
-
-  Check the setup with a dead event or a failed startup: the error shows up within seconds.
-- **Never sent:** error text of any kind, including what SNS, S3 and Postgres return (Postgres errors can quote column values), order keys, table, schema, slot and topic names, URLs, row data, and every field not listed above. Read the cause in the task's logs at the same timestamp, by `holder`. INFO and DEBUG lines, spans and performance traces are not sent, and `send_default_pii` is off. As a second line of defense, URL credentials and secret `key=value` values are still redacted from anything sent.
-- **Shutdown:** queued events are flushed for at most 2 s at exit, and after SIGTERM only within what remains of the `2 x drain_timeout + 3 s` budget, so a 15 s `stopTimeout` still holds. A Sentry outage never blocks delivery or a panicking thread: events go through a bounded queue on their own thread, are dropped when it is full, and each send gives up after 5 s; a panic only queues its event.
-- **Builds:** the `sentry` cargo feature (default on, in the published image) compiles it in. A build with `--no-default-features` ignores the DSN and logs `error reporting is configured, but this build has no sentry feature`.
 
 ## 7. Pre-production checklist
 
@@ -324,8 +279,38 @@ Telemetry is configured under `telemetry` ([docs/configuration.md](configuration
 | `pgcdc.role` | gauge | 0 standby, 1 active, 2 draining |
 | `pgcdc.leader.epoch` | gauge | |
 | `pgcdc.tables_without_full_identity` | gauge | |
+| `pgcdc.sink.throttled` | counter | `reason` (`throttling`, `kms_throttling`, `service_unavailable`): messages SNS refused for throttling. A whole `PublishBatch` refused counts each of its messages, an entry failed with a throttling code counts one; the SNS client does not retry, so each throttle counts once |
+| `pgcdc.store.throttled` | counter | `operation` (as `pgcdc.store.duration`): S3 attempts answered 503 or 429, including those the S3 client retries itself (up to 3 per call) |
+| `pgcdc.errors` | counter | `component`, `kind` (below): failures pg-cdc acts on, after any client retries |
+| `pgcdc.admin.rejected` | counter | `operation` (`redrive`, `discard`): requests answered 503 because the key's lane already had 16 waiting |
+
+Every attribute value comes from a fixed set; none is a table, key, error message or request id. `pgcdc.errors` by component:
+
+| `component` | `kind` | Counted when |
+|---|---|---|
+| `sink` | `retryable`, `terminal` | per message the sink did not deliver, and per event pg-cdc parks dead itself because it is larger than the sink accepts (`terminal`); also each failed sink preflight (`retryable`) |
+| `store` | `unavailable`, `not_found`, `conflict`, `malformed` | per failed state or payload store call, admin reads included; `conflict` is often a benign race that pg-cdc reloads from |
+| `leader` | `unavailable`, `timeout` | per failed or timed out lease check, including the one cut off by the lease expiring |
+| `source`, `decoder`, `leader`, `delivery` | `retryable`, `timeout`, `malformed`, `terminal` | per ended replication session, by the part that failed; `terminal` when the error stops the process, including the third decode fault at one position |
+
+The counters overlap on purpose, so do not add them up: a throttled SNS publish counts in `pgcdc.sink.throttled` and, for the same messages, in `pgcdc.errors{component="sink",kind="retryable"}`. A throttled S3 attempt that a retry recovers counts only in `pgcdc.store.throttled`; one whose call still fails also counts once in `pgcdc.errors{component="store",kind="unavailable"}`.
 
 Spans: `transaction` (`commit_lsn`, `xid`, `events`), `sink_send` (`sink`, `size`, `delivered`, `retryable`, `terminal`), `store` (`operation`, `count`), `park` and `drain` (`events`) and `status_update` (`lsn`) at debug; `takeover` (`holder`, `kind`, `epoch`) and `role_change` (`from`, `to`) at info. Only pg-cdc's own spans at debug and above are exported, sampled by `trace_sample_ratio`. Logs at info and above are exported too, and while telemetry is enabled a JSON log line written inside a sampled span gains `"trace_id"` (32 hex digits) and `"span_id"` (16 hex digits).
+
+### Error reporting (Sentry)
+
+Optional and off unless a DSN is set ([docs/configuration.md](configuration.md#telemetry)). It works with or without OTLP.
+
+- **Sent, and nothing else:** an allowlist, not a filter.
+  - ERROR lines become events and the WARN lines before them breadcrumbs. Their message is the line's call site, never its text: `<target> at <file>:<line>`, for example `pg_cdc::lane at crates/pg-cdc/src/lane/mod.rs:655`, built from tracing's static metadata, so no logged value can reach it. Events also carry the level and module. Lines from other crates (the AWS SDK, tokio-postgres, hyper) get the same call-site message and none of their fields. Open the file and line, or the task's logs at the same timestamp, for the wording and the cause.
+  - From pg-cdc's lines, only these fields: the numbers and flags `lane`, `partition`, `attempts`, `delay_ms`, `epoch`, `own_pid`, `since_last_ok_ms`, `type_oid`, `sent`, `outcomes`, `entries`, `count`, `dead`, `fifo`, `max_message_bytes` and `limit_from_topic`, and the labels `id` (an event id such as `000000001a2b3c4d-00000003`), `operation`, `kind` and `sink` when the value is at most 64 lowercase letters, digits, `_` and `-`.
+  - Panics, as a fatal event with the fixed message `pg-cdc panicked`, the panic's source location and its stack. Stack frames carry function names, absolute source paths, line numbers and instruction addresses. The panic message itself is not sent.
+  - On every event: the release `pg-cdc@<version>`, environment, the task's holder id as `server_name`, the tags `pipeline` and `holder`, the OS context (name, version, build and kernel version), the Rust compiler version, the CPU architecture as the only device detail, and a trace context of random ids.
+
+  Check the setup with a dead event or a failed startup: the error shows up within seconds.
+- **Never sent:** error text of any kind, including what SNS, S3 and Postgres return (Postgres errors can quote column values), order keys, table, schema, slot and topic names, URLs, row data, the machine's model or name, and every field not listed above. Read the cause in the task's logs at the same timestamp, by `holder`. INFO and DEBUG lines, spans and performance traces are not sent, and `send_default_pii` is off. As a second line of defense, URL credentials and secret `key=value` values are still redacted from anything sent.
+- **Shutdown:** at exit, queued events are flushed for at most 2 s, and after SIGTERM only within what remains of the `2 x drain_timeout + 3 s` budget, so a 15 s `stopTimeout` still holds. When the main thread unwinds from a panic instead, the flush takes up to 2 s regardless of that budget. A Sentry outage never blocks delivery or a panicking thread: events go through a bounded queue on their own thread, are dropped when it is full, and each send gives up after 5 s; a panic only queues its event.
+- **Builds:** the `sentry` cargo feature (default on, in the published image) compiles it in. A build with `--no-default-features` ignores the DSN and logs `error reporting is configured, but this build has no sentry feature`.
 
 ## 11. Container image
 

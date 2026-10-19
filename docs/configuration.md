@@ -62,6 +62,10 @@ admin:
 telemetry:
   otlp_endpoint: http://otel-collector:4317
   trace_sample_ratio: 0.01
+  sentry:
+    dsn: https://<public key>@<org>.ingest.sentry.io/<project>
+    environment: production
+    sample_rate: 1.0
 ```
 
 ## Keys
@@ -99,6 +103,9 @@ telemetry:
 | `admin.listen` | `127.0.0.1:9187` | An IP address and port; host names are rejected. |
 | `telemetry.otlp_endpoint` | unset (telemetry off) | An `http://` or `https://` URL. |
 | `telemetry.trace_sample_ratio` | `0.01` | 0 to 1. |
+| `telemetry.sentry.dsn` | unset (error reporting off) | An `http://` or `https://` Sentry DSN; `SENTRY_DSN` is used when unset. Kept secret. |
+| `telemetry.sentry.environment` | unset (Sentry's default) | Tags every event. |
+| `telemetry.sentry.sample_rate` | `1.0` | 0 to 1; the share of error events sent. |
 
 Fixed internal values: standby poll and lease check every 2 s; batch linger 5 ms; sink retry backoff 100 ms to 30 s; reconnect backoff 1 s to 30 s.
 
@@ -171,6 +178,7 @@ Telemetry is off unless an OTLP endpoint is configured; then traces, metrics and
 - **`OTEL_*` variables.** `OTEL_SERVICE_NAME` (default `pg-cdc`), `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_METRIC_EXPORT_INTERVAL` are honored. Every signal carries `service.instance.id` (the task's holder id), `service.version` and `pgcdc.pipeline`.
 - **Sampling.** Traces use `ParentBased(TraceIdRatioBased(trace_sample_ratio))`.
 - **Never in the way.** Exports go through bounded batch queues that drop when full, and on SIGTERM the exporters get at most 1 s within the shutdown budget.
+- **Error reporting.** `telemetry.sentry.dsn`, or `SENTRY_DSN` when the config sets none, sends ERROR lines and panics to Sentry, independently of OTLP. Only an allowlist leaves the process; the [runbook](runbook.md#error-reporting-sentry) lists exactly what. The `sentry` cargo feature (default on) compiles it in; without it the DSN is ignored with a warning.
 - **The `otel` feature.** OpenTelemetry is compiled in by default. `cargo build --release -p pg-cdc --no-default-features` builds without it; such a build logs `telemetry is configured, but this build has no otel feature` and exports nothing.
 
 ## Logs
