@@ -324,6 +324,66 @@ async fn an_oversized_parked_head_counts_as_dead_under_its_labels() {
     );
 }
 
+fn sink_errors(seen: &Mutex<Vec<Seen>>) -> Vec<Seen> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| matches!(entry, Seen::Error(ErrorComponent::Sink, ..)))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_event_too_large_for_the_sink_counts_one_terminal_error() {
+    let seen = recording();
+    let limits = SinkCapabilities {
+        max_message_bytes: 100,
+        ..LIMITS
+    };
+    let mut harness = Harness::start(
+        Setup::default(),
+        ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered)),
+        TestStore::default(),
+    )
+    .await;
+    harness.send(0, b"big", 500).unwrap();
+    harness.settle(1).await;
+    wait_for_dead(&harness.store, 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(harness.sink.batches(), Vec::<Vec<u32>>::new());
+    assert_eq!(
+        sink_errors(&seen),
+        vec![Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_oversized_parked_head_counts_one_terminal_error() {
+    let seen = recording();
+    let store = TestStore::default();
+    store
+        .inner
+        .append_parked(&[labelled(b"k", 0, 500)])
+        .await
+        .unwrap();
+    let limits = SinkCapabilities {
+        max_message_bytes: 100,
+        ..LIMITS
+    };
+    let harness = Harness::start(
+        Setup::default(),
+        ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered)),
+        store,
+    )
+    .await;
+    wait_for_dead(&harness.store, 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        sink_errors(&seen),
+        vec![Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1)]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn each_sink_call_records_one_point_timed_over_the_call() {
     let seen = recording();
