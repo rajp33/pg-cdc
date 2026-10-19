@@ -61,7 +61,7 @@ struct Report {
     criterion_7: Verdict,
 }
 
-fn overhead_percent(default_median: f64, baseline_median: f64) -> Option<f64> {
+pub(super) fn overhead_percent(default_median: f64, baseline_median: f64) -> Option<f64> {
     (baseline_median > 0.0).then(|| (default_median / baseline_median - 1.0) * 100.0)
 }
 

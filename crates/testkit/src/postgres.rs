@@ -170,6 +170,10 @@ impl Postgres {
         self.port
     }
 
+    pub fn container_id(&self) -> &str {
+        self.container.id()
+    }
+
     pub fn user(&self) -> &'static str {
         USER
     }

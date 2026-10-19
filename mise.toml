@@ -97,7 +97,7 @@ run = [
 ]
 
 [tasks.load]
-description = "Load scenarios (ceiling, sns, overhead, memory, outage, brownout, handover); LOAD_SCENARIO picks one, default all"
+description = "Load scenarios (ceiling, sns, overhead, overhead-instructions, memory, outage, brownout, handover); LOAD_SCENARIO picks one, default all"
 run = [
   "cargo build --release -p pg-cdc",
   "cargo build --release -p pg-cdc --no-default-features --target-dir target/baseline",

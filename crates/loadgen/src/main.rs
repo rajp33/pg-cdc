@@ -259,8 +259,9 @@ mod tests {
     }
 
     #[test]
-    fn the_outage_brownout_and_handover_scenarios_are_selectable() {
+    fn the_outage_brownout_handover_and_instruction_scenarios_are_selectable() {
         for (name, scenario) in [
+            ("overhead-instructions", Scenario::OverheadInstructions),
             ("outage", Scenario::Outage),
             ("brownout", Scenario::Brownout),
             ("handover", Scenario::Handover),
