@@ -118,7 +118,7 @@ The order key decides ordering and lane placement. Events of one order key are d
 | `column:<name>` | the value of that column; schema and table when it is absent or null |
 | `pipeline` | one key for everything: total order, one event in flight at a time |
 
-A truncate has no key: its order key is its table under `key`, `table` and the `column:<name>` fallback, and the one constant key under `pipeline`. Under `key` and `column:<name>` it is therefore not ordered relative to that table's row events. One order key moves at most one event per sink round trip, roughly 20 to 50 events/s against SNS, so choose `order_by` so that no single key carries a high rate.
+A truncate has no key: its order key is its table under `key`, `table` and the `column:<name>` fallback, and the one constant key under `pipeline`. Under `key` and `column:<name>` it is therefore not ordered relative to that table's row events that use a different order key. One order key moves at most one event per sink round trip, roughly 20 to 50 events/s against SNS, so choose `order_by` so that no single key carries a high rate.
 
 ## Sinks
 
@@ -129,7 +129,7 @@ Each change is one SNS message whose body is the JSON envelope (see the [design]
 - **Message attributes.** Every message carries `schema`, `table` and `op`, plus each `attribute_columns` value, taken from `after`, or from `before` when there is no `after`. A value is a `Number` attribute when it is a plain JSON number from -10^9 to 10^9 with at most 5 digits after the decimal point, the range SNS accepts, and a `String` holding the exact original text otherwise, including larger or more precise numbers and exponent forms such as `1e+300`. Null and empty values are omitted, as is a string with a character SNS rejects (with a warning).
 - **FIFO topics.** The message group is the order key id and the deduplication id is `<pipeline>:<event id>`, the same on every replay and takeover. SNS deduplicates across the whole topic, so pipelines sharing a FIFO topic need distinct `pipeline` names.
 - **Standard topics.** No message group, unless `fair_queue_group: column:<name>` sets one from that column for SQS fair queues. It is ignored, with a warning, on a FIFO topic.
-- **Message size.** The limit comes from the topic's `MaximumMessageSize` attribute when `GetTopicAttributes` returns it, and is 256 KiB otherwise; the `SNS topic ready` log at startup shows the limit and where it came from. Topics above 256 KiB have not been verified against real AWS. Larger events go to the payload store as a pointer, or park as dead without one (see [Payload store](#payload-store)).
+- **Message size.** The limit comes from the topic's `MaximumMessageSize` attribute when `GetTopicAttributes` returns it, and is 256 KiB otherwise; the `SNS topic ready` log at startup shows the limit and where it came from. Topics above 256 KiB have not been verified against real AWS. Larger events are stored in the payload store and sent as a pointer, provided the pointer fits, or park as dead without one (see [Payload store](#payload-store)).
 - **Preflight.** pg-cdc checks the topic with `GetTopicAttributes` and keeps retrying until it succeeds before it opens the replication connection.
 - **Retries.** A failing order key backs off from 100 ms to 30 s while other keys keep flowing, as long as the state store answers promptly. An entry SNS rejects with `SenderFault` is terminal and parks at once as dead.
 
