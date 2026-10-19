@@ -343,10 +343,12 @@ mod client {
         while let Some(equals) = rest.find('=') {
             let (head, tail) = rest.split_at(equals);
             let key_start = head
-                .rfind(|character: char| {
+                .char_indices()
+                .rev()
+                .find(|(_, character)| {
                     !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
                 })
-                .map_or(0, |index| index + 1);
+                .map_or(0, |(index, character)| index + character.len_utf8());
             out.push_str(head);
             out.push('=');
             let value = &tail[1..];
@@ -604,6 +606,50 @@ mod tests {
                 started.elapsed()
             );
             server.abort();
+        }
+
+        #[test]
+        fn text_scrubbing_survives_multibyte_delimiters() {
+            for text in [
+                "é=x",
+                "é://x",
+                "ü@é://ö@ä/ß",
+                "pässword=é",
+                "=é",
+                "é=",
+                "x://é",
+                "a=b é=c",
+            ] {
+                let _ = client::scrub_text(text);
+            }
+            assert_eq!(
+                client::scrub_text("pässword=é token=ü"),
+                "pässword=é token=[redacted]"
+            );
+        }
+
+        fn scrubbable() -> impl proptest::strategy::Strategy<Value = String> {
+            use proptest::prelude::*;
+            proptest::collection::vec(
+                prop_oneof![
+                    any::<char>(),
+                    Just('='),
+                    Just('@'),
+                    Just(':'),
+                    Just('/'),
+                    Just('é'),
+                    Just(' '),
+                ],
+                0..64,
+            )
+            .prop_map(|chars| chars.into_iter().collect())
+        }
+
+        proptest::proptest! {
+            #[test]
+            fn text_scrubbing_never_panics_on_any_text(text in scrubbable()) {
+                let _ = client::scrub_text(&text);
+            }
         }
 
         #[test]
