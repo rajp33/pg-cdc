@@ -19,7 +19,7 @@ otel = [
   "dep:tracing-opentelemetry",
   "dep:opentelemetry-appender-tracing",
 ]
-sentry = ["dep:sentry"]
+sentry = ["dep:sentry", "dep:ureq"]
 
 [dependencies]
 anyhow.workspace = true
@@ -69,6 +69,7 @@ tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
 twox-hash.workspace = true
+ureq = { workspace = true, optional = true }
 webpki-roots.workspace = true
 
 [dev-dependencies]

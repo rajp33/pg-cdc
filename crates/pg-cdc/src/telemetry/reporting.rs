@@ -77,7 +77,16 @@ impl ErrorReporting {
 
     #[cfg(feature = "sentry")]
     pub fn shutdown(self, within: Duration) -> bool {
-        self.guard.is_none_or(|guard| guard.close(Some(within)))
+        let Some(guard) = self.guard else {
+            return true;
+        };
+        let (closed, wait) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("pg-cdc-sentry".to_owned())
+            .spawn(move || {
+                closed.send(guard.close(Some(within))).ok();
+            });
+        spawned.is_ok() && wait.recv_timeout(within).unwrap_or(false)
     }
 
     #[cfg(not(feature = "sentry"))]
@@ -90,20 +99,25 @@ impl ErrorReporting {
 mod client {
     use std::borrow::Cow;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use secrecy::ExposeSecret as _;
     use sentry::integrations::tracing::EventFilter;
     use sentry::protocol::{Breadcrumb, Context, Event, Map, Value};
+    use sentry::transports::UreqHttpTransportOptions;
     use sentry::types::Dsn;
-    use sentry::{ClientOptions, TransportFactory};
+    use sentry::{ClientOptions, TransportFactory, TransportOptions};
     use tracing::Level;
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::Layer as _;
+    use ureq::tls::{TlsConfig, TlsProvider};
 
     use super::{
         ErrorReporting, ReportingPlan, TelemetryError, TelemetryIdentity, TelemetryLayers,
     };
 
+    // ureq sets no request timeout by default, so an unreachable Sentry would hold the send queue forever.
+    const SEND_TIMEOUT: Duration = Duration::from_secs(5);
     const REDACTED: &str = "[redacted]";
     const SENSITIVE_WORDS: [&str; 26] = [
         "password",
@@ -145,9 +159,7 @@ mod client {
             return Ok((ErrorReporting { guard: None }, None));
         };
         let mut options = options(plan, identity)?;
-        if transport.is_some() {
-            options.transport = transport;
-        }
+        options.transport = transport.or_else(|| bounded_transport(&options));
         let guard = sentry::init(options);
         let layer = sentry::integrations::tracing::layer()
             .event_filter(|metadata| match *metadata.level() {
@@ -163,6 +175,19 @@ mod client {
                 layers: vec![Box::new(layer)],
             }),
         ))
+    }
+
+    fn bounded_transport(options: &ClientOptions) -> Option<Arc<dyn TransportFactory>> {
+        let general = TransportOptions::try_from_client_options(options)?;
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(SEND_TIMEOUT))
+            .tls_config(TlsConfig::builder().provider(TlsProvider::Rustls).build())
+            .build()
+            .new_agent();
+        let transport = UreqHttpTransportOptions::from(general)
+            .with_agent(agent)
+            .build();
+        Some(Arc::new(Arc::new(transport)))
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -548,6 +573,37 @@ mod tests {
                 events[0].tags.get("pipeline").map(String::as_str),
                 Some("orders")
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shutdown_against_a_blackholed_sentry_gives_up_at_its_deadline() {
+            let (endpoint, server) = pg_cdc_testkit::blackhole().await.unwrap();
+            let address = endpoint.trim_start_matches("http://");
+            let plan = ReportingPlan {
+                dsn: SecretString::from(format!("http://public@{address}/1")),
+                ..plan()
+            };
+            let (reporting, layers) = ErrorReporting::install(Some(&plan), &identity()).unwrap();
+            let subscriber = tracing_subscriber::registry().with(layers.unwrap().into_layer());
+            tracing::subscriber::with_default(subscriber, || {
+                for attempt in 0..64 {
+                    tracing::error!(target: "pg_cdc::lane", attempt, "the sink rejected the event for good");
+                }
+            });
+            let started = std::time::Instant::now();
+            let finished =
+                tokio::task::spawn_blocking(move || reporting.shutdown(Duration::from_millis(300)));
+            let flushed = tokio::time::timeout(Duration::from_secs(5), finished)
+                .await
+                .expect("shutdown must not outlive its budget")
+                .unwrap();
+            assert!(!flushed);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                started.elapsed()
+            );
+            server.abort();
         }
 
         #[test]
