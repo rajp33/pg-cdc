@@ -17,6 +17,7 @@ use super::{
 };
 use crate::event::EventId;
 use crate::lane::OperateError;
+use crate::metrics::{self, AdminOperation, Measurement};
 use crate::order::OrderKeyId;
 use crate::state::{
     LeaderRecord, ParkStatus, ParkedEntry, ParkedEvent, ParkedHead, ParkedSummary, StateStore,
@@ -569,7 +570,7 @@ async fn try_redrive(admin: &Admin, key: &str, query: Option<&str>) -> Checked<R
                 StatusCode::OK,
                 &json!({"order_key": key.to_string(), "id": id.to_string(), "status": "retrying"}),
             ),
-            Err(error) => operate_failure(admin, error).await,
+            Err(error) => operate_failure(admin, AdminOperation::Redrive, error).await,
         }
     })
     .await)
@@ -590,16 +591,20 @@ async fn try_discard(admin: &Admin, key: &str, query: Option<&str>) -> Checked<R
                 StatusCode::OK,
                 &json!({"order_key": key.to_string(), "discarded": id.to_string()}),
             ),
-            Err(error) => operate_failure(admin, error).await,
+            Err(error) => operate_failure(admin, AdminOperation::Discard, error).await,
         }
     })
     .await)
 }
 
-async fn operate_failure(admin: &Admin, error: OperateError) -> Reply {
+async fn operate_failure(admin: &Admin, operation: AdminOperation, error: OperateError) -> Reply {
     match error {
         OperateError::NotParked(_) => Reply::error(StatusCode::NOT_FOUND, &error),
-        OperateError::Loading(_) | OperateError::Busy(_) => {
+        OperateError::Busy(_) => {
+            metrics::record(Measurement::AdminRejected { operation });
+            Reply::error(StatusCode::SERVICE_UNAVAILABLE, &error).with_retry_after()
+        }
+        OperateError::Loading(_) => {
             Reply::error(StatusCode::SERVICE_UNAVAILABLE, &error).with_retry_after()
         }
         OperateError::NotDead { head, .. } | OperateError::HeadMismatch { head, .. } => {
@@ -640,6 +645,7 @@ mod tests {
     use crate::event::EventId;
     use crate::health::{Health, Role};
     use crate::lane::{LaneSettings, Lanes, OperateError, Stores};
+    use crate::metrics::{AdminOperation, Measurement, Recorder};
     use crate::order::OrderKeyId;
     use crate::sink::{AttributeValue, Outbound, Outcome, Sink, SinkCapabilities, SinkError};
     use crate::state::PARKED_SUMMARY_BYTES;
@@ -2198,6 +2204,37 @@ mod tests {
         fixture.stop().await;
     }
 
+    #[derive(Debug)]
+    struct Rejections(Arc<Mutex<Vec<AdminOperation>>>);
+
+    impl Recorder for Rejections {
+        fn record(&self, measurement: Measurement<'_>) {
+            if let Measurement::AdminRejected { operation } = measurement {
+                self.0.lock().unwrap().push(operation);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_full_operation_queue_counts_as_a_rejection_of_its_operation() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        crate::metrics::install(Box::new(Rejections(Arc::clone(&seen)))).unwrap();
+        let admin = Admin::new(Health::new(), Status::new(), identity());
+        let key = named("a");
+        for (operation, error) in [
+            (AdminOperation::Discard, OperateError::Busy(key)),
+            (AdminOperation::Redrive, OperateError::Loading(key)),
+            (AdminOperation::Redrive, OperateError::Busy(key)),
+            (AdminOperation::Redrive, OperateError::NotParked(key)),
+        ] {
+            operate_failure(&admin, operation, error).await;
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![AdminOperation::Discard, AdminOperation::Redrive]
+        );
+    }
+
     #[tokio::test]
     async fn operate_errors_map_to_their_replies() {
         let admin = Admin::new(Health::new(), Status::new(), identity());
@@ -2231,7 +2268,9 @@ mod tests {
             );
             let retry = matches!(error, OperateError::Loading(_) | OperateError::Busy(_));
             let stopped = matches!(error, OperateError::Stopped);
-            let response = operate_failure(&admin, error).await.into_response();
+            let response = operate_failure(&admin, AdminOperation::Redrive, error)
+                .await
+                .into_response();
             assert_eq!(response.status(), status, "{message}");
             assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
             assert_eq!(response.headers().get(RETRY_AFTER).is_some(), retry);

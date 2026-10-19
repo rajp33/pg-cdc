@@ -31,7 +31,7 @@ use crate::leader::record::{Claim, Release, TakeoverError, release, take_over};
 use crate::leader::standby::{
     AcquireError, OBJECT_IN_USE, ProbeError, SlotHolder, SlotProbe, StartError, acquire,
 };
-use crate::metrics::{self, EventOutcome, Measurement};
+use crate::metrics::{self, ErrorComponent, ErrorKind, EventOutcome, Measurement};
 use crate::order::{OrderBy, order_key};
 use crate::sink::{Outbound, Sink, metric_labels};
 use crate::state::StateStore;
@@ -141,6 +141,40 @@ impl SessionError {
             | Self::UnknownRelation { wal_start, .. } => Some(*wal_start),
             Self::Malformed { at, .. } => Some(*at),
             _ => None,
+        }
+    }
+
+    pub fn component(&self) -> ErrorComponent {
+        match self {
+            Self::Connect(_)
+            | Self::Catalog(_)
+            | Self::Invalid(_)
+            | Self::ControlStalled(_)
+            | Self::Replication(_)
+            | Self::StreamEnded => ErrorComponent::Source,
+            Self::Malformed { .. }
+            | Self::Decode { .. }
+            | Self::Build { .. }
+            | Self::UnknownRelation { .. }
+            | Self::Encode(_) => ErrorComponent::Decoder,
+            Self::Probe(_) | Self::Takeover(_) | Self::Fenced(_) => ErrorComponent::Leader,
+            Self::Ack(_) | Self::Lane(_) | Self::LaneStopped(_) | Self::LanesStopped => {
+                ErrorComponent::Delivery
+            }
+        }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        if self.is_fatal() {
+            return ErrorKind::Terminal;
+        }
+        match self {
+            Self::ControlStalled(_) => ErrorKind::Timeout,
+            Self::Malformed { .. }
+            | Self::Decode { .. }
+            | Self::Build { .. }
+            | Self::UnknownRelation { .. } => ErrorKind::Malformed,
+            _ => ErrorKind::Retryable,
         }
     }
 

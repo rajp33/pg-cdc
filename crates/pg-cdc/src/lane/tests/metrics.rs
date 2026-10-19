@@ -1,6 +1,6 @@
 use super::*;
 use crate::capture::{Capture, SpanSeen};
-use crate::metrics::{EventOutcome, Measurement, Recorder, SinkOutcome};
+use crate::metrics::{ErrorComponent, ErrorKind, EventOutcome, Measurement, Recorder, SinkOutcome};
 use crate::sink::AttributeValue;
 use tracing::Level;
 use tracing::level_filters::LevelFilter;
@@ -15,6 +15,7 @@ enum Seen {
     },
     CommitToDelivery(Duration),
     Sink(SinkOutcome, Duration),
+    Error(ErrorComponent, ErrorKind, u64),
     Other,
 }
 
@@ -37,6 +38,11 @@ impl Recorder for Collecting {
             },
             Measurement::CommitToDelivery(elapsed) => Seen::CommitToDelivery(elapsed),
             Measurement::Sink { outcome, elapsed } => Seen::Sink(outcome, elapsed),
+            Measurement::Error {
+                component,
+                kind,
+                count,
+            } => Seen::Error(component, kind, count),
             _ => Seen::Other,
         };
         self.0.lock().unwrap().push(seen);
@@ -318,6 +324,66 @@ async fn an_oversized_parked_head_counts_as_dead_under_its_labels() {
     );
 }
 
+fn sink_errors(seen: &Mutex<Vec<Seen>>) -> Vec<Seen> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| matches!(entry, Seen::Error(ErrorComponent::Sink, ..)))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_event_too_large_for_the_sink_counts_one_terminal_error() {
+    let seen = recording();
+    let limits = SinkCapabilities {
+        max_message_bytes: 100,
+        ..LIMITS
+    };
+    let mut harness = Harness::start(
+        Setup::default(),
+        ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered)),
+        TestStore::default(),
+    )
+    .await;
+    harness.send(0, b"big", 500).unwrap();
+    harness.settle(1).await;
+    wait_for_dead(&harness.store, 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(harness.sink.batches(), Vec::<Vec<u32>>::new());
+    assert_eq!(
+        sink_errors(&seen),
+        vec![Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_oversized_parked_head_counts_one_terminal_error() {
+    let seen = recording();
+    let store = TestStore::default();
+    store
+        .inner
+        .append_parked(&[labelled(b"k", 0, 500)])
+        .await
+        .unwrap();
+    let limits = SinkCapabilities {
+        max_message_bytes: 100,
+        ..LIMITS
+    };
+    let harness = Harness::start(
+        Setup::default(),
+        ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered)),
+        store,
+    )
+    .await;
+    wait_for_dead(&harness.store, 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        sink_errors(&seen),
+        vec![Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1)]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn each_sink_call_records_one_point_timed_over_the_call() {
     let seen = recording();
@@ -385,6 +451,36 @@ fn the_worst_outcome_wins_terminal_over_retryable_over_delivered() {
     let expected: Vec<(SinkOutcome, Duration)> =
         cases.iter().map(|(_, worst)| (*worst, elapsed)).collect();
     assert_eq!(sink_points(&seen), expected);
+}
+
+#[test]
+fn failed_messages_count_as_sink_errors_of_their_kind() {
+    let seen = recording();
+    let retryable = || Outcome::Retryable(SinkError("throttled".to_owned()));
+    let terminal = || Outcome::Terminal(SinkError("rejected".to_owned()));
+    let elapsed = Some(Duration::from_millis(3));
+    record_sink_call(
+        &tracing::Span::none(),
+        &[Outcome::Delivered, retryable(), terminal(), retryable()],
+        elapsed,
+    );
+    record_sink_call(&tracing::Span::none(), &[Outcome::Delivered], elapsed);
+    record_sink_call(&tracing::Span::none(), &[terminal()], elapsed);
+    let errors: Vec<Seen> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| matches!(entry, Seen::Error(..)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        errors,
+        vec![
+            Seen::Error(ErrorComponent::Sink, ErrorKind::Retryable, 2),
+            Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1),
+            Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1),
+        ]
+    );
 }
 
 const HOT_PATH_SPANS: [&str; 4] = ["sink_send", "park", "drain", "store"];

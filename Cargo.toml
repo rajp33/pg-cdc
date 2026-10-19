@@ -82,6 +82,13 @@ rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
+sentry = { version = "0.49.3", default-features = false, features = [
+  "backtrace",
+  "contexts",
+  "tracing",
+  "ureq",
+  "rustls",
+] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 serde_json = { version = "1.0.154", features = [
@@ -107,6 +114,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
   "std",
 ] }
 twox-hash = { version = "2.1.5", default-features = false, features = ["xxhash3_128"] }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 webpki-roots = "1.0.9"
 
 [workspace.lints.rust]

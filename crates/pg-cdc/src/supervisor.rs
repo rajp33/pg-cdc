@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::ConnectionProvider;
 use crate::lane::Stores;
+use crate::metrics::{self, ErrorComponent, ErrorKind, Measurement};
 use crate::session::{SessionConfig, SessionContext, SessionError, run_session};
 use crate::sink::Sink;
 use crate::state::StateStore;
@@ -128,11 +129,13 @@ pub async fn supervise<A: Attempt>(
             Err(error) => error,
         };
         if error.is_fatal() {
+            record_error(error.component(), ErrorKind::Terminal);
             return Err(SupervisorError::Fatal(error));
         }
         if let Some(lsn) = error.fault_lsn() {
             let count = faults.record(lsn);
             if count >= HALT_AFTER_FAULTS {
+                record_error(error.component(), ErrorKind::Terminal);
                 return Err(SupervisorError::Halted {
                     lsn,
                     count,
@@ -140,6 +143,7 @@ pub async fn supervise<A: Attempt>(
                 });
             }
         }
+        record_error(error.component(), error.kind());
         if started.elapsed() >= BACKOFF_CAP {
             backoff.reset();
         }
@@ -153,22 +157,40 @@ pub async fn supervise<A: Attempt>(
 }
 
 pub async fn preflight(sink: &dyn Sink, shutdown: &CancellationToken) -> bool {
-    retry_until_ok("sink preflight failed; retrying", shutdown, || {
-        sink.preflight()
+    retry_until_ok(StartupCheck::Sink, shutdown, || async {
+        let checked = sink.preflight().await;
+        if checked.is_err() {
+            record_error(ErrorComponent::Sink, ErrorKind::Retryable);
+        }
+        checked
     })
     .await
 }
 
+fn record_error(component: ErrorComponent, kind: ErrorKind) {
+    metrics::record(Measurement::Error {
+        component,
+        kind,
+        count: 1,
+    });
+}
+
 pub async fn store_ready(store: &Arc<dyn StateStore>, shutdown: &CancellationToken) -> bool {
     let store = InstrumentedStateStore::new(Arc::clone(store));
-    retry_until_ok("state store check failed; retrying", shutdown, || async {
+    retry_until_ok(StartupCheck::Store, shutdown, || async {
         store.read_leader().await.map(drop)
     })
     .await
 }
 
+#[derive(Debug, Clone, Copy)]
+enum StartupCheck {
+    Sink,
+    Store,
+}
+
 async fn retry_until_ok<F, Fut, E>(
-    failure: &'static str,
+    check: StartupCheck,
     shutdown: &CancellationToken,
     mut attempt: F,
 ) -> bool
@@ -188,7 +210,14 @@ where
         };
         let delay = backoff.next_delay();
         let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-        tracing::warn!(%error, delay_ms, "{failure}");
+        match check {
+            StartupCheck::Sink => {
+                tracing::warn!(%error, delay_ms, "sink preflight failed; retrying");
+            }
+            StartupCheck::Store => {
+                tracing::warn!(%error, delay_ms, "state store check failed; retrying");
+            }
+        }
         if !sleep_unless_cancelled(delay, shutdown).await {
             return false;
         }
@@ -212,7 +241,7 @@ mod tests {
     use crate::leader::lease::FenceReason;
     use crate::leader::record::TakeoverError;
     use crate::leader::standby::ProbeError;
-    use crate::metrics::{Measurement, Recorder, StoreOperation};
+    use crate::metrics::{ErrorComponent, ErrorKind, Measurement, Recorder, StoreOperation};
     use crate::order::OrderKeyId;
     use crate::sink::{Outbound, Outcome, SinkCapabilities, SinkError};
     use crate::state::memory::MemoryStateStore;
@@ -632,6 +661,88 @@ mod tests {
         attempt.cancel_after_first = Some(shutdown.clone());
         assert!(supervise(&mut attempt, &shutdown).await.is_ok());
         assert_eq!(attempt.runs, 1);
+    }
+
+    #[derive(Debug)]
+    struct Errors(Arc<std::sync::Mutex<Vec<(ErrorComponent, ErrorKind)>>>);
+
+    impl Recorder for Errors {
+        fn record(&self, measurement: Measurement<'_>) {
+            if let Measurement::Error {
+                component, kind, ..
+            } = measurement
+            {
+                self.0.lock().unwrap().push((component, kind));
+            }
+        }
+    }
+
+    fn recording_errors() -> Arc<std::sync::Mutex<Vec<(ErrorComponent, ErrorKind)>>> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::metrics::install(Box::new(Errors(Arc::clone(&seen)))).unwrap();
+        seen
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_ended_session_counts_one_error_by_component_and_kind() {
+        let seen = recording_errors();
+        let mut attempt = Scripted::new(vec![
+            Err(SessionError::StreamEnded),
+            Err(SessionError::ControlStalled(Duration::from_secs(5))),
+            fault(0x10),
+            Err(SessionError::Fenced(FenceReason::Expired)),
+            Err(SessionError::Probe(ProbeError("closed".to_owned()))),
+            Err(SessionError::LanesStopped),
+        ]);
+        let result = supervise(&mut attempt, &CancellationToken::new()).await;
+        assert!(
+            matches!(result, Err(SupervisorError::Fatal(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (ErrorComponent::Source, ErrorKind::Retryable),
+                (ErrorComponent::Source, ErrorKind::Timeout),
+                (ErrorComponent::Decoder, ErrorKind::Malformed),
+                (ErrorComponent::Leader, ErrorKind::Retryable),
+                (ErrorComponent::Leader, ErrorKind::Retryable),
+                (ErrorComponent::Delivery, ErrorKind::Terminal),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_fault_that_halts_the_supervisor_counts_as_terminal() {
+        let seen = recording_errors();
+        let mut attempt = Scripted::new(vec![fault(0x10), fault(0x10), fault(0x10), Ok(())]);
+        let result = supervise(&mut attempt, &CancellationToken::new()).await;
+        assert!(
+            matches!(result, Err(SupervisorError::Halted { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (ErrorComponent::Decoder, ErrorKind::Malformed),
+                (ErrorComponent::Decoder, ErrorKind::Malformed),
+                (ErrorComponent::Decoder, ErrorKind::Terminal),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_sink_preflight_counts_as_a_retryable_sink_error() {
+        let seen = recording_errors();
+        let sink = FlakySink {
+            failures_left: AtomicU32::new(2),
+            ..FlakySink::default()
+        };
+        assert!(preflight(&sink, &CancellationToken::new()).await);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(ErrorComponent::Sink, ErrorKind::Retryable); 2]
+        );
     }
 
     #[test]

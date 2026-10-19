@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 use serde_json::{Map, Value};
@@ -27,6 +27,7 @@ pub const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(6);
 pub const DEFAULT_FENCE_DELAY: Duration = Duration::from_secs(16);
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_TRACE_SAMPLE_RATIO: f64 = 0.01;
+pub const DEFAULT_SENTRY_SAMPLE_RATE: f64 = 1.0;
 pub const DEFAULT_ADMIN_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9187);
 const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
 
@@ -173,6 +174,8 @@ pub struct TelemetryConfig {
     pub otlp_endpoint: Option<String>,
     #[serde(default = "default_trace_sample_ratio", deserialize_with = "de_ratio")]
     pub trace_sample_ratio: f64,
+    #[serde(default)]
+    pub sentry: SentryConfig,
 }
 
 impl Default for TelemetryConfig {
@@ -180,7 +183,46 @@ impl Default for TelemetryConfig {
         Self {
             otlp_endpoint: None,
             trace_sample_ratio: DEFAULT_TRACE_SAMPLE_RATIO,
+            sentry: SentryConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SentryConfig {
+    #[serde(default)]
+    pub dsn: Option<SecretString>,
+    #[serde(default, deserialize_with = "de_opt_string")]
+    pub environment: Option<String>,
+    #[serde(
+        default = "default_sentry_sample_rate",
+        deserialize_with = "de_sample_rate"
+    )]
+    pub sample_rate: f64,
+}
+
+impl Default for SentryConfig {
+    fn default() -> Self {
+        Self {
+            dsn: None,
+            environment: None,
+            sample_rate: DEFAULT_SENTRY_SAMPLE_RATE,
+        }
+    }
+}
+
+impl PartialEq for SentryConfig {
+    fn eq(&self, other: &Self) -> bool {
+        let dsn = |config: &Self| {
+            config
+                .dsn
+                .as_ref()
+                .map(|dsn| dsn.expose_secret().to_owned())
+        };
+        dsn(self) == dsn(other)
+            && self.environment == other.environment
+            && self.sample_rate == other.sample_rate
     }
 }
 
@@ -640,12 +682,33 @@ impl TelemetryConfig {
         }
         match self.otlp_endpoint.as_deref() {
             Some(endpoint) if !endpoint.is_empty() && !is_http_url(endpoint) => {
-                Err(ConfigError::InvalidValue {
+                return Err(ConfigError::InvalidValue {
                     field: "telemetry.otlp_endpoint",
                     value: endpoint.to_owned(),
                     reason: "must be an http:// or https:// URL",
-                })
+                });
             }
+            _ => {}
+        }
+        self.sentry.validate()
+    }
+}
+
+impl SentryConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(0.0..=1.0).contains(&self.sample_rate) {
+            return Err(ConfigError::InvalidValue {
+                field: "telemetry.sentry.sample_rate",
+                value: self.sample_rate.to_string(),
+                reason: "must be a number from 0 to 1",
+            });
+        }
+        match self.dsn.as_ref().map(ExposeSecret::expose_secret) {
+            Some(dsn) if !dsn.is_empty() && !is_http_url(dsn) => Err(ConfigError::InvalidValue {
+                field: "telemetry.sentry.dsn",
+                value: "[redacted]".to_owned(),
+                reason: "must be an http:// or https:// Sentry DSN",
+            }),
             _ => Ok(()),
         }
     }
@@ -740,6 +803,10 @@ fn default_trace_sample_ratio() -> f64 {
     DEFAULT_TRACE_SAMPLE_RATIO
 }
 
+fn default_sentry_sample_rate() -> f64 {
+    DEFAULT_SENTRY_SAMPLE_RATE
+}
+
 fn default_store_concurrency() -> usize {
     DEFAULT_STORE_CONCURRENCY
 }
@@ -813,45 +880,47 @@ fn de_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D
 }
 
 fn de_ratio<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
-    struct RatioVisitor;
+    deserializer.deserialize_any(RatioVisitor("telemetry.trace_sample_ratio"))
+}
 
-    impl RatioVisitor {
-        fn not_a_number<E: de::Error>(text: &str) -> E {
-            E::custom(format!(
-                "telemetry.trace_sample_ratio {text:?} must be a number from 0 to 1"
-            ))
-        }
+fn de_sample_rate<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    deserializer.deserialize_any(RatioVisitor("telemetry.sentry.sample_rate"))
+}
+
+struct RatioVisitor(&'static str);
+
+impl RatioVisitor {
+    fn not_a_number<E: de::Error>(&self, text: &str) -> E {
+        E::custom(format!("{} {text:?} must be a number from 0 to 1", self.0))
+    }
+}
+
+impl Visitor<'_> for RatioVisitor {
+    type Value = f64;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a number from 0 to 1")
     }
 
-    impl Visitor<'_> for RatioVisitor {
-        type Value = f64;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a number from 0 to 1")
-        }
-
-        fn visit_f64<E: de::Error>(self, value: f64) -> Result<f64, E> {
-            Ok(value)
-        }
-
-        fn visit_u64<E: de::Error>(self, value: u64) -> Result<f64, E> {
-            u32::try_from(value)
-                .map(f64::from)
-                .map_err(|_| Self::not_a_number(&value.to_string()))
-        }
-
-        fn visit_i64<E: de::Error>(self, value: i64) -> Result<f64, E> {
-            i32::try_from(value)
-                .map(f64::from)
-                .map_err(|_| Self::not_a_number(&value.to_string()))
-        }
-
-        fn visit_str<E: de::Error>(self, value: &str) -> Result<f64, E> {
-            value.trim().parse().map_err(|_| Self::not_a_number(value))
-        }
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<f64, E> {
+        Ok(value)
     }
 
-    deserializer.deserialize_any(RatioVisitor)
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<f64, E> {
+        u32::try_from(value)
+            .map(f64::from)
+            .map_err(|_| self.not_a_number(&value.to_string()))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<f64, E> {
+        i32::try_from(value)
+            .map(f64::from)
+            .map_err(|_| self.not_a_number(&value.to_string()))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<f64, E> {
+        value.trim().parse().map_err(|_| self.not_a_number(value))
+    }
 }
 
 fn de_socket_addr<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SocketAddr, D::Error> {
@@ -1888,6 +1957,7 @@ state_store:
             TelemetryConfig {
                 otlp_endpoint: Some("http://collector:4317".to_owned()),
                 trace_sample_ratio: 1.0,
+                sentry: SentryConfig::default(),
             }
         );
         let mut overrides = with_password();
@@ -1904,6 +1974,7 @@ state_store:
             TelemetryConfig {
                 otlp_endpoint: Some("https://otel.internal:4317".to_owned()),
                 trace_sample_ratio: 0.5,
+                sentry: SentryConfig::default(),
             }
         );
         let integer = parse(&telemetry("  trace_sample_ratio: 1"), with_password()).unwrap();
@@ -1921,6 +1992,67 @@ state_store:
             from_environment.telemetry.otlp_endpoint.as_deref(),
             Some("http://env:4317")
         );
+    }
+
+    #[test]
+    fn sentry_is_off_by_default_and_parses_from_yaml_and_environment() {
+        let config = parse(MINIMAL, with_password()).unwrap();
+        assert!(config.telemetry.sentry.dsn.is_none());
+        assert_eq!(config.telemetry.sentry.environment, None);
+        assert_eq!(config.telemetry.sentry.sample_rate, 1.0);
+        let yaml = telemetry(
+            "  sentry:\n    dsn: https://public@o1.ingest.sentry.io/2\n    environment: staging\n    sample_rate: 0.25",
+        );
+        let config = parse(&yaml, with_password()).unwrap();
+        let sentry = &config.telemetry.sentry;
+        assert_eq!(
+            sentry.dsn.as_ref().map(ExposeSecret::expose_secret),
+            Some("https://public@o1.ingest.sentry.io/2")
+        );
+        assert_eq!(sentry.environment.as_deref(), Some("staging"));
+        assert_eq!(sentry.sample_rate, 0.25);
+        let overridden = parse(
+            MINIMAL,
+            [
+                with_password(),
+                env(&[
+                    (
+                        "PGCDC__TELEMETRY__SENTRY__DSN",
+                        "https://env@sentry.internal/3",
+                    ),
+                    ("PGCDC__TELEMETRY__SENTRY__SAMPLE_RATE", "0.5"),
+                ]),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            overridden
+                .telemetry
+                .sentry
+                .dsn
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("https://env@sentry.internal/3")
+        );
+        assert_eq!(overridden.telemetry.sentry.sample_rate, 0.5);
+    }
+
+    #[test]
+    fn invalid_sentry_settings_are_rejected() {
+        for (body, field) in [
+            (
+                "  sentry:\n    sample_rate: 1.5",
+                "telemetry.sentry.sample_rate",
+            ),
+            ("  sentry:\n    dsn: not-a-url", "telemetry.sentry.dsn"),
+        ] {
+            assert_eq!(invalid_field(&telemetry(body)), field, "{body}");
+        }
+        assert!(matches!(
+            parse(&telemetry("  sentry:\n    traces: 1"), with_password()),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]

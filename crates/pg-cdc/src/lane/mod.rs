@@ -22,7 +22,7 @@ use tracing::Instrument;
 
 use crate::ack::{Settled, Ticket};
 use crate::event::EventId;
-use crate::metrics::{self, EventOutcome, Measurement, SinkOutcome};
+use crate::metrics::{self, ErrorComponent, ErrorKind, EventOutcome, Measurement, SinkOutcome};
 use crate::order::OrderKeyId;
 use crate::payload::PayloadStore;
 use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError, metric_labels};
@@ -702,5 +702,17 @@ fn record_sink_call(span: &tracing::Span, outcomes: &[Outcome], elapsed: Option<
             SinkOutcome::Delivered
         };
         metrics::record(Measurement::Sink { outcome, elapsed });
+        for (kind, count) in [
+            (ErrorKind::Retryable, retryable),
+            (ErrorKind::Terminal, terminal),
+        ] {
+            if count > 0 {
+                metrics::record(Measurement::Error {
+                    component: ErrorComponent::Sink,
+                    kind,
+                    count,
+                });
+            }
+        }
     }
 }

@@ -239,6 +239,10 @@ struct OtelRecorder {
     store_duration: Histogram<f64>,
     takeovers: Counter<u64>,
     decode_fallbacks: Counter<u64>,
+    sink_throttled: Counter<u64>,
+    store_throttled: Counter<u64>,
+    errors: Counter<u64>,
+    admin_rejected: Counter<u64>,
 }
 
 fn duration_histogram(meter: &Meter, name: &'static str) -> Histogram<f64> {
@@ -258,6 +262,10 @@ impl OtelRecorder {
             store_duration: duration_histogram(meter, "pgcdc.store.duration"),
             takeovers: meter.u64_counter("pgcdc.takeovers").build(),
             decode_fallbacks: meter.u64_counter("pgcdc.decode.fallbacks").build(),
+            sink_throttled: meter.u64_counter("pgcdc.sink.throttled").build(),
+            store_throttled: meter.u64_counter("pgcdc.store.throttled").build(),
+            errors: meter.u64_counter("pgcdc.errors").build(),
+            admin_rejected: meter.u64_counter("pgcdc.admin.rejected").build(),
         }
     }
 }
@@ -303,6 +311,26 @@ impl Recorder for OtelRecorder {
                 1,
                 &[KeyValue::new("type", Value::from(type_oid.to_string()))],
             ),
+            Measurement::SinkThrottled { reason, count } => self
+                .sink_throttled
+                .add(count, &[KeyValue::new("reason", reason.as_str())]),
+            Measurement::StoreThrottled { operation } => self
+                .store_throttled
+                .add(1, &[KeyValue::new("operation", operation.as_str())]),
+            Measurement::Error {
+                component,
+                kind,
+                count,
+            } => self.errors.add(
+                count,
+                &[
+                    KeyValue::new("component", component.as_str()),
+                    KeyValue::new("kind", kind.as_str()),
+                ],
+            ),
+            Measurement::AdminRejected { operation } => self
+                .admin_rejected
+                .add(1, &[KeyValue::new("operation", operation.as_str())]),
         }
     }
 }

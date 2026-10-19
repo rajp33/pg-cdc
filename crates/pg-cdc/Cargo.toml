@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [features]
-default = ["otel"]
+default = ["otel", "sentry"]
 otel = [
   "dep:opentelemetry",
   "dep:opentelemetry_sdk",
@@ -19,6 +19,7 @@ otel = [
   "dep:tracing-opentelemetry",
   "dep:opentelemetry-appender-tracing",
 ]
+sentry = ["dep:sentry", "dep:ureq"]
 
 [dependencies]
 anyhow.workspace = true
@@ -44,6 +45,7 @@ pg-cdc-replication.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 secrecy.workspace = true
+sentry = { workspace = true, optional = true }
 serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true
@@ -67,12 +69,14 @@ tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
 twox-hash.workspace = true
+ureq = { workspace = true, optional = true }
 webpki-roots.workspace = true
 
 [dev-dependencies]
 aws-sdk-sqs.workspace = true
 pg-cdc-testkit.workspace = true
 proptest.workspace = true
+sentry = { workspace = true, features = ["test"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = [
   "io-util",

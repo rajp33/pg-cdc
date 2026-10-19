@@ -788,6 +788,10 @@ admin:
 telemetry:
   otlp_endpoint: http://localhost:4317
   trace_sample_ratio: 0.01
+  sentry:
+    dsn: https://<public key>@<org>.ingest.sentry.io/<project>
+    environment: production
+    sample_rate: 1.0
 ```
 
 With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDENTIALS__PASSWORD`. A filesystem store is configured as `state_store: { type: filesystem, path: /var/lib/pg-cdc }`.
@@ -810,6 +814,9 @@ With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDE
 | `admin.listen` | `127.0.0.1:9187` |
 | `telemetry.otlp_endpoint` | unset (telemetry disabled) |
 | `telemetry.trace_sample_ratio` | `0.01` |
+| `telemetry.sentry.dsn` | unset (error reporting disabled; `SENTRY_DSN` is the fallback) |
+| `telemetry.sentry.environment` | unset |
+| `telemetry.sentry.sample_rate` | `1.0` |
 
 Fixed internal values:
 
@@ -896,6 +903,12 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
 | `pgcdc.takeovers` | counter | `kind` (clean, unclean; a first takeover counts as clean) |
 | `pgcdc.decode.fallbacks` | counter | `type` |
 | `pgcdc.tables_without_full_identity` | gauge | |
+| `pgcdc.sink.throttled` | counter | `reason` (throttling, kms_throttling, service_unavailable); messages SNS refused for throttling |
+| `pgcdc.store.throttled` | counter | `operation`; S3 attempts answered 503 or 429, retried ones included |
+| `pgcdc.errors` | counter | `component` (source, decoder, leader, delivery, sink, store), `kind` (retryable, terminal, timeout, unavailable, conflict, not_found, malformed) |
+| `pgcdc.admin.rejected` | counter | `operation` (redrive, discard); refused because the lane's operation queue is full |
+
+Every attribute value comes from a fixed set. A throttle counts in its `*.throttled` counter and also in `pgcdc.errors` when the failure reaches pg-cdc (a throttled SNS publish is a retryable sink error; a throttled S3 attempt only when the S3 client's retries also fail).
 
 Suggested alerts:
 
@@ -903,9 +916,18 @@ Suggested alerts:
 - the oldest parked event older than 10 minutes;
 - slot retained bytes above a threshold;
 - status update age above 30 s;
-- no active task, or more than one.
+- no active task, or more than one;
+- sustained SNS or S3 throttling;
+- any terminal error.
 
-### 17.4 Logs
+### 17.4 Error reporting
+
+- **Switching it on.** Sentry reporting is enabled when `telemetry.sentry.dsn` or `SENTRY_DSN` is set, independently of OTLP. The `sentry` cargo feature (default on) gates the dependency: `sentry` with default features off and only backtrace, contexts, tracing and the ureq transport over rustls with ring; pg-cdc installs its own panic hook.
+- **What is sent: an allowlist.** ERROR lines become events and WARN lines breadcrumbs, whose message is the call site from tracing's static metadata (`<target> at <file>:<line>`), never the logged text, so no runtime value reaches it. Fields are dropped unless allowlisted: a fixed set of numeric fields (`lane`, `attempts`, `delay_ms`, `epoch`, ...) and the labels `id`, `operation`, `kind` and `sink` when label-shaped (at most 64 of `[a-z0-9_-]`). Error strings are never sent, since provider errors can quote row values. A panic is a fatal event with a fixed message, its location and stack (function names, absolute source paths, line numbers and instruction addresses), without its payload. Of the device context only the CPU architecture is kept; the OS, Rust and trace contexts are sent. No spans or performance traces. Events carry release `pg-cdc@<version>`, the environment, `server_name` set to the holder id, and tags `pipeline` and `holder`. `sample_rate` samples error events.
+- **Privacy.** `send_default_pii` is off. A `before_send` and `before_breadcrumb` scrubber still redacts URL userinfo and secret `key=value` pairs as defense in depth.
+- **Shutdown.** The client is closed on its own thread with at most 2 s to flush, bounded by what remains of the SIGTERM budget; when the main thread unwinds from a panic, dropping the reporter allows the full 2 s. Sends time out after 5 s; the panic hook only queues its event and never flushes.
+
+### 17.5 Logs
 
 - **Logs.** `tracing` writes JSON logs with trace and span ids, and they export over OTLP when telemetry is enabled.
 - **Logs never block.** Lines go through a bounded buffer of 8,192 lines to their own writer thread; a line that does not fit is dropped. At exit the buffer is flushed for at most 1 s, and after SIGTERM only within what remains of the shutdown budget (`2 × drain_timeout + 3 s`).
