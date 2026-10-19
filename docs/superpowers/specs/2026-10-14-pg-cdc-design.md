@@ -79,7 +79,7 @@ The sink, the state store, the payload store and the Postgres connection are ada
 
 - **supabase/etl is not a good base.** It is git-only, its destination trait is shaped for warehouses, and its fixed password breaks IAM tokens.
   - Its feedback rules are adopted: the checkpoint is a commit's end LSN, recorded only once the commit's events are durable, and the keepalive's `wal_end` is acknowledged when idle.
-- **pg-cdc vendors the pgwire-replication transport** and writes its own pgoutput decoder.
+- **pg-cdc writes its own replication transport and pgoutput decoder.** The transport is a small client built on `postgres-protocol`, the message codec and SCRAM implementation behind tokio-postgres. pgwire-replication informed its design and is not vendored.
 - **Status updates keep flowing under backpressure.** pgwire-replication and SpiceAI learned this the hard way: stopping feedback while a channel is full lets `wal_sender_timeout` drop the connection.
 - **A keepalive's `wal_end` is safe to acknowledge when nothing is pending,** as in Materialize.
 
@@ -97,12 +97,12 @@ pg-cdc v1 is the change reader for Theia's [THE-526](https://linear.app/theia-vi
 
 ## 4. Success criteria
 
-1. **No committed change is lost.** Each is delivered at least once or held in the state store, as proven by the chaos tests (§18.3).
+1. **No committed change is lost.** Each is delivered at least once, held in the state store, or still retained by the slot for replay, as proven by the chaos tests (§18.3).
 2. **Per-order-key order holds** at the sink.
 3. **WAL stays bounded during a sink outage.** The slot keeps advancing once events park, so retained WAL is roughly `park_after` worth of write volume.
 4. **Throughput:** at least 5,000 events/s sustained, with p99 commit-to-acknowledgement under 1 s against a healthy SNS topic.
 5. **Handover:** a deploy handover completes in under 10 s with nothing lost.
-6. **Memory** stays within `max_inflight_bytes` plus fixed overhead, whatever the transaction size.
+6. **Memory** stays within `max_inflight_bytes` plus fixed overhead, whatever the transaction size. Parked order keys are outside this bound: each costs about 0.5 to 1 KB of lane memory while parked, bounded only by `max_parked_events` (§10.5).
 7. **Telemetry overhead:** with telemetry not configured, throughput is within 1% of a build without the `otel` feature.
 
 ## 5. Architecture
@@ -133,9 +133,9 @@ admin HTTP: /healthz /readyz /status /parked
 **Workspace**
 
 - `crates/decoder` (package `pg-cdc-decoder`): a pure, fuzzed decoder for pgoutput messages and Postgres text values. The name avoids the unrelated `pgoutput` crate on crates.io.
-- `crates/replication` (package `pg-cdc-replication`): the vendored pgwire-replication transport (MIT/Apache-2.0).
-  - It is renamed so it can't clash with the published crate.
-  - It is patched only to expose the backend PID.
+- `crates/replication` (package `pg-cdc-replication`): the replication transport.
+  - It covers startup, TLS, authentication (cleartext, MD5 and SCRAM-SHA-256), `START_REPLICATION`, and standby status updates on its own timer.
+  - It exposes the walsender's backend PID from BackendKeyData.
 - `crates/pg-cdc`: the binary and library.
 - `crates/loadgen`: a load generator, not shipped.
 
@@ -159,6 +159,7 @@ admin HTTP: /healthz /readyz /status /parked
   - `bytea_output=hex`.
 
   This makes value text deterministic and the same as a default `to_jsonb` session.
+- **UTF-8 on the wire.** The replication startup packet also sends `client_encoding=UTF8`, which overrides any role or database default, and the connection fails unless the server's `ParameterStatus` reports `UTF8`. pgoutput converts tuple text and identifiers to the client encoding, and both are decoded strictly as UTF-8.
 - **Control connection.** A regular `tokio-postgres` connection over rustls carries catalog lookups, lease checks, slot metrics and standby polling. Metadata never goes over the replication connection, because some Aurora versions reject `SHOW` there.
 - **Parameters.** Both connections take their parameters from the ConnectionProvider before every attempt (§11.7).
 - **Direct connections only.** Both connect directly to the database endpoint: RDS Proxy rejects replication connections, and poolers cannot mint IAM tokens.
@@ -177,7 +178,7 @@ admin HTTP: /healthz /readyz /status /parked
 - **Primary key.** It comes from the catalog over the control connection: `pg_index.indisprimary`, in index column order.
   - Without one, the replica-identity index (`indisreplident`) is used; otherwise the relation has no key.
   - Keys are cached per relation OID and refreshed when a new Relation message for that OID arrives.
-- **Non-built-in types.** Enums, domains, arrays, composites, ranges and custom types are resolved from `pg_type` over the control connection and cached for the life of the process.
+- **Non-built-in types.** Enums, domains, arrays, composites, ranges and custom types are resolved from `pg_type` over the control connection and cached for the life of a connection, like relations (D4).
 
 ### 6.4 Value mapping
 
@@ -259,7 +260,7 @@ The xid is left out of the envelope: it is 32 bits and wraps, and `commit_lsn` a
   - it is unique within a pipeline;
   - it is identical on every replay of the same WAL;
   - lexicographic order equals stream order;
-  - it is a valid SNS FIFO deduplication id.
+  - prefixed with the pipeline name and `:`, it is a valid SNS FIFO deduplication id (§11.2).
 - **Change publications only when caught up.** If the publication's table list changes while transactions are still unacknowledged, those transactions can get different ordinals on replay.
 
 ### 7.3 Key and order key
@@ -291,7 +292,7 @@ A truncate produces one event per truncated relation, with `key`, `before` and `
 
 When the encoded message (body plus attributes) exceeds the sink's `max_message_bytes`:
 
-- **With a PayloadStore,** the full envelope is stored there, and the sink receives a pointer event instead. The pointer is the same envelope without `before`, `after` and `unchanged_toast`, plus `"payload_ref": { "uri": "s3://bucket/prefix/payloads/<id>.json", "bytes": 912345 }`.
+- **With a PayloadStore,** the full envelope is stored there, and the sink receives a pointer event instead. The pointer is the same envelope without `before`, `after` and `unchanged_toast`, plus `"payload_ref": { "uri": "s3://<bucket>/<prefix>/<pipeline>/payloads/<id>.json", "bytes": 912345 }`.
 - **Without a PayloadStore,** the event is terminal and is parked as `dead` (§10.4).
 
 ## 8. Ordering and lanes
@@ -300,7 +301,7 @@ When the encoded message (body plus attributes) exceeds the sink's `max_message_
 - **Lanes own their keys.** A lane holds the per-key queues, retry timers, parked state and batching for its order keys, so per-key state needs no locks.
 - **One event per key in flight.** At most one event per order key is in flight, and a batch holds at most one event per order key.
 - **Batching.** Batches are filled from ready keys up to the sink's message and byte limits, lingering up to 5 ms when not full.
-- **Retries don't block the lane.** A key whose head is waiting on a retry is not ready, and the lane's other keys keep flowing.
+- **Retries don't block the lane.** A key whose head is waiting on a retry is not ready, and the lane's other keys keep flowing. Store calls do block it: parking, head loading, removals and admin operations run inside the lane, so the lane sends nothing while it waits on the store (a v1 limit).
 - **Per-key throughput.** One key moves at most one event per sink round trip, roughly 20–50 events/s for SNS. `order_by: pipeline` therefore trades throughput for total order.
 
 ## 9. Delivery and acknowledgement
@@ -313,6 +314,7 @@ When the encoded message (body plus attributes) exceeds the sink's `max_message_
 ### 9.2 Confirmed LSN
 
 - **The ack tracker** keeps transactions in commit order, each with a count of unsettled events.
+- **Settled runs collapse.** Consecutive settled transactions behind an unsettled one merge into one entry that keeps only the last end LSN, so the tracker holds at most about two entries per unsettled transaction, however many later transactions settle.
 - **The confirmed LSN** is the end LSN of the last transaction in the unbroken run of settled transactions at the front of that list.
 - **Starting value.** When streaming starts, the confirmed LSN starts at the slot's `confirmed_flush_lsn`, so pg-cdc never reports a lower position.
 - **When idle,** with no unsettled events and no open transaction, the confirmed LSN advances to the latest keepalive `wal_end`. This keeps the slot moving while the publication is quiet.
@@ -369,16 +371,18 @@ A retryable outcome puts the event's order key into exponential backoff with ful
 
 Short of a halt (§10.7) or a lost slot (§13.3), only two conditions stall the pipeline:
 
-- **The parked limit.** `delivery.max_parked_events` defaults to 10,000,000, and 0 means unlimited. At the limit no more events park, so undeliverable events stay in flight until backpressure stalls the reader.
+- **The parked limit.** `delivery.max_parked_events` defaults to 10,000,000, and 0 means unlimited. At the limit no more events park, so undeliverable events stay in flight until backpressure stalls the reader. Nothing parks until startup has counted the parked queues of every partition, since an uncounted partition may already hold events; until then events stay in flight, and a partition whose count keeps failing keeps parking off. Lanes reserve room in the shared count before they write, so together they never park past the limit. The count can run high but never low: an event replayed after a restart while its parked copy is still stored, or a write that fails after landing part of a queue, can hold a second unit until that key's parked queue drains, when the key's units are reconciled against an empty store. A key whose backlog is larger than the room left parks its oldest events that fit and keeps the rest in flight, in order, until room frees.
 - **The StateStore is unavailable.** Events cannot park, and the pipeline stalls the same way.
+
+Memory is a third limit. Each order key with a parked queue keeps about 0.5 to 1 KB of lane state in memory while it is parked, and a takeover loads every parked queue's head before delivering, so `max_inflight_bytes` does not bound it. Only `max_parked_events` does, since each parked key holds at least one event; the task needs about `max_parked_events` x 1 KB on top of `max_inflight_bytes`, or a lower `max_parked_events`.
 
 ### 10.6 Startup and takeover
 
 - **Reading starts at once.** Reading and decoding begin as soon as the slot is acquired.
-- **Heads load per partition.** Parked queue heads load one partition at a time, with 256 partitions keyed by the first byte of the order key id. Store calls are bounded by `state_store.max_concurrency`.
+- **Heads load per partition.** Parked queue heads load by partition, with 256 partitions keyed by the first byte of the order key id, up to `state_store.max_concurrency` partitions at once, so a takeover starts with a burst of up to that many listings. Store calls are bounded by `state_store.max_concurrency`.
 - **Delivery waits for its partition.** Delivery for an order key starts only once its partition has loaded, so no live event can overtake a parked one.
 - **Replayed events for parked keys.**
-  - A replayed event with an id below its queue's head settled before the restart, so it is skipped.
+  - A replayed event with an id below its queue's head settled before the restart, so it is skipped. This relies on appends never leaving a gap below a queue's head (§11.3, item 8).
   - Any other event for a parked key is appended. Appends are create-only, so an event already in the queue is not duplicated.
 
 ### 10.7 Decode faults are never parked
@@ -396,6 +400,7 @@ Each adapter is an object-safe async trait (`async-trait`), selected by `type` i
 ```rust
 #[async_trait]
 pub trait Sink: Send + Sync {
+    fn name(&self) -> &'static str { "custom" }
     fn capabilities(&self) -> SinkCapabilities;
     async fn preflight(&self) -> Result<(), SinkError>;
     async fn send(&self, batch: &[Outbound]) -> Vec<Outcome>;
@@ -428,6 +433,7 @@ Contract:
 - **No sink-side retries.** The sink neither retries nor backs off; the pipeline does. SDK-level retries are disabled.
 - **`preflight` gates health.** It runs at startup and must succeed before the task reports healthy. `capabilities` is valid only after it has run.
 - **Encoding is shared.** The pipeline encodes envelopes and attributes, so every sink receives the same body.
+- **`name` labels telemetry.** It is the `sink` attribute of the batch-send span (§17.2). The provided method returns `"custom"`; the v1 sinks return `"sns"`, `"stdout"` and `"discard"`, and a wrapper returns its inner sink's name.
 
 v1 sinks:
 
@@ -448,12 +454,14 @@ v1 sinks:
   - a failed entry with `SenderFault=false` is `Retryable`;
   - request-level failures (throttling, 5xx, timeouts, connection or credential errors, a missing topic) make every entry `Retryable`.
 - **FIFO topics.**
-  - `MessageGroupId` is the order key id, and `MessageDeduplicationId` is the event id.
+  - `MessageGroupId` is the order key id, and `MessageDeduplicationId` is `<pipeline>:<event id>`, at most 89 characters. SNS deduplicates across the whole topic, so pipelines sharing a FIFO topic need distinct `pipeline` names; the same event gets the same id on every replay and after every takeover.
   - SNS FIFO allows 300 messages/s per group and 3,000/s per topic by default, and more in high-throughput mode.
 - **Standard topics.** There is no group id, unless `sink.fair_queue_group: column:<name>` sets one from that column for SQS fair queues. The column must also be listed in `attribute_columns`.
 - **Message attributes.**
   - Every message carries `schema`, `table` and `op`, plus one attribute per column in `sink.attribute_columns`.
   - A column's value comes from `after`, or from `before` when there is no `after`. It is sent as String or Number and omitted when null.
+  - A number is sent as Number only from -10^9 to 10^9 with at most 5 fractional digits, which is what SNS accepts; any other number, including exponent form, is sent as String with its exact text, never rounded.
+  - A String value containing a character SNS and SQS reject (anything outside #x9, #xA, #xD, #x20–#xD7FF, #xE000–#xFFFD and #x10000–#x10FFFF) is omitted like a null, with a warning.
   - SNS allows 10 attributes per message.
 
 ### 11.3 StateStore
@@ -463,7 +471,10 @@ v1 sinks:
 pub trait StateStore: Send + Sync {
     async fn append_parked(&self, events: &[ParkedEvent]) -> Result<(), StoreError>;
     async fn load_parked_heads(&self, partition: u8) -> Result<Vec<ParkedHead>, StoreError>;
+    async fn list_parked_queues(&self, after: Option<&OrderKeyId>, limit: usize, length_cap: usize) -> Result<ParkedQueues, StoreError>;
     async fn read_parked(&self, key: &OrderKeyId, after: Option<&EventId>, limit: usize) -> Result<Vec<ParkedEvent>, StoreError>;
+    async fn read_parked_within(&self, key: &OrderKeyId, after: Option<&EventId>, limit: usize, max_bytes: u64) -> Result<ParkedSlice, StoreError>;
+    async fn read_parked_summary(&self, key: &OrderKeyId) -> Result<Option<ParkedSummary>, StoreError>;
     async fn set_parked_status(&self, key: &OrderKeyId, id: &EventId, status: ParkStatus) -> Result<(), StoreError>;
     async fn remove_parked(&self, events: &[(OrderKeyId, EventId)]) -> Result<(), StoreError>;
     async fn read_leader(&self) -> Result<Option<Versioned<LeaderRecord>>, StoreError>;
@@ -475,6 +486,9 @@ The types:
 
 - `ParkedEvent` holds the order key id, event id, status (`retrying` or `dead`), attempts, first failure time, last error and the encoded envelope.
 - `ParkedHead` holds the order key id, head event id and queue length.
+- `ParkedQueues` holds a page of `ParkedHead`s and `next`, the order key id to continue after when more queues may follow.
+- `ParkedSlice` holds entries, each a loaded `ParkedEvent` or a withheld event's id and stored size, and `full`, set when the read stopped before an event because loading it would pass `max_bytes`.
+- `ParkedSummary` holds a queue head's id, status, attempts, first failure time and last error, without its attributes or envelope, and `last_error_cut`, set when the last error was cut.
 - `LeaderRecord` holds the epoch, holder, state (`active` or `released`), confirmed LSN and update time.
 
 Contract, checked by a shared conformance suite that every adapter must pass:
@@ -485,24 +499,38 @@ Contract, checked by a shared conformance suite that every adapter must pass:
 4. `read_parked` returns events in ascending id order, and `load_parked_heads` returns each queue's lowest id.
 5. `remove_parked` of a missing event succeeds.
 6. `swap_leader` is an atomic compare-and-swap, and `expected: None` means create-if-absent.
-7. Concurrent calls are safe. pg-cdc bounds them with `state_store.max_concurrency` (default 32) and backs off on throttling.
+7. Concurrent calls are safe. pg-cdc bounds them with `state_store.max_concurrency` (default 256) and backs off on throttling.
+8. `append_parked` lands each order key's events in id order. If it fails or is cancelled, the events it stored for each key are a prefix of that key's events in the call, so a queue never has a gap below its head. An event that cannot be encoded fails the call before anything is written. The suite checks the encoding rule; each adapter's own tests check the prefix rule by injecting a fault in the middle of a key's events.
+9. `list_parked_queues` returns the queues whose order key id is above `after`, in ascending order key id order, at most `limit` of them, each with its lowest id as the head and its length capped at `length_cap`; a key with no events is not listed. On S3 its work is bounded by the page, `limit` queues of at most `length_cap` events each, whatever other queues hold; the filesystem store scans directories instead (§11.5). Startup keeps using `load_parked_heads` (§10.6); `list_parked_queues` serves the admin API (§16.2).
+10. `read_parked_within` walks a queue's events above `after` in ascending id order, at most `limit` of them, and loads an event only while the stored sizes it has loaded stay within `max_bytes`. An event larger than `max_bytes` on its own is returned withheld, with its id and stored size, without loading it; the walk stops, with `full` set, before an event that would take the loaded total past `max_bytes`. It serves the admin API's queue inspection (§16.2), so inspecting large parked envelopes holds a bounded amount of memory.
+11. `read_parked_summary` returns the summary of a queue's lowest-id event, or `None` for a key with no events, reading at most the first 8 KiB of the stored event. The stored layout puts the id, status, attempts, first failure time and last error before the attributes and envelope, so the summary never loads the envelope; a last error that does not fit in those 8 KiB is cut on a character boundary and `last_error_cut` is set. It serves the admin API's queue listing (§16.2).
+12. `set_parked_status` rewrites only the version of the event it read. An event that is gone returns `NotFound` and is never recreated, and one that changed since it was read returns `Conflict`, so a status rewrite that lands late never brings back a removed event. On either error the owning lane reloads that key's head from the store instead of retrying the rewrite; a redrive that meets either answers like a head that is still loading.
 
 ### 11.4 S3 StateStore
 
-- **Parked events** live at `<prefix>/<pipeline>/parked/<order key id>/<event id>.json`. They are written with `If-None-Match: *`, so a 412 means the object already exists and counts as success.
+- **Parked events** live at `<prefix>/<pipeline>/parked/<order key id>/<event id>.json`. They are written with `If-None-Match: *`, so a 412 means the object already exists and counts as success. One append writes each order key's events one at a time in id order and stops that key at its first failure; different keys are written in parallel.
 - **`load_parked_heads(p)`** lists the `parked/<pp>` prefix, where `pp` is the partition as two hex digits. The first object under each key is its head.
+- **`list_parked_queues`** lists the `parked/` prefix with delimiter `/` and `StartAfter` past `after`'s objects, so each key is one common prefix, then lists each returned key's prefix up to `length_cap` objects (one page when `length_cap` is at most 1,000), under the store's concurrency bound.
 - **`read_parked`** lists with `StartAfter`, then fetches each object.
-- **A status change** rewrites the object; only the owning lane writes it.
+- **`read_parked_within`** takes each object's size from the same listing and fetches only the objects it loads.
+- **`read_parked_summary`** lists the key's prefix with `MaxKeys` 1 and fetches the head object with `Range: bytes=0-8191`, reading no more than that even from a server that ignores the range.
+- **Read-ahead.** A read from the head of a queue (`after` empty, `limit` at most 1,000) lists one page of up to 1,000 ids, keeps them in memory and fetches only the first `limit`; the next reads from the head fetch the kept ids by name without listing, so draining a key costs one `ListObjectsV2` per 1,000 events instead of one per event. Successful removals drop their ids, and when a key's ids run out the next read lists again, which finds events appended since. The read-ahead never answers that a queue is empty: only a fresh listing does. If a kept id's object is gone, the key's ids are dropped and the read falls back to a fresh listing. An append below a kept id drops that key's ids. Every `swap_leader` call empties the read-ahead, so each leadership claim starts with nothing kept, and a listing that began before the claim is not kept. At most 100,000 ids are kept in all (about 2 MiB); filling past that drops other keys' ids. The read-ahead relies on the owning lane being the only writer of its keys' queues (§12), and on appends landing above a queue's stored ids (§11.3, item 8; §10.6).
+- **`remove_parked`** sends `DeleteObjects` in quiet mode, at most 1,000 objects per request, the requests in parallel under the concurrency bound. A missing object counts as deleted, as item 5 requires; any per-object error in the reply fails the whole call, and the lane retries it with backoff without sending the events again.
+- **A status change** reads the object with its ETag and rewrites it with `If-Match: <etag>`; a 412 is `Conflict` and a 404 is `NotFound` (§11.3, item 12). ETags are content hashes, so a rewrite that finds the object changed and then changed back to the same bytes still lands.
 - **The leader record** lives at `<prefix>/<pipeline>/leader.json`. It is changed with `If-Match: <etag>` and created with `If-None-Match: *`.
-- **Throttling.** `503 SlowDown` and other 5xx responses are retried with backoff.
+- **Throttling.** `503 SlowDown` and other 5xx responses are retried with backoff. When throttling outlasts the client's 3 attempts, the call fails as unavailable and the lane retries it with its store backoff (100 ms to 30 s): an event that cannot park stays in flight and holds its WAL, a delivered head whose removal fails is not sent again, and the process keeps running.
 - **Encryption.** Parked objects hold row data, so the bucket should use default encryption (SSE-KMS).
 
 ### 11.5 Filesystem StateStore
 
 - **Layout.** The same tree lives under `state_store.path`.
 - **Append** writes a temp file, fsyncs it, then `link()`s it to the final name, which fails if that name exists and so gives create-only semantics. It then fsyncs the directory.
+- **Missing directories are created durably.** The first write of each process creates `state_store.path`, the pipeline directory and any missing ancestors, then fsyncs every ancestor of the pipeline directory up to `/`, whether or not it already existed, so directories a previous process created but never synced become durable too. The walk runs over the canonical location the kernel resolved the created path to, so a relative path, a `..` component or a symlink is followed exactly as the writes follow it, and the walk reaches `/`. An ancestor that cannot be opened or fsynced, for example one the service user cannot read, fails the write as unavailable with that path and the OS error; it is never skipped, since a directory entry is durable only once its parent is fsynced. Until the walk succeeds, every write repeats it.
 - **The leader compare-and-swap** runs under an exclusive lock on `leader.lock`, with the version stored in the record.
+- **Status changes and removals** each hold an exclusive lock on the key directory, checked after locking to still be the directory at that path, so no two of them on one key ever interleave and a status change never brings back a removed event (§11.3, item 12). Only a lock holder removes a key directory, so the path cannot be replaced while the lock is held. Locks are tried without blocking and retried with backoff for at most 2 s, checking the deadline and cancellation on every retry. A key still locked after that, for example by a paused predecessor, fails the call as unavailable, and the lane retries it with its store backoff; a removal still removes the other keys' events in the same call.
+- **Temp files do not leak.** A write whose temp file fails to write or fsync deletes it before returning the error. Temp files a crash leaves behind are reclaimed: the leader compare-and-swap deletes any beside the record while it holds `leader.lock`, and loading a partition's heads, which only the holder of the leader record does, deletes those in its queue directories last modified more than an hour ago. A write in progress, the holder's own or a fenced predecessor's, loses its temp file only if it stalled for over an hour; its `link()` or `rename()` then fails, so the write reports an error and is retried, and never reports success for an event it did not store.
 - **Single host only.** Active/standby across hosts needs S3, or the later Postgres store.
+- **Listings scan directories.** A directory has no order, so finding a queue's head reads all of its entries; listing and reads keep only the page they return in memory and stop at the next entry once cancelled.
 
 ### 11.6 PayloadStore
 
@@ -538,7 +566,7 @@ pub struct ConnectParams {
 }
 ```
 
-- **Called before every connection attempt,** replication and control alike. The core knows nothing about IAM or Aurora.
+- **Called before every connection attempt,** replication and control alike. That includes the replication login check and every `START_REPLICATION` attempt a standby makes once the slot frees, so a standby that has waited longer than a token's lifetime still presents a fresh one. The core knows nothing about IAM or Aurora.
 - **Failover handling is generic.** A dropped connection backs off (1 s to 30 s, full jitter), calls `params()` again, re-resolves DNS and reconnects.
 - **v1 providers:**
   - `password`: static, with the password taken from the environment only;
@@ -571,7 +599,7 @@ A task moves from `standby` to `active` to `draining`. The slot is the lock, bec
 1. **Acquire the slot.** Start the status task and the reader immediately.
 2. **Read the leader record.**
    - If it is `released`, continue at once.
-   - If it is `active`, the previous holder did not release cleanly. Wait `fence_delay` (10 s, longer than `lease_timeout`) before any sink or store write.
+   - If it is `active`, the previous holder did not release cleanly. Wait `fence_delay` (16 s: longer than `lease_timeout`, and with an S3 state store at least `lease_timeout` plus the S3 attempt timeout) before any sink or store write.
 3. **Claim leadership.** Swap the record to `{epoch: previous + 1, holder: self, state: active}`.
    - If the swap fails, another writer is active: release the slot, return to standby and raise an alert.
 4. **Start delivery.** Load the parked heads and enable delivery partition by partition (§10.6).
@@ -580,8 +608,8 @@ A task moves from `standby` to `active` to `draining`. The slot is the lock, bec
 
 1. Stop reading the socket.
 2. Give in-flight events `drain_timeout` (5 s) to deliver, then park whatever remains.
-3. Send a final status update.
-4. Swap the leader record to `released`, with the confirmed LSN.
+3. Send a final status update. If it cannot be sent, the leader record stays `active` and the next holder waits `fence_delay`.
+4. Swap the leader record to `released`, with the confirmed LSN. If the swap does not finish in time, it may still have landed, so the record is either `active` or `released`; the next holder reads it and waits `fence_delay` only if it is still `active`.
 5. Close the replication connection and exit 0.
 
 The new task's gap is the drain plus one poll, about 2–7 s. A transaction still open at handover replays to the new task with the same ids.
@@ -603,6 +631,8 @@ The new task's gap is the drain plus one poll, about 2–7 s. A transaction stil
 
 A process paused for longer than `fence_delay` can land stale writes when it resumes. The result is duplicates, never loss.
 
+A store write already on the wire when its task fences can still commit after the future is dropped. A self-fenced task stops issuing writes at most `lease_timeout` after its last good lease check, and the S3 client gives up an attempt after 10 s, so with an S3 state store `fence_delay` must be at least `lease_timeout` plus that attempt timeout. That bounds the old holder's own client-side attempts; it cannot recall a request S3 has already received, which S3 may still apply later. A late status rewrite is rejected if the event was removed or changed meanwhile (§11.3, item 12). A late append can still land: the result is a possible duplicate and, rarely, a per-key reorder, when it lands after the successor listed that key's partition and the orphaned queue head is redelivered after newer events of the key at the next takeover.
+
 ## 13. Slot and source safety
 
 ### 13.1 Operator setup
@@ -623,6 +653,7 @@ GRANT rds_iam TO pgcdc;
 - **Self-managed Postgres:** `ALTER ROLE pgcdc REPLICATION` replaces `rds_replication`, and `rds_iam` does not apply.
 - **Aurora:** it also needs `rds.logical_replication=1`, which requires a writer reboot. IAM on replication connections additionally needs `rds.iam_auth_for_replication=1`.
 - **Table privileges:** streaming changes needs none.
+- **A spare WAL sender.** Startup validation briefly opens a replication connection (§13.2), so `max_wal_senders` needs one sender free beyond those in use while a task starts. With none free, the check fails with SQLSTATE 53300, and the new task stays unhealthy and retries until a sender frees.
 
 ### 13.2 Startup validation
 
@@ -632,16 +663,19 @@ At process start, in any role, pg-cdc checks over the control connection that:
 - the slot exists, uses `pgoutput`, belongs to the configured database, and has a `wal_status` other than `lost`;
 - the publication exists.
 
+It then opens a replication connection and closes it without `START_REPLICATION`, to check that the role can log in for replication.
+
 On failure:
 
 - **The task stays unhealthy and retries with backoff.** A misconfigured new task never takes over, and a start-first deploy keeps the old task running.
 - **A `wal_status` of `unreserved` doesn't block.** It logs an error and raises an alert.
+- **A refused replication login is a failure.** SQLSTATE class 28, SQLSTATE 42501 or an authentication method pg-cdc cannot use fails validation, and so does the same refusal when `START_REPLICATION`'s connection opens. Other connection errors retry without changing health.
 
 ### 13.3 Slot loss
 
 - **What happens.** If the slot is missing or invalidated, streaming stops and the task turns unhealthy and alerts. pg-cdc never recreates a slot.
   - Invalidation comes from `max_slot_wal_keep_size`, or from `idle_replication_slot_timeout` on Postgres 18.
-- **Recovery.** An operator recreates the slot (§13.1). Changes made between the loss and the recreation are not captured; backfills (§20) will close that gap.
+- **Recovery.** An operator recreates the slot (§13.1). The transactions committed after the confirmed position and up to the new slot's starting position are potentially missing: some may have been delivered or parked, since an earlier transaction still in flight holds the confirmed position back, but none can be replayed. Backfills (§20) will close that gap; until then consumers dedupe what reconciliation resends by event id. The gap is bounded by LSNs: the start is the slot's `confirmed_flush_lsn` if the slot is still visible, otherwise the `confirmed_lsn` of the latest `confirmed position` line (logged at info at most once a minute), and an older value only widens the gap safely. Commit times cannot bound it, since they are not ordered by LSN. Without a trustworthy LSN, or without a way to find the rows a range of transactions touched, the operator reconciles the published tables in full. Parked events are kept and drain after the recreation.
 - **Aurora.** Whether logical slots survive a writer failover is not documented, and an AWS post (2026-08-12) says they must be recreated. This must be tested in staging before production.
   - If the slot survives, pg-cdc reconnects through the cluster endpoint and resumes.
   - If it does not, the path above applies.
@@ -654,7 +688,7 @@ Each invariant has an enforcement mechanism listed in §14.6. A runtime violatio
 
 - **D1. The message set is closed.** Only protocol version 1 is negotiated, with none of its optional features (§6.2), and the decoder handles every message in that set.
 - **D2. Value decoding is total.** Every type OID maps to typed JSON, or to its Postgres text form as a string.
-  - If a known type fails to parse, the text form is emitted, and `decode_fallback_total` and an error log record it.
+  - If a known type fails to parse, the text form is emitted, and the `pgcdc.decode.fallbacks` counter and an error log record it.
   - No value is dropped.
 - **D3. Malformed input is a transport fault.** Malformed bytes, an unknown message tag, or a tuple of the wrong shape triggers a reconnect and a replay from the confirmed LSN.
   - Three consecutive faults at the same LSN halt the pipeline; it never skips.
@@ -668,7 +702,7 @@ Each invariant has an enforcement mechanism listed in §14.6. A runtime violatio
 
 ### 14.3 Acknowledgement
 
-- **A1. Only delivery or parking settles an event.** The type that marks an event settled can only be built from those two results, so no code path can skip an event and still acknowledge it.
+- **A1. Only delivery or parking settles an event.** The type that marks an event settled can only be built from those two results, so no code path can skip an event and still acknowledge it. The one skip is a replayed event below its parked queue's head (§10.6), which delivery or parking already settled before the restart; it settles only with proof that its id is below the stored head.
 - **A2. The confirmed LSN is safe.** It never decreases, and never passes the end LSN of a transaction with an unsettled event.
 - **A3. Keepalive positions are acknowledged only when idle,** meaning no event is unsettled and no transaction is open.
 - **A4. Status updates are independent.** One is sent at least every `status_interval`, whatever the reader, sink and store are doing.
@@ -690,10 +724,10 @@ Each invariant has an enforcement mechanism listed in §14.6. A runtime violatio
 | Mechanism | Covers |
 |---|---|
 | Property tests on the ack tracker with random settle orders | A2, A3 |
-| Model-based property tests of lanes and parking, with random failures, restarts and operator actions | O2, O3, A1 |
+| Model-based property tests of lanes and parking, with random failures, appends that store only a prefix, clean restarts, crashes in the middle of a park, and operator actions | O2, O3, A1 |
 | Fuzzing the decoder, which must never panic | D1–D3 |
 | `to_jsonb` reference tests over every built-in type | D2 |
-| Chaos integration tests: SIGKILL at random points, sink and store faults, dropped connections and takeovers. A checker verifies every change was delivered at least once and per-key order held. | O1–O3, A1–A4, L1–L3 |
+| Chaos integration tests: SIGKILL at random points, sink and store faults, dropped connections and takeovers. A checker verifies every change was delivered at least once, is still parked or is still retained by the slot, and that per-key order held. | O1–O3, A1–A4, L1–L3 |
 | A settled event can only be constructed from a delivery or a park | A1 |
 | Runtime checks with fail-stop | A2, O2 |
 
@@ -736,7 +770,7 @@ state_store:
   type: s3
   bucket: pgcdc-state
   prefix: orders/
-  max_concurrency: 32
+  max_concurrency: 256
 
 payload_store:
   type: s3
@@ -745,7 +779,7 @@ payload_store:
 
 leadership:
   lease_timeout: 6s
-  fence_delay: 10s
+  fence_delay: 16s
   drain_timeout: 5s
 
 admin:
@@ -769,9 +803,9 @@ With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDE
 | `delivery.max_parked_events` | `10000000` (`0` = unlimited) |
 | `delivery.max_inflight_bytes` | `256MiB` |
 | `sink.max_concurrency` | `32` |
-| `state_store.max_concurrency` | `32` |
+| `state_store.max_concurrency` | `256` |
 | `leadership.lease_timeout` | `6s` |
-| `leadership.fence_delay` | `10s` |
+| `leadership.fence_delay` | `16s` |
 | `leadership.drain_timeout` | `5s` |
 | `admin.listen` | `127.0.0.1:9187` |
 | `telemetry.otlp_endpoint` | unset (telemetry disabled) |
@@ -780,12 +814,13 @@ With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDE
 Fixed internal values:
 
 - standby poll and lease check: every 2 s;
+- control queries before the slot is acquired (catalog validation, standby poll, start position): 10 s timeout;
 - batch linger: 5 ms;
 - sink retry backoff: 100 ms to 30 s;
 - reconnect backoff: 1 s to 30 s;
 - decode fault halt: 3 consecutive faults.
 
-`fence_delay` must be greater than `lease_timeout`; config validation enforces it.
+`fence_delay` must be greater than `lease_timeout`, and with an S3 state store at least `lease_timeout` plus the S3 client's 10 s attempt timeout; config validation enforces both.
 
 ## 16. CLI and admin API
 
@@ -808,13 +843,15 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
 | `GET /healthz` | 200 when startup validation (§13.2), sink preflight and the store check pass, and, for an active task, the lease is valid |
 | `GET /readyz` | 200 only when active and streaming |
 | `GET /status` | Role, epoch, slot, confirmed LSN, in-flight counts, parked and dead counts, and time since the last status update |
-| `GET /parked` | Parked queues with head id, head status, length and last error, filterable by status |
-| `GET /parked/{order_key_id}` | The events in one queue |
+| `GET /parked` | Parked queues with head id, head status, attempts, first failure, length and last error, filterable by status, paged with `limit` (default 100, at most 1,000) and `after`; `length` is capped at 1,000 and `length_capped` marks a queue at least that long. Each head is read with `read_parked_summary`, so a listing never loads an envelope; a last error cut to fit is marked `last_error_cut` |
+| `GET /parked/{order_key_id}` | The events in one queue, paged with `limit` and `after` and at most 8 MiB of stored events per page; an event larger than that is listed with its id and size but not its envelope |
 | `POST /parked/{order_key_id}/redrive` | Mark the dead head retrying again |
 | `POST /parked/{order_key_id}/discard?id=<event id>` | Remove the head, only if it still has that id |
 
+- **Inspections share a memory budget.** At most two listings and queue pages are read at once; others wait their turn within the 30 s budget. Each holds its turn from before its first store read until its reply has been sent or its connection has closed, so clients that stop reading cannot pile up replies.
 - **No races with delivery.** Parked operations run inside the owning lane.
 - **Standbys refuse them.** A standby answers with 409 and the current holder from the leader record.
+- **Only the active holder answers.** Every parked endpoint answers 409 unless this task holds claimed lanes, so a task waiting `fence_delay`, a draining task and a fenced task refuse too; the body carries `role`, and `holder`, `leader_state` and `epoch` from the leader record. Before the state store is ready the endpoints answer 503 (`pg-cdc is starting`), and an operation that outlives 30 s answers 504, since it may still complete. Each lane queues at most 16 redrive and discard requests and answers 503 with `Retry-After: 1` past that; it runs at most 4 between deliveries and skips one whose requester has gone.
 
 ## 17. Observability
 
@@ -828,7 +865,7 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
   - Logs go to stdout as JSON at INFO.
 - **The `otel` cargo feature** (default on) gates every OpenTelemetry dependency. A build without it is the baseline for criterion 7 (§4).
 - **When enabled:**
-  - Traces, metrics and logs export over OTLP, using gRPC by default.
+  - Traces, metrics and logs export over OTLP/gRPC, the only transport.
   - Head sampling uses `telemetry.trace_sample_ratio`: default 0.01, and 1.0 for load tests.
 
 ### 17.2 Spans
@@ -856,7 +893,7 @@ The admin API binds to `admin.listen` (default `127.0.0.1:9187`). It has no auth
 | `pgcdc.status_update.age` | gauge (s) | |
 | `pgcdc.role` | gauge | 0 standby, 1 active, 2 draining |
 | `pgcdc.leader.epoch` | gauge | |
-| `pgcdc.takeovers` | counter | `kind` (clean, unclean) |
+| `pgcdc.takeovers` | counter | `kind` (clean, unclean; a first takeover counts as clean) |
 | `pgcdc.decode.fallbacks` | counter | `type` |
 | `pgcdc.tables_without_full_identity` | gauge | |
 
@@ -868,10 +905,10 @@ Suggested alerts:
 - status update age above 30 s;
 - no active task, or more than one.
 
-### 17.4 Logs and profiles
+### 17.4 Logs
 
 - **Logs.** `tracing` writes JSON logs with trace and span ids, and they export over OTLP when telemetry is enabled.
-- **Profiles.** An optional `pprof` build feature, off by default, serves CPU profiles on the admin port for load tests.
+- **Logs never block.** Lines go through a bounded buffer of 8,192 lines to their own writer thread; a line that does not fit is dropped. At exit the buffer is flushed for at most 1 s, and after SIGTERM only within what remains of the shutdown budget (`2 × drain_timeout + 3 s`).
 
 ## 18. Testing
 
@@ -887,7 +924,7 @@ Suggested alerts:
 The integration tests use testcontainers:
 
 - Postgres 14, 15, 16, 17 and 18 with `wal_level=logical`;
-- LocalStack for SNS, SQS and S3, reading delivered messages back through an SQS subscription.
+- moto for SNS, SQS and S3, reading delivered messages back through an SQS subscription.
 
 They cover:
 
@@ -903,15 +940,15 @@ The harness:
 
 1. writes a known workload;
 2. SIGKILLs pg-cdc at random points;
-3. injects sink and store faults through a `chaos` wrapper;
+3. injects sink and store faults through a `chaos` wrapper: a fault-injecting proxy in front of the sink and store endpoints;
 4. drops connections;
 5. runs clean and crash takeovers between two instances.
 
-A checker then asserts that every committed change was either delivered at least once or is still in the store, and that per-key order held.
+A checker then asserts that every committed change was delivered at least once, is still in the store, or is still retained by the slot, and that per-key order held. A change is retained when its transaction lies at or past the slot's confirmed position, so the next start replays it. The settle phase after the chaos is bounded, so a backlog still draining at its end is checked where it is rather than waited for.
 
 ### 18.4 Conformance
 
-- **StateStore suite:** run against the filesystem store locally, and against the S3 store on LocalStack or MinIO.
+- **StateStore suite:** run against the filesystem and memory stores locally, and against the S3 store on moto.
 - **Sink suite:** outcome classification and batch limits.
 
 ### 18.5 Load
@@ -939,7 +976,7 @@ GitHub Actions runs:
 Each milestone ends in working, tested software and gets its own implementation plan.
 
 1. **Stream.**
-   - Build: the workspace, the vendored transport, the ConnectionProvider (`password`, `aws_rds_iam`), the decoder and value mapping (with fixtures, fuzzing and `to_jsonb` tests), the envelope, and the `stdout` sink.
+   - Build: the workspace, the replication transport, the ConnectionProvider (`password`, `aws_rds_iam`), the decoder and value mapping (with fixtures, fuzzing and `to_jsonb` tests), the envelope, and the `stdout` sink.
    - Outcome: changes stream end to end, and the slot is acknowledged after delivery.
 2. **Deliver.** Order keys, lanes, the ack tracker, the status task, backpressure, the Sink trait, the SNS and `discard` sinks, and retries.
 3. **Park.**
@@ -964,6 +1001,8 @@ Each milestone ends in working, tested software and gets its own implementation 
    - Before release, review the patent landscape for watermark-based CDC (Netflix DBLog).
 2. **Admin API authentication.** Required before the admin API is exposed beyond localhost.
 3. **Segmented S3 parking layout.** Only if load tests or real outages show per-event objects are too slow or too costly.
+
+Also in v1.1, outside the ranking: an optional `pprof` build feature for CPU profiles, off by default and served on the admin port for load tests.
 
 ### v1.2: open-source release
 
@@ -994,11 +1033,11 @@ Each milestone ends in working, tested software and gets its own implementation 
 |---|---|
 | Aurora may drop logical slots on writer failover. AWS doesn't document it, and one AWS post says it does. | Test in staging before production; alert and follow the runbook (§13.3); backfills arrive in v1.1 |
 | SNS topics above 256 KiB may restrict subscription types, and the `PublishBatch` aggregate limit for such topics is unverified | Verify during milestone 2; `preflight` reads limits from the topic |
-| The vendored transport needs a patch (backend PID) and ongoing maintenance | Keep patches minimal, behind an internal trait |
+| The in-house transport is protocol code pg-cdc maintains | Keep it small and behind the transport crate's API; test it against a fake server and against Postgres 14 to 18 |
 | Fencing assumes no process pauses for longer than `fence_delay` | Only duplicates result; documented |
-| Parking during a long outage costs about $5 per million events on S3 | `max_parked_events`; a segmented layout in v1.1 if needed |
+| Parking during a long outage costs about $5.40 per million events on S3: a PUT to park and a GET to drain each event, plus batched deletes and a listing per 1,000 events | `max_parked_events`; a segmented layout in v1.1 if needed |
 | Primary keys are read from the current catalog, not as of the WAL position | A key change during traffic can mis-key a few events; documented |
-| A hot key moves at most one event per sink round trip | Documented, along with the `order_by` choices |
+| A hot key moves at most one event per sink round trip; while its parked queue drains, each event also costs a GET and its share of a batched delete, with a listing per 1,000 events (§11.4) | Documented, along with the `order_by` choices; parked drain across keys is bounded by `state_store.max_concurrency` (§15) |
 | Changing a publication during a backlog can renumber replayed ordinals | Change publications only when caught up (§7.2) |
 
 ## 22. References

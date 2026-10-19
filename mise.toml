@@ -1,0 +1,126 @@
+[tools]
+cargo-binstall = "1.25.3"
+"cargo:cargo-nextest" = "0.9.148"
+cargo-deny = "0.20.2"
+"cargo:cargo-machete" = "0.9.2"
+typos = "1.51.1"
+taplo = "0.10.0"
+actionlint = "1.7.12"
+"cargo:cargo-llvm-cov" = "0.9.1"
+"cargo:cargo-fuzz" = "0.13.2"
+
+[env]
+FUZZ_TOOLCHAIN = "nightly-2026-10-01"
+
+[tasks.fmt]
+description = "Format Rust and TOML sources"
+run = ["cargo fmt --all", "taplo fmt"]
+
+[tasks.lint-code]
+description = "Formatting, spelling, clippy and docs"
+env = { RUSTDOCFLAGS = "-D warnings" }
+run = [
+  "cargo fmt --all --check",
+  "taplo fmt --check",
+  "typos",
+  "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+  "cargo clippy -p pg-cdc --no-default-features --lib --bins -- -D warnings",
+  "cargo doc --workspace --no-deps --all-features",
+]
+
+[tasks.lint-deps]
+description = "Supply-chain and unused-dependency checks"
+run = ["cargo deny check", "cargo machete"]
+
+[tasks.lint]
+description = "The gate without tests"
+run = ["mise run lint-code", "mise run lint-deps"]
+
+[tasks.test]
+description = "All tests, Docker-backed integration tests included"
+run = "cargo nextest run --workspace --all-features"
+
+[tasks.test-integration]
+description = "Integration tests only, for the Postgres version matrix"
+run = "cargo nextest run --workspace --all-features -E 'kind(test)'"
+
+[tasks.check]
+description = "The single local gate"
+run = ["mise run lint-code", "mise run test", "mise run lint-deps"]
+
+[tasks.actionlint]
+description = "Lint GitHub Actions workflows"
+run = "actionlint"
+
+[tasks.cov]
+description = "Coverage with floors: decoder 90%, workspace 80%"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+cargo llvm-cov clean --workspace
+cargo llvm-cov nextest --workspace --all-features --no-report
+if [ -d crates/decoder ]; then
+  cargo llvm-cov report --ignore-filename-regex '(crates/(testkit|loadgen)/|/tests/)' --fail-under-lines 80
+  cargo llvm-cov report --ignore-filename-regex '(crates/(pg-cdc|replication|testkit|loadgen)/|/tests/)' --fail-under-lines 90
+else
+  cargo llvm-cov report --ignore-filename-regex '(crates/(testkit|loadgen)/|/tests/)'
+fi
+'''
+
+[tasks.fuzz-smoke]
+description = "Run every fuzz target for 60 seconds on the pinned nightly"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+if [ ! -d fuzz ]; then
+  exit 0
+fi
+rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+host=$(rustc +"$FUZZ_TOOLCHAIN" -vV | sed -n 's/^host: //p')
+for target in $(cargo +"$FUZZ_TOOLCHAIN" fuzz list); do
+  cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$host" "$target" -- -max_total_time=60
+done
+'''
+
+[tasks.chaos-smoke]
+description = "Seeded 15 second chaos run against two pg-cdc instances"
+run = [
+  "cargo build -p pg-cdc",
+  "cargo run -p pg-cdc-loadgen -- chaos --pg-cdc target/debug/pg-cdc --seed 1 --duration 15s --settle 30s --report target/chaos/smoke.json",
+]
+
+[tasks.chaos]
+description = "About 5 minutes against two pg-cdc instances: opening takeovers, 3 minutes of chaos, at most 1 minute to settle; CHAOS_SEED defaults to the current Unix time"
+run = [
+  "cargo build --release -p pg-cdc",
+  "cargo run --release -p pg-cdc-loadgen -- chaos --pg-cdc target/release/pg-cdc --seed ${CHAOS_SEED:-$(date +%s)} --duration 3m --settle 1m --report target/chaos/full.json",
+]
+
+[tasks.load]
+description = "Load scenarios (ceiling, sns, overhead, memory, outage, brownout, handover); LOAD_SCENARIO picks one, default all"
+run = [
+  "cargo build --release -p pg-cdc",
+  "cargo build --release -p pg-cdc --no-default-features --target-dir target/baseline",
+  "cargo build --release -p pg-cdc-loadgen",
+  "target/release/loadgen load ${LOAD_SCENARIO:-all} --pg-cdc target/release/pg-cdc --baseline target/baseline/release/pg-cdc --report-dir target/load",
+]
+
+[tasks.ci]
+description = "Everything CI runs, locally"
+run = [
+  "mise run lint",
+  "mise run actionlint",
+  "mise run test",
+  "mise run cov",
+  "mise run chaos-smoke",
+]
+
+[tasks.fixtures]
+description = "Regenerate the decoder's golden pgoutput fixtures on Postgres 14 to 18"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+for v in 14 15 16 17 18; do
+  PGCDC_TEST_PG_VERSION=$v cargo nextest run -p pg-cdc-decoder --test golden --run-ignored only -E 'test(capture_golden_fixtures)'
+done
+'''

@@ -1,0 +1,189 @@
+#[path = "support/state_store.rs"]
+mod state_store;
+
+use std::sync::Arc;
+
+use pg_cdc::state::filesystem::{FilesystemStateStore, LEADER_LOCK};
+use pg_cdc::state::{
+    LeaderRecord, LeaderState, ParkStatus, StateStore, StoreError, SwapOutcome, Version,
+    decode_parked,
+};
+use pg_cdc_decoder::Lsn;
+
+use state_store::{TestResult, event, id, key};
+
+#[tokio::test]
+async fn the_filesystem_store_conforms() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().to_owned();
+    state_store::conforms(|| {
+        let store: Arc<dyn StateStore> = Arc::new(FilesystemStateStore::new(&path, "orders", 4));
+        async move { Ok(store) }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn parked_events_and_the_leader_record_use_the_spec_layout_and_stray_files_are_ignored()
+-> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = FilesystemStateStore::new(dir.path(), "orders", 4);
+    let queue = key(0xab, 1)?;
+    let parked = event(queue, id(0x1A2B_3C4D, 3), ParkStatus::Retrying);
+    store.append_parked(std::slice::from_ref(&parked)).await?;
+    let queue_dir = dir
+        .path()
+        .join("orders")
+        .join("parked")
+        .join(queue.to_string());
+    let object = queue_dir.join("000000001a2b3c4d-00000003.json");
+    let name = format!("{queue}/000000001a2b3c4d-00000003.json");
+    assert_eq!(decode_parked(&name, &std::fs::read(&object)?)?, parked);
+    std::fs::write(
+        queue_dir.join(".tmp-000000001a2b3c4d-00000004.json-1"),
+        b"partial",
+    )?;
+    std::fs::write(queue_dir.join("notes.txt"), b"x")?;
+    std::fs::create_dir_all(
+        dir.path()
+            .join("orders")
+            .join("parked")
+            .join("ab-not-a-key"),
+    )?;
+    let heads = store.load_parked_heads(0xab).await?;
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].length, 1);
+    assert_eq!(
+        store.read_parked(&queue, None, 10).await?,
+        vec![parked.clone()]
+    );
+    std::fs::remove_file(queue_dir.join(".tmp-000000001a2b3c4d-00000004.json-1"))?;
+    std::fs::remove_file(queue_dir.join("notes.txt"))?;
+    store.remove_parked(&[(queue, parked.id)]).await?;
+    assert!(!queue_dir.exists(), "an emptied queue leaves no directory");
+    let root = dir.path().join("orders");
+    let record = LeaderRecord {
+        epoch: 3,
+        holder: "task-a".to_owned(),
+        state: LeaderState::Active,
+        confirmed_lsn: Lsn(0x1_0000_00FF),
+        updated_ms: 1_760_443_200_000,
+    };
+    assert_eq!(
+        store.swap_leader(&record, None).await?,
+        SwapOutcome::Swapped(Version("1".to_owned()))
+    );
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("leader.json"))?)?;
+    assert_eq!(
+        written,
+        serde_json::json!({
+            "version": 1,
+            "record": {
+                "epoch": 3,
+                "holder": "task-a",
+                "state": "active",
+                "confirmed_lsn": "1/FF",
+                "updated_ms": 1_760_443_200_000_u64,
+            },
+        })
+    );
+    assert!(root.join(LEADER_LOCK).is_file());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unwritable_root_reports_the_store_unavailable() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let blocker = dir.path().join("file");
+    std::fs::write(&blocker, b"not a directory")?;
+    let store = FilesystemStateStore::new(&blocker, "orders", 4);
+    let queue = key(0x01, 1)?;
+    let result = store
+        .append_parked(&[event(queue, id(1, 0), ParkStatus::Retrying)])
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::Unavailable(_))),
+        "{result:?}"
+    );
+    assert!(matches!(
+        store.read_leader().await,
+        Err(StoreError::Unavailable(_))
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+mod unsyncable_directories {
+    use std::fs::{self, File, Permissions};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    use super::{
+        FilesystemStateStore, ParkStatus, StateStore, StoreError, TestResult, event, id, key,
+    };
+
+    fn can_open(dir: &Path) -> bool {
+        File::open(dir).is_ok()
+    }
+
+    #[tokio::test]
+    async fn an_append_that_finds_the_entry_linked_still_syncs_the_directory() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let store = FilesystemStateStore::new(dir.path(), "orders", 4);
+        let queue = key(0x01, 1)?;
+        let parked = event(queue, id(7, 0), ParkStatus::Retrying);
+        store.append_parked(std::slice::from_ref(&parked)).await?;
+        let queue_dir = dir
+            .path()
+            .join("orders")
+            .join("parked")
+            .join(queue.to_string());
+        fs::set_permissions(&queue_dir, Permissions::from_mode(0o300))?;
+        let unsyncable = !can_open(&queue_dir);
+        let result = store.append_parked(std::slice::from_ref(&parked)).await;
+        fs::set_permissions(&queue_dir, Permissions::from_mode(0o700))?;
+        if unsyncable {
+            assert!(
+                matches!(result, Err(StoreError::Unavailable(_))),
+                "{result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_append_into_an_existing_queue_directory_syncs_its_parent() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let store = FilesystemStateStore::new(dir.path(), "orders", 4);
+        let queue = key(0x01, 1)?;
+        store
+            .append_parked(&[event(queue, id(7, 0), ParkStatus::Retrying)])
+            .await?;
+        let parked_dir = dir.path().join("orders").join("parked");
+        fs::set_permissions(&parked_dir, Permissions::from_mode(0o300))?;
+        let unsyncable = !can_open(&parked_dir);
+        let result = store
+            .append_parked(&[event(queue, id(8, 0), ParkStatus::Retrying)])
+            .await;
+        fs::set_permissions(&parked_dir, Permissions::from_mode(0o700))?;
+        if unsyncable {
+            assert!(
+                matches!(result, Err(StoreError::Unavailable(_))),
+                "{result:?}"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_concurrency_above_the_semaphore_limit_is_capped_instead_of_panicking() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = FilesystemStateStore::new(dir.path(), "orders", usize::MAX);
+    let queue = key(0x01, 1)?;
+    let parked = event(queue, id(1, 0), ParkStatus::Retrying);
+    store.append_parked(std::slice::from_ref(&parked)).await?;
+    assert_eq!(store.read_parked(&queue, None, 10).await?, vec![parked]);
+    Ok(())
+}

@@ -1,0 +1,86 @@
+[package]
+name = "pg-cdc"
+description = "Stream Postgres logical replication changes to a sink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["otel"]
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:tracing-opentelemetry",
+  "dep:opentelemetry-appender-tracing",
+]
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-sdk-rds.workspace = true
+aws-sdk-s3.workspace = true
+aws-sdk-sns.workspace = true
+aws-smithy-http-client.workspace = true
+bytes.workspace = true
+clap.workspace = true
+fastrand.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-appender-tracing = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+pg-cdc-decoder.workspace = true
+pg-cdc-replication.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber.workspace = true
+twox-hash.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+aws-sdk-sqs.workspace = true
+pg-cdc-testkit.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt",
+  "rt-multi-thread",
+  "test-util",
+  "time",
+] }

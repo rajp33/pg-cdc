@@ -1,0 +1,6 @@
+include = ["**/*.toml"]
+exclude = ["target/**", "fuzz/target/**"]
+
+[formatting]
+column_width = 100
+reorder_keys = false
