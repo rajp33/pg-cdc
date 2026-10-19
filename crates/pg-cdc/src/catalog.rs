@@ -31,6 +31,12 @@ const IDENTITY_SQL: &str = "SELECT pt.schemaname::text, pt.tablename::text FROM 
      JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename \
      WHERE pt.pubname = $1 AND c.relreplident <> 'f' ORDER BY 1, 2";
 
+const PUBLISHED_COLUMNS_SQL: &str = "SELECT a.attname::text FROM pg_publication_tables pt \
+     JOIN pg_namespace n ON n.nspname = pt.schemaname \
+     JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename \
+     LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+     WHERE pt.pubname = $1 AND pt.schemaname = $2 AND pt.tablename = $3 ORDER BY a.attnum";
+
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("catalog query failed: {0}")]
@@ -169,6 +175,27 @@ pub async fn tables_without_full_identity(
     rows.iter()
         .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
         .collect()
+}
+
+pub async fn published_columns(
+    client: &Client,
+    publication: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Option<Vec<String>>, CatalogError> {
+    let rows = client
+        .query(PUBLISHED_COLUMNS_SQL, &[&publication, &schema, &table])
+        .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut columns = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Some(name) = row.try_get::<_, Option<String>>(0)? {
+            columns.push(name);
+        }
+    }
+    Ok(Some(columns))
 }
 
 #[cfg(test)]

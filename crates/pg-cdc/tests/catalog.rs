@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use pg_cdc::catalog::{
-    SlotActivity, TypeResolver, key_columns, slot_activity, slot_confirmed_flush,
-    slot_retained_bytes, tables_without_full_identity,
+    SlotActivity, TypeResolver, key_columns, published_columns, slot_activity,
+    slot_confirmed_flush, slot_retained_bytes, tables_without_full_identity,
 };
 use pg_cdc_decoder::Lsn;
 use pg_cdc_decoder::value::TypeKind;
@@ -154,6 +154,39 @@ async fn reads_slot_position_and_identity_warnings() -> TestResult {
             ("public".to_owned(), "default_t".to_owned()),
             ("public".to_owned(), "nothing_t".to_owned())
         ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn published_columns_list_a_published_tables_live_columns() -> TestResult {
+    let pg = Postgres::start().await?;
+    pg.execute(
+        "CREATE TABLE orders (id int PRIMARY KEY, status text);
+         CREATE TABLE order_items (id int PRIMARY KEY, gone int, order_id int);
+         ALTER TABLE order_items DROP COLUMN gone;
+         CREATE TABLE empty_t ();
+         CREATE TABLE unpublished (id int PRIMARY KEY);",
+    )
+    .await?;
+    pg.create_publication("cat_pub", &["orders", "order_items", "empty_t"])
+        .await?;
+    let client = pg.client().await?;
+    let columns = |table: &'static str| published_columns(&client, "cat_pub", "public", table);
+    assert_eq!(
+        columns("order_items").await?,
+        Some(vec!["id".to_owned(), "order_id".to_owned()])
+    );
+    assert_eq!(
+        columns("orders").await?,
+        Some(vec!["id".to_owned(), "status".to_owned()])
+    );
+    assert_eq!(columns("empty_t").await?, Some(Vec::new()));
+    assert_eq!(columns("unpublished").await?, None);
+    assert_eq!(columns("missing").await?, None);
+    assert_eq!(
+        published_columns(&client, "other_pub", "public", "orders").await?,
+        None
     );
     Ok(())
 }

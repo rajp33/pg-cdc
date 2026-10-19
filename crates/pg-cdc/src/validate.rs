@@ -1,6 +1,7 @@
 use tokio_postgres::Client;
 
 use crate::catalog::CatalogError;
+use crate::order::OrderBy;
 
 pub const PGOUTPUT: &str = "pgoutput";
 
@@ -131,6 +132,29 @@ pub async fn validate(
 ) -> Result<Verdict, ValidationError> {
     let facts = source_facts(client, slot, publication).await?;
     Ok(assess(&facts, slot, publication)?)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OrderOverrideGap {
+    #[error("the table is not in the publication, so the override never applies")]
+    Unpublished,
+    #[error("the table has no column {0}, so its events order by table")]
+    MissingColumn(String),
+}
+
+pub fn order_override_gap(
+    order_by: &OrderBy,
+    published_columns: Option<&[String]>,
+) -> Option<OrderOverrideGap> {
+    let Some(columns) = published_columns else {
+        return Some(OrderOverrideGap::Unpublished);
+    };
+    match order_by {
+        OrderBy::Column(name) if !columns.contains(name) => {
+            Some(OrderOverrideGap::MissingColumn(name.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn assess(facts: &SourceFacts, slot: &str, publication: &str) -> Result<Verdict, Invalid> {
@@ -292,6 +316,26 @@ mod tests {
     fn judge_lets_an_unreserved_slot_through() {
         let facts = with_slot(|slot| slot.wal_status = Some("unreserved".to_owned()));
         assert_eq!(judge(&facts, SLOT, PUBLICATION), Ok(Verdict::Unreserved));
+    }
+
+    #[test]
+    fn a_table_override_needs_a_published_table_with_its_column() {
+        let columns = ["id".to_owned(), "order_id".to_owned()];
+        let by_order = OrderBy::Column("order_id".to_owned());
+        let by_tenant = OrderBy::Column("tenant_id".to_owned());
+        assert_eq!(order_override_gap(&by_order, Some(&columns)), None);
+        assert_eq!(order_override_gap(&OrderBy::Key, Some(&columns)), None);
+        assert_eq!(order_override_gap(&OrderBy::Table, Some(&[])), None);
+        assert_eq!(
+            order_override_gap(&by_tenant, Some(&columns)),
+            Some(OrderOverrideGap::MissingColumn("tenant_id".to_owned()))
+        );
+        for order_by in [OrderBy::Key, by_order] {
+            assert_eq!(
+                order_override_gap(&order_by, None),
+                Some(OrderOverrideGap::Unpublished)
+            );
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
