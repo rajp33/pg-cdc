@@ -922,10 +922,10 @@ Suggested alerts:
 
 ### 17.4 Error reporting
 
-- **Switching it on.** Sentry reporting is enabled when `telemetry.sentry.dsn` or `SENTRY_DSN` is set, independently of OTLP. The `sentry` cargo feature (default on) gates the dependency: `sentry` with default features off and only backtrace, contexts, panic, tracing and the ureq transport over rustls with ring.
-- **What is sent.** ERROR events become Sentry events; WARN events become breadcrumbs; panics are captured. No spans or performance traces. Events carry release `pg-cdc@<version>`, the environment, `server_name` set to the holder id, and tags `pipeline` and `holder`. `sample_rate` samples error events.
-- **Privacy.** `send_default_pii` is off. A `before_send` and `before_breadcrumb` scrubber redacts fields named like credentials or row data, URL userinfo, and secret `key=value` pairs. pg-cdc never logs row values at WARN or ERROR.
-- **Shutdown.** The client is closed with at most 2 s to flush, bounded by what remains of the SIGTERM budget.
+- **Switching it on.** Sentry reporting is enabled when `telemetry.sentry.dsn` or `SENTRY_DSN` is set, independently of OTLP. The `sentry` cargo feature (default on) gates the dependency: `sentry` with default features off and only backtrace, contexts, tracing and the ureq transport over rustls with ring; pg-cdc installs its own panic hook.
+- **What is sent: an allowlist.** ERROR lines become events and WARN lines breadcrumbs, built from the line's message, target, level and location only. pg-cdc's WARN and ERROR messages are literals (a workspace test enforces it); lines from other crates get a fixed message. Fields are dropped unless allowlisted: a fixed set of numeric fields (`lane`, `attempts`, `delay_ms`, `epoch`, ...) and the labels `id`, `operation`, `kind` and `sink` when label-shaped (at most 64 of `[a-z0-9_-]`). Error strings are never sent, since provider errors can quote row values. A panic is a fatal event with a fixed message, its location and stack, without its payload. No spans or performance traces. Events carry release `pg-cdc@<version>`, the environment, `server_name` set to the holder id, and tags `pipeline` and `holder`. `sample_rate` samples error events.
+- **Privacy.** `send_default_pii` is off. A `before_send` and `before_breadcrumb` scrubber still redacts URL userinfo and secret `key=value` pairs as defense in depth.
+- **Shutdown.** The client is closed on its own thread with at most 2 s to flush, bounded by what remains of the SIGTERM budget, also when the reporter is dropped during unwinding. Sends time out after 5 s; the panic hook only queues its event and never flushes.
 
 ### 17.5 Logs
 
