@@ -181,10 +181,10 @@ impl SnsSink {
             return Vec::new();
         }
         match self.api.publish_batch(&self.topic_arn, entries).await {
-            Err(PublishFailure::TooLong(message)) if entries.len() > 1 => {
+            Err(PublishFailure::TooLong(error)) if entries.len() > 1 => {
                 tracing::warn!(
                     entries = entries.len(),
-                    %message,
+                    %error,
                     "SNS rejected the batch as too long; sending its entries one at a time"
                 );
                 let mut outcomes = Vec::with_capacity(entries.len());

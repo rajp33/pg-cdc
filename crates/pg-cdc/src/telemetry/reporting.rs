@@ -154,9 +154,6 @@ mod client {
     ];
     const OUR_TARGET: &str = "pg_cdc";
     const PANIC_MESSAGE: &str = "pg-cdc panicked";
-    const MESSAGE_FIELD: &str = "message";
-    const FOREIGN_ERROR: &str = "a dependency logged an error";
-    const FOREIGN_WARNING: &str = "a dependency logged a warning";
     const MAX_LABEL_BYTES: usize = 64;
     const NUMBER_FIELDS: [&str; 16] = [
         "lane",
@@ -246,7 +243,6 @@ mod client {
 
     #[derive(Default)]
     struct Allowed {
-        message: Option<String>,
         fields: Map<String, Value>,
     }
 
@@ -286,17 +282,11 @@ mod client {
         }
 
         fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == MESSAGE_FIELD {
-                self.message = Some(value.to_owned());
-            } else {
-                self.label(field, value.to_owned());
-            }
+            self.label(field, value.to_owned());
         }
 
         fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-            if field.name() == MESSAGE_FIELD {
-                self.message = Some(format!("{value:?}"));
-            } else if LABEL_FIELDS.contains(&field.name()) {
+            if LABEL_FIELDS.contains(&field.name()) {
                 self.label(field, format!("{value:?}"));
             }
         }
@@ -309,12 +299,9 @@ mod client {
         if ours {
             event.record(&mut allowed);
         }
-        let message = |foreign: &str| {
-            if ours {
-                allowed.message.as_deref().map(scrub_text)
-            } else {
-                Some(foreign.to_owned())
-            }
+        let message = match (metadata.file(), metadata.line()) {
+            (Some(file), Some(line)) => format!("{} at {file}:{line}", metadata.target()),
+            _ => metadata.target().to_owned(),
         };
         match *metadata.level() {
             Level::ERROR => {
@@ -327,7 +314,7 @@ mod client {
                 EventMapping::Event(Box::new(Event {
                     level: sentry::Level::Error,
                     logger: Some(metadata.target().to_owned()),
-                    message: message(FOREIGN_ERROR),
+                    message: Some(message),
                     extra: allowed.fields.clone(),
                     contexts,
                     ..Event::default()
@@ -337,7 +324,7 @@ mod client {
                 ty: "log".to_owned(),
                 category: Some(metadata.target().to_owned()),
                 level: sentry::Level::Warning,
-                message: message(FOREIGN_WARNING),
+                message: Some(message),
                 data: allowed.fields.clone(),
                 ..Breadcrumb::default()
             }),
@@ -630,16 +617,14 @@ mod tests {
 
         #[test]
         fn an_error_is_sent_with_the_release_environment_and_identity() {
+            let line = line!() + 2;
             let events = captured(|| {
                 tracing::error!(target: "pg_cdc::session", lane = 3, "the sink rejected the event for good");
             });
             assert_eq!(events.len(), 1, "{events:?}");
             let event = &events[0];
             assert_eq!(event.level, Level::Error);
-            assert_eq!(
-                event.message.as_deref(),
-                Some("the sink rejected the event for good")
-            );
+            assert_eq!(event.message, Some(at("pg_cdc::session", line)));
             assert_eq!(
                 event.release.as_deref(),
                 Some(format!("pg-cdc@{}", env!("CARGO_PKG_VERSION")).as_str())
@@ -667,19 +652,20 @@ mod tests {
 
         #[test]
         fn a_warning_rides_along_as_a_breadcrumb_of_the_next_error() {
+            let line = line!() + 2;
             let events = captured(|| {
                 tracing::warn!(target: "pg_cdc::lane", "delivery failed; retrying");
                 tracing::info!(target: "pg_cdc::lane", "delivered");
                 tracing::error!(target: "pg_cdc::lane", "parking it dead");
             });
             assert_eq!(events.len(), 1, "{events:?}");
-            let crumbs: Vec<Option<&str>> = events[0]
+            let crumbs: Vec<Option<String>> = events[0]
                 .breadcrumbs
                 .values
                 .iter()
-                .map(|crumb| crumb.message.as_deref())
+                .map(|crumb| crumb.message.clone())
                 .collect();
-            assert_eq!(crumbs, vec![Some("delivery failed; retrying")]);
+            assert_eq!(crumbs, vec![Some(at("pg_cdc::lane", line))]);
         }
 
         #[test]
@@ -717,9 +703,9 @@ mod tests {
             ] {
                 assert!(!sent.contains(leaked), "{leaked} leaked: {sent}");
             }
-            assert_eq!(
-                events[0].message.as_deref(),
-                Some("pg-cdc stopped: cannot reach postgresql://[redacted]@db.internal/app")
+            assert!(
+                from_callsite(events[0].message.as_deref(), "pg_cdc::session"),
+                "{sent}"
             );
             assert!(!events[0].extra.contains_key("password"), "{sent}");
             assert!(!sent.contains("ab000000000000000000000000000001"), "{sent}");
@@ -759,9 +745,9 @@ mod tests {
                 assert!(!sent.contains(leaked), "{leaked} leaked: {sent}");
             }
             let ours = &events[0];
-            assert_eq!(
-                ours.message.as_deref(),
-                Some("cannot take over the slot; releasing it")
+            assert!(
+                from_callsite(ours.message.as_deref(), "pg_cdc::session"),
+                "{sent}"
             );
             assert_eq!(
                 ours.extra.get("id"),
@@ -773,9 +759,9 @@ mod tests {
             );
             assert!(!ours.extra.contains_key("error"), "{sent}");
             let crumb = &ours.breadcrumbs.values[0];
-            assert_eq!(
-                crumb.message.as_deref(),
-                Some("replication session ended; reconnecting")
+            assert!(
+                from_callsite(crumb.message.as_deref(), "pg_cdc::supervisor"),
+                "{sent}"
             );
             assert_eq!(crumb.data.keys().collect::<Vec<_>>(), vec!["delay_ms"]);
             let foreign = &events[1];
@@ -783,10 +769,61 @@ mod tests {
                 foreign.logger.as_deref(),
                 Some("tokio_postgres::connection")
             );
-            assert_eq!(
-                foreign.message.as_deref(),
-                Some("a dependency logged an error")
+            assert!(
+                from_callsite(foreign.message.as_deref(), "tokio_postgres::connection"),
+                "{sent}"
             );
+        }
+
+        fn at(target: &str, line: u32) -> String {
+            format!("{target} at {}:{line}", file!())
+        }
+
+        fn from_callsite(message: Option<&str>, target: &str) -> bool {
+            message.is_some_and(|message| {
+                message
+                    .strip_prefix(&format!("{target} at {}:", file!()))
+                    .is_some_and(|line| line.parse::<u32>().is_ok())
+            })
+        }
+
+        #[test]
+        fn messages_come_from_the_callsite_and_never_from_values() {
+            let error = "password='two words' customer-row-value";
+            let events = captured(|| {
+                tracing::warn!(
+                    target: "pg_cdc::sink::sns",
+                    entries = 2_u64,
+                    message = %error,
+                    "SNS rejected the batch as too long; sending its entries one at a time"
+                );
+                tracing::warn!(target: "pg_cdc::lane", message = %error);
+                tracing::warn!(target: "pg_cdc::lane", "failed: {}", error.trim_end_matches('x'));
+                tracing::warn!(target: "pg_cdc::lane", "failed: \"{error}\"");
+                tracing::event!(target: "pg_cdc::lane", tracing::Level::ERROR, "failed: {error}");
+            });
+            assert_eq!(events.len(), 1, "{events:?}");
+            let sent = fields(&events[0]);
+            for leaked in ["two words", "customer-row-value", "failed"] {
+                assert!(!sent.contains(leaked), "{leaked} leaked: {sent}");
+            }
+            assert!(
+                from_callsite(events[0].message.as_deref(), "pg_cdc::lane"),
+                "{sent}"
+            );
+            let crumbs = &events[0].breadcrumbs.values;
+            assert_eq!(crumbs.len(), 4, "{sent}");
+            assert!(
+                from_callsite(crumbs[0].message.as_deref(), "pg_cdc::sink::sns"),
+                "{sent}"
+            );
+            assert_eq!(crumbs[0].data.get("entries"), Some(&serde_json::json!(2)));
+            for crumb in &crumbs[1..] {
+                assert!(
+                    from_callsite(crumb.message.as_deref(), "pg_cdc::lane"),
+                    "{sent}"
+                );
+            }
         }
 
         #[test]
