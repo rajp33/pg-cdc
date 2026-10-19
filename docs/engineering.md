@@ -39,11 +39,27 @@ These rules bind every change. `mise run check` enforces most of them.
 - Tests assert behavior, are deterministic and print nothing on success.
 - Coverage floors, enforced in CI by `mise run cov`: `pg-cdc-decoder` at least 90% of lines; the workspace at least 80%, excluding testkit and loadgen. Both floors are enforced once `crates/decoder` exists; until then `mise run cov` only prints the report.
 - The testkit labels every container it starts `pg-cdc-testkit.created=<Unix seconds>` and, at most once every 10 minutes per machine, removes labeled containers older than an hour, so containers leaked by a killed test run do not pile up.
-- Chaos and load runs stay out of the gate: `mise run chaos-smoke`, `mise run chaos` and `mise run load` (see the README and `docs/load.md`). `crates/loadgen` (package `pg-cdc-loadgen`, binary `loadgen`) is a CLI, uses `anyhow`, and is excluded from coverage.
+- Chaos and load runs stay out of the gate: `mise run chaos-smoke`, `mise run chaos` and `mise run load` (see [Local development](#local-development) and [docs/load.md](load.md)). `crates/loadgen` (package `pg-cdc-loadgen`, binary `loadgen`) is a CLI, uses `anyhow`, and is excluded from coverage.
+
+## Local development
+
+```sh
+mise trust && mise install
+mise run check
+```
+
+Integration tests need Docker; `PGCDC_TEST_PG_VERSION` selects Postgres 14 to 18 (default 17).
+
+Outside the gate:
+
+- `mise run chaos-smoke` runs the chaos harness for 15 s (seed 1) against two debug instances, Postgres and moto, and checks that nothing was lost and per-key order held; CI runs it as its own job.
+- `mise run chaos` runs it on a release build with `CHAOS_SEED` (default: the current Unix time) for about 5 minutes: the opening takeovers, 3 minutes of chaos and at most 1 minute to settle. Whatever is still parked or not yet delivered then must be in S3 or retained by the slot.
+- `mise run load` builds the release and `--no-default-features` binaries and runs the load scenarios into `target/load`; `LOAD_SCENARIO=ceiling|sns|overhead|memory|outage|brownout|handover` runs one. `cargo run -p pg-cdc-loadgen -- report --report-dir target/load --out summary.md` writes the summary table. Results are in [docs/load.md](load.md).
+- `cargo run -p pg-cdc-loadgen -- write --database <db> --user <user> --slot <slot> --rate 1000 --duration 60s` writes the chaos workload (upserts into `loadgen_items` from one connection) against any Postgres, with the password from `PGPASSWORD`; given `--slot`, it first creates the table with FULL identity, the `loadgen` publication and each slot.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on pull requests, pushes to `main` and manual dispatch, with one concurrency group per ref and top-level `contents: read`. Third-party actions are pinned to commit SHAs. Jobs: `lint` (the gate minus tests, plus actionlint), `test` (Postgres 17), `pg-matrix` (Postgres 14, 15, 16 and 18), `coverage`, `chaos-smoke` (the 15-second chaos run, uploading `target/chaos` when it fails) and `fuzz-smoke` (60 seconds per target). `.github/workflows/image.yml` builds the release image for linux/amd64 and linux/arm64 on native runners and smoke-tests each on pull requests; only pushes to `main` and `v*` tags push it to `ghcr.io/rajp33/pg-cdc`, by digest, and merge the multi-arch manifest. Dependabot updates cargo, GitHub Actions and the Dockerfile's base images weekly. The repository is public, so no job needs a secret beyond the workflow's own `GITHUB_TOKEN`, which only the image push uses.
+`.github/workflows/ci.yml` runs on pull requests, pushes to `main` and manual dispatch, with one concurrency group per ref and top-level `contents: read`. Third-party actions are pinned to commit SHAs. Jobs: `lint` (the gate minus tests, plus actionlint), `test` (Postgres 17), `pg-matrix` (Postgres 14, 15, 16 and 18), `coverage`, `chaos-smoke` (the 15-second chaos run, uploading `target/chaos` when it fails) and `fuzz-smoke` (60 seconds per target). The `image` job builds the release image for linux/amd64 and linux/arm64 on native runners and smoke-tests each. On pushes to `main` and `v*` tags, once every other job has passed, `image-push` pushes each architecture to `ghcr.io/rajp33/pg-cdc` by digest, with an SBOM and build provenance, and `image-publish` merges the multi-arch manifest, tags it and signs it with cosign. Dependabot updates cargo, GitHub Actions and the Dockerfile's base images weekly. The repository is public, so no job needs a secret beyond the workflow's own `GITHUB_TOKEN`, which only the image push uses.
 
 ## Commits
 

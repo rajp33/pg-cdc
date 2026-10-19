@@ -1,0 +1,182 @@
+# Configuration reference
+
+pg-cdc reads one YAML file, passed as `pg-cdc run --config <file>`. The [runbook](runbook.md) covers setup and operations; this page lists every key.
+
+## Loading rules
+
+- **Environment overrides.** Any key can be set or overridden with `PGCDC__<SECTION>__<KEY>`, for example `PGCDC__DELIVERY__PARK_AFTER=60s` or `PGCDC__SINK__ATTRIBUTE_COLUMNS=tenant_id,region` (lists as comma-separated values). A `PGCDC__` variable that does not name a configuration key is an error.
+- **Secrets come from the environment only.** With `credentials.type: password`, the password is read from `PGCDC__SOURCE__CREDENTIALS__PASSWORD`; a password in the file is rejected.
+- **Unknown keys are rejected.**
+- **Units.** Durations are whole numbers with `ms`, `s`, `m` or `h` (`30s`); sizes are whole numbers with `B`, `KiB`, `MiB` or `GiB` (`256MiB`).
+
+## Full example
+
+```yaml
+pipeline: orders
+
+source:
+  host: app.cluster-xyz.us-east-1.rds.amazonaws.com
+  port: 5432
+  database: app
+  user: pgcdc
+  credentials:
+    type: aws_rds_iam
+  tls:
+    mode: verify-full
+    ca_file: /etc/pg-cdc/rds-global-bundle.pem
+  slot: pgcdc_orders
+  publication: pgcdc_orders
+
+delivery:
+  order_by: key
+  lanes: 64
+  max_inflight_bytes: 256MiB
+  park_after: 30s
+  max_parked_events: 10000000
+
+sink:
+  type: sns
+  topic_arn: arn:aws:sns:us-east-1:123456789012:orders.fifo
+  max_concurrency: 32
+  attribute_columns: [tenant_id]
+
+state_store:
+  type: s3
+  bucket: pgcdc-state
+  prefix: orders/
+  max_concurrency: 256
+
+payload_store:
+  type: s3
+  bucket: pgcdc-payloads
+  prefix: orders/
+
+leadership:
+  lease_timeout: 6s
+  fence_delay: 16s
+  drain_timeout: 5s
+
+admin:
+  listen: 127.0.0.1:9187
+
+telemetry:
+  otlp_endpoint: http://otel-collector:4317
+  trace_sample_ratio: 0.01
+```
+
+## Keys
+
+| Key | Default | Notes |
+|---|---|---|
+| `pipeline` | required | 1 to 63 letters, digits, `_` or `-`. Names the pipeline in the state store, in event `source.pipeline` and in FIFO deduplication ids. |
+| `source.host`, `source.database`, `source.user` | required | |
+| `source.port` | `5432` | |
+| `source.credentials.type` | required | `password` or `aws_rds_iam` (see [Credentials](#credentials)). |
+| `source.credentials.region` | the default AWS region | `aws_rds_iam` only. |
+| `source.tls.mode` | `verify-full` | `disable`, `require` (encrypt, no certificate check), `verify-ca` (check the chain, not the host name) or `verify-full`. |
+| `source.tls.ca_file` | the webpki (Mozilla) roots | PEM file of trusted CAs, such as the RDS global bundle. |
+| `source.slot`, `source.publication` | required | 1 to 63 lowercase letters, digits or underscores. pg-cdc never creates or drops either. |
+| `source.status_interval` | `10s` | How often the confirmed position is reported to Postgres. |
+| `delivery.order_by` | `key` | `key`, `table`, `column:<name>` or `pipeline` (see [Order keys](#order-keys)). |
+| `delivery.lanes` | `64` | 1 to 4,096. An event goes to lane `order key id mod lanes`. |
+| `delivery.max_inflight_bytes` | `256MiB` | The reader stops when in-flight events (their encoded bodies) reach this size. |
+| `delivery.park_after` | `30s` | How long an event may stay undelivered after its first failure before it is parked. |
+| `delivery.max_parked_events` | `10000000` | `0` is unlimited. Also bounds parked-key memory (see [runbook](runbook.md#5-parked-and-dead-events)). |
+| `sink.type` | required | `sns`, `stdout` or `discard`. |
+| `sink.max_concurrency` | `32` | 1 to 4,096 concurrent sink calls, for any sink type. |
+| `sink.topic_arn` | required for `sns` | |
+| `sink.region` | the default AWS region | `sns` only. |
+| `sink.attribute_columns` | `[]` | `sns` only. Up to 7 distinct column names sent as message attributes; `schema`, `table` and `op` are reserved. |
+| `sink.fair_queue_group` | unset | `sns` only, as `column:<name>`; the column must also be in `attribute_columns`. |
+| `state_store.type` | required | `s3` or `filesystem`. |
+| `state_store.bucket`, `state_store.prefix`, `state_store.region` | bucket required, prefix empty | `s3` only. |
+| `state_store.path` | required for `filesystem` | |
+| `state_store.max_concurrency` | `256` | 1 to 4,096 store calls in flight, shared by parking, draining and head loading. |
+| `payload_store` | unset | Optional; `type: s3` with `bucket`, `prefix` and `region` (see [Payload store](#payload-store)). |
+| `leadership.lease_timeout` | `6s` | Must exceed the 2 s lease check interval. |
+| `leadership.fence_delay` | `16s` | Must exceed `lease_timeout`; with an S3 state store, at least `lease_timeout` plus the S3 client's 10 s attempt timeout. |
+| `leadership.drain_timeout` | `5s` | Greater than zero. |
+| `admin.listen` | `127.0.0.1:9187` | An IP address and port; host names are rejected. |
+| `telemetry.otlp_endpoint` | unset (telemetry off) | An `http://` or `https://` URL. |
+| `telemetry.trace_sample_ratio` | `0.01` | 0 to 1. |
+
+Fixed internal values: standby poll and lease check every 2 s; batch linger 5 ms; sink retry backoff 100 ms to 30 s; reconnect backoff 1 s to 30 s.
+
+## Credentials
+
+- **`password`** reads `PGCDC__SOURCE__CREDENTIALS__PASSWORD`.
+- **`aws_rds_iam`** generates an RDS IAM token with the default AWS credential chain for every connection. The role needs `rds_iam` and `rds_replication`, and the cluster needs `rds.iam_auth_for_replication = 1` ([runbook](runbook.md#1-setup)).
+
+## Order keys
+
+The order key decides ordering and lane placement. Events of one order key are delivered one at a time, in stream order.
+
+| `delivery.order_by` | Order key |
+|---|---|
+| `key` | schema, table and key values (primary key or replica identity index); schema and table when the relation has no key |
+| `table` | schema and table |
+| `column:<name>` | the value of that column; schema and table when it is absent or null |
+| `pipeline` | one key for everything: total order, one event in flight at a time |
+
+A truncate's order key is its table, so under `key` it is not ordered relative to that table's row events. One order key moves at most one event per sink round trip, roughly 20 to 50 events/s against SNS, so choose `order_by` so that no single key carries a high rate.
+
+## Sinks
+
+### SNS
+
+Each change is one SNS message whose body is the JSON envelope (see the [design](superpowers/specs/2026-10-14-pg-cdc-design.md#71-envelope-version-1)). The sink uses `PublishBatch` with up to 10 entries and the default AWS credential chain.
+
+- **Message attributes.** Every message carries `schema`, `table` and `op`, plus each `attribute_columns` value, taken from `after`, or from `before` when there is no `after`. A value is a `Number` attribute when it is a plain JSON number from -10^9 to 10^9 with at most 5 digits after the decimal point, the range SNS accepts, and a `String` holding the exact original text otherwise, including larger or more precise numbers and exponent forms such as `1e+300`. Null and empty values are omitted, as is a string with a character SNS rejects (with a warning).
+- **FIFO topics.** The message group is the order key id and the deduplication id is `<pipeline>:<event id>`, the same on every replay and takeover. SNS deduplicates across the whole topic, so pipelines sharing a FIFO topic need distinct `pipeline` names.
+- **Standard topics.** No message group, unless `fair_queue_group: column:<name>` sets one from that column for SQS fair queues. It is ignored, with a warning, on a FIFO topic.
+- **Message size.** The limit comes from the topic's `MaximumMessageSize` attribute when `GetTopicAttributes` returns it, and is 256 KiB otherwise; the `SNS topic ready` log at startup shows the limit and where it came from. Topics above 256 KiB have not been verified against real AWS. Larger events go to the payload store, or park as dead without one.
+- **Preflight.** pg-cdc checks the topic with `GetTopicAttributes` and keeps retrying until it succeeds before it opens the replication connection.
+- **Retries.** A failing order key backs off from 100 ms to 30 s while other keys keep flowing. An entry SNS rejects with `SenderFault` is terminal and parks at once as dead.
+
+### stdout and discard
+
+`sink: { type: stdout }` writes each change as a JSON line on stdout and logs to stderr. `sink: { type: discard }` drops every change, for load tests.
+
+## State store
+
+The state store holds parked events and the leader record (`leader.json`). Layout and IAM are in the [runbook](runbook.md#1-setup).
+
+- **`s3`** uses conditional writes and suits active/standby across hosts. Use default encryption on the bucket, because parked objects hold row data.
+- **`filesystem`** keeps the same tree on local disk under `path` and suits a single host. pg-cdc fsyncs `path` and every directory above it, so the service user must be able to read each of them; one it cannot read leaves the store unavailable. It has no ordered index, so admin listings scan directory entries (see [runbook](runbook.md#9-admin-api-reference)).
+
+pg-cdc checks that the state store answers before it opens the replication connection.
+
+## Payload store
+
+With a payload store, an event larger than the sink's message limit is stored at `s3://<bucket>/<prefix>/<pipeline>/payloads/<event id>.json`, and the sink receives a pointer instead: the same envelope without `before`, `after` and `unchanged_toast`, plus `"payload_ref": {"uri": "s3://...", "bytes": 912345}`. Without a payload store, such an event parks as dead. Give the payload prefix a lifecycle rule that expires objects after your consumers' retention.
+
+## Leadership
+
+- **`lease_timeout`.** Every 2 s the active task checks over its control connection that the slot is still held by its own walsender. If no check succeeds for `lease_timeout`, the task fences itself: it stops writing, drops in-flight work, closes the replication connection and returns to standby.
+- **`fence_delay`.** What a successor waits after a crash or a fence before it writes anything. By then the old holder has stopped issuing writes and given up on any attempt it sent. It cannot recall a request S3 already received, which S3 may still apply later: a late status rewrite is rejected because it is conditional, while a late append can yield a duplicate and, rarely, one key's events out of order.
+- **`drain_timeout`.** On SIGTERM, the window for in-flight events to deliver, and again for parking what remains. The whole shutdown takes at most `2 x drain_timeout + 3 s`.
+
+The handover sequence and ECS settings are in the [runbook](runbook.md#8-shutdown-health-and-startup-validation).
+
+## Admin endpoint
+
+`admin.listen` serves health, status and the parked-event API. Port 0 picks a free port, logged as `admin listening`. Two tasks that share a network namespace need distinct ports, and a task that cannot bind the address exits 1. The endpoint has no authentication, so keep it on loopback or a private network. `pg-cdc health` and `pg-cdc parked` take `--addr`, else `PGCDC__ADMIN__LISTEN`, else `127.0.0.1:9187`.
+
+## Telemetry
+
+Telemetry is off unless an OTLP endpoint is configured; then traces, metrics and logs go to it over OTLP/gRPC. The metrics, spans and suggested alerts are in the [runbook](runbook.md#10-telemetry-reference).
+
+- **Enabling.** `telemetry.otlp_endpoint` or `OTEL_EXPORTER_OTLP_ENDPOINT` turns it on; the config value wins when both are set. `https://` endpoints use rustls with the webpki roots.
+- **gRPC only.** If `OTEL_EXPORTER_OTLP_PROTOCOL` is set to anything other than `grpc`, pg-cdc logs a warning and uses gRPC.
+- **`OTEL_*` variables.** `OTEL_SERVICE_NAME` (default `pg-cdc`), `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_METRIC_EXPORT_INTERVAL` are honored. Every signal carries `service.instance.id` (the task's holder id), `service.version` and `pgcdc.pipeline`.
+- **Sampling.** Traces use `ParentBased(TraceIdRatioBased(trace_sample_ratio))`.
+- **Never in the way.** Exports go through bounded batch queues that drop when full, and on SIGTERM the exporters get at most 1 s within the shutdown budget.
+- **The `otel` feature.** OpenTelemetry is compiled in by default. `cargo build --release -p pg-cdc --no-default-features` builds without it; such a build logs `telemetry is configured, but this build has no otel feature` and exports nothing.
+
+## Logs
+
+Logs are JSON lines on stdout with the SNS and discard sinks, and on stderr with the stdout sink. `RUST_LOG` sets the filter (default `info`). Logs are written from a bounded buffer of 8,192 lines on their own thread, so a stalled log reader never holds up replication or shutdown; lines that do not fit are dropped.
+
+## Platforms
+
+pg-cdc runs on Linux and macOS. The container image is described in the [runbook](runbook.md#11-container-image).
