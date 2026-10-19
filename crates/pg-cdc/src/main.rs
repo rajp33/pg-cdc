@@ -35,8 +35,8 @@ use pg_cdc::state::s3::{S3StateStore, s3_client};
 use pg_cdc::status::Status;
 use pg_cdc::supervisor::{LiveSession, preflight, store_ready, supervise};
 use pg_cdc::telemetry::{
-    OTLP_ENDPOINT_VARIABLE, Telemetry, TelemetryIdentity, TelemetryLayers, TelemetryPlan, plan,
-    subscriber,
+    ErrorReporting, OTLP_ENDPOINT_VARIABLE, REPORTING_FLUSH_TIMEOUT, SENTRY_DSN_VARIABLE,
+    Telemetry, TelemetryIdentity, TelemetryLayers, TelemetryPlan, plan, reporting_plan, subscriber,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -153,8 +153,16 @@ fn flush_deadline(signalled: Option<Instant>, drain_timeout: Duration) -> Option
 }
 
 fn flush_window(deadline: Option<Instant>, now: Instant) -> Duration {
-    deadline.map_or(LOG_FLUSH_TIMEOUT, |deadline| {
-        LOG_FLUSH_TIMEOUT.min(deadline.saturating_duration_since(now))
+    within_budget(LOG_FLUSH_TIMEOUT, deadline, now)
+}
+
+fn reporting_window(deadline: Option<Instant>, now: Instant) -> Duration {
+    within_budget(REPORTING_FLUSH_TIMEOUT, deadline, now)
+}
+
+fn within_budget(limit: Duration, deadline: Option<Instant>, now: Instant) -> Duration {
+    deadline.map_or(limit, |deadline| {
+        limit.min(deadline.saturating_duration_since(now))
     })
 }
 
@@ -327,6 +335,19 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<PendingLog
             return (ExitCode::FAILURE, None);
         }
     };
+    let reporting_plan = reporting_plan(
+        &config.telemetry.sentry,
+        std::env::var(SENTRY_DSN_VARIABLE).ok().as_deref(),
+    );
+    let (reporting, reporting_layers) =
+        match ErrorReporting::install(reporting_plan.as_ref(), &identity) {
+            Ok(installed) => installed,
+            Err(error) => {
+                let _ = writeln!(std::io::stderr(), "pg-cdc: cannot start telemetry: {error}");
+                return (ExitCode::FAILURE, None);
+            }
+        };
+    let layers = TelemetryLayers::combine(layers, reporting_layers);
     let logs = match init_logging(&config.sink, layers) {
         Ok(logs) => logs,
         Err(error) => {
@@ -335,6 +356,9 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<PendingLog
         }
     };
     warn_when_telemetry_is_degraded(&plan, &telemetry);
+    if reporting_plan.is_some() && !reporting.is_enabled() {
+        tracing::warn!("error reporting is configured, but this build has no sentry feature");
+    }
     let drain_timeout = config.leadership.drain_timeout;
     let signalled = Arc::new(OnceLock::new());
     let board = Board {
@@ -354,6 +378,9 @@ fn run_command(runtime: &Runtime, config: &Path) -> (ExitCode, Option<PendingLog
     let deadline = flush_deadline(signalled.get().copied(), drain_timeout);
     if !telemetry.shutdown(flush_window(deadline, Instant::now())) {
         tracing::warn!("telemetry did not finish exporting within the shutdown budget");
+    }
+    if !reporting.shutdown(reporting_window(deadline, Instant::now())) {
+        tracing::warn!("error reports did not finish sending within the shutdown budget");
     }
     (
         code,
@@ -613,6 +640,25 @@ mod tests {
         assert_eq!(flush_window(Some(now), now), Duration::ZERO);
         assert_eq!(
             flush_window(Some(now), now + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn error_reports_flush_for_two_seconds_unless_the_sigterm_budget_has_less_left() {
+        let now = Instant::now();
+        assert_eq!(REPORTING_FLUSH_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(reporting_window(None, now), REPORTING_FLUSH_TIMEOUT);
+        assert_eq!(
+            reporting_window(Some(now + Duration::from_secs(10)), now),
+            REPORTING_FLUSH_TIMEOUT
+        );
+        assert_eq!(
+            reporting_window(Some(now + Duration::from_millis(1500)), now),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            reporting_window(Some(now), now + Duration::from_secs(1)),
             Duration::ZERO
         );
     }

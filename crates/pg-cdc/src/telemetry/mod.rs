@@ -16,6 +16,11 @@ use crate::status::Status;
 
 #[cfg(feature = "otel")]
 mod otel;
+mod reporting;
+
+pub use reporting::{
+    ErrorReporting, REPORTING_FLUSH_TIMEOUT, ReportingPlan, SENTRY_DSN_VARIABLE, reporting_plan,
+};
 
 pub const OTLP_ENDPOINT_VARIABLE: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 pub const TELEMETRY_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
@@ -37,19 +42,22 @@ pub struct TelemetryIdentity {
 }
 
 pub struct TelemetryLayers {
-    #[cfg(feature = "otel")]
     layers: Vec<Box<dyn Layer<Registry> + Send + Sync>>,
 }
 
 impl TelemetryLayers {
-    #[cfg(feature = "otel")]
     pub fn into_layer(self) -> Box<dyn Layer<Registry> + Send + Sync> {
         Box::new(self.layers)
     }
 
-    #[cfg(not(feature = "otel"))]
-    pub fn into_layer(self) -> Box<dyn Layer<Registry> + Send + Sync> {
-        Box::new(tracing_subscriber::layer::Identity::new())
+    pub fn combine(first: Option<Self>, second: Option<Self>) -> Option<Self> {
+        match (first, second) {
+            (Some(mut first), Some(second)) => {
+                first.layers.extend(second.layers);
+                Some(first)
+            }
+            (first, second) => first.or(second),
+        }
     }
 }
 
@@ -70,6 +78,8 @@ pub enum TelemetryError {
     },
     #[error(transparent)]
     Recorder(#[from] AlreadyInstalled),
+    #[error("cannot start error reporting: {0}")]
+    Reporting(String),
 }
 
 #[derive(Debug)]
