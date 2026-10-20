@@ -504,6 +504,7 @@ async fn run(
         status_interval: config.source.status_interval,
         buffer: REPLICATION_BUFFER,
         order_by: config.delivery.order_by.clone(),
+        order_by_tables: config.delivery.order_by_tables.clone(),
         lanes: config.delivery.lanes,
         sink_concurrency: config.sink.max_concurrency(),
         attribute_columns: config.sink.attribute_columns().to_vec(),

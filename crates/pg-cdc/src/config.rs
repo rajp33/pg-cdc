@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -19,7 +19,7 @@ use serde::forward_to_deserialize_any;
 use serde_json::{Map, Value};
 
 use crate::leader::POLL_INTERVAL;
-use crate::order::OrderBy;
+use crate::order::{OrderBy, TableName};
 use crate::state::s3::S3_ATTEMPT_TIMEOUT;
 
 pub const ENV_PREFIX: &str = "PGCDC__";
@@ -41,6 +41,7 @@ pub const DEFAULT_ADMIN_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr
 const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
 const TAG: &str = "type";
 const TAGGED: &str = "$pg_cdc::tagged";
+const LEAF: &str = "$pg_cdc::leaf";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -155,6 +156,8 @@ pub enum TlsMode {
 pub struct DeliveryConfig {
     #[serde(default, deserialize_with = "de_order_by")]
     pub order_by: OrderBy,
+    #[serde(default, deserialize_with = "de_order_by_tables")]
+    pub order_by_tables: BTreeMap<TableName, OrderBy>,
     #[serde(default = "default_lanes", deserialize_with = "de_count")]
     pub lanes: usize,
     #[serde(default = "default_max_inflight_bytes", deserialize_with = "de_size")]
@@ -169,6 +172,7 @@ impl Default for DeliveryConfig {
     fn default() -> Self {
         Self {
             order_by: OrderBy::default(),
+            order_by_tables: BTreeMap::new(),
             lanes: DEFAULT_LANES,
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
             park_after: DEFAULT_PARK_AFTER,
@@ -837,9 +841,12 @@ impl<'de> Deserializer<'de> for Probe<'_> {
 
     fn deserialize_newtype_struct<V: Visitor<'de>>(
         self,
-        _: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        if name == LEAF {
+            return leaf();
+        }
         visitor.visit_newtype_struct(self)
     }
 
@@ -1129,6 +1136,17 @@ impl DeliveryConfig {
                 reason: "must be greater than zero",
             });
         }
+        if let Some((table, _)) = self
+            .order_by_tables
+            .iter()
+            .find(|(_, order_by)| **order_by == OrderBy::Pipeline)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "delivery.order_by_tables",
+                value: table.to_string(),
+                reason: "a table orders by key, table or column:<name>; pipeline applies only to delivery.order_by",
+            });
+        }
         Ok(())
     }
 }
@@ -1368,6 +1386,77 @@ fn de_fair_queue_group<'de, D: Deserializer<'de>>(
 
 fn de_order_by<'de, D: Deserializer<'de>>(deserializer: D) -> Result<OrderBy, D::Error> {
     de_string(deserializer)?.parse().map_err(de::Error::custom)
+}
+
+fn de_order_by_tables<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<TableName, OrderBy>, D::Error> {
+    struct TablesVisitor;
+
+    fn insert<E: de::Error>(
+        tables: &mut BTreeMap<TableName, OrderBy>,
+        table: &str,
+        order_by: &str,
+    ) -> Result<(), E> {
+        let name: TableName = table.trim().parse().map_err(E::custom)?;
+        let order_by: OrderBy = order_by.trim().parse().map_err(E::custom)?;
+        if tables.insert(name, order_by).is_some() {
+            return Err(E::custom(format!(
+                "order_by_tables names {:?} more than once",
+                table.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    impl<'de> Visitor<'de> for TablesVisitor {
+        type Value = BTreeMap<TableName, OrderBy>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of schema.table to an order_by, or schema.table=order_by pairs separated by commas")
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut tables = BTreeMap::new();
+            while let Some((table, order_by)) = map.next_entry::<StringField, StringField>()? {
+                insert(&mut tables, &table.0, &order_by.0)?;
+            }
+            Ok(tables)
+        }
+
+        fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            let mut tables = BTreeMap::new();
+            for pair in text.split(',').filter(|pair| !pair.trim().is_empty()) {
+                let (table, order_by) = pair.split_once('=').ok_or_else(|| {
+                    E::custom(format!(
+                        "order_by_tables entry {:?} must be schema.table=order_by",
+                        pair.trim()
+                    ))
+                })?;
+                insert(&mut tables, table, order_by)?;
+            }
+            Ok(tables)
+        }
+    }
+
+    struct LeafVisitor;
+
+    impl<'de> Visitor<'de> for LeafVisitor {
+        type Value = BTreeMap<TableName, OrderBy>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            TablesVisitor.expecting(formatter)
+        }
+
+        fn visit_newtype_struct<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(TablesVisitor)
+        }
+    }
+
+    deserializer.deserialize_newtype_struct(LEAF, LeafVisitor)
 }
 
 fn de_size<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
@@ -2006,6 +2095,7 @@ state_store:
         let config = parse(MINIMAL, with_password()).unwrap();
         assert_eq!(config.delivery, DeliveryConfig::default());
         assert_eq!(config.delivery.order_by, OrderBy::Key);
+        assert!(config.delivery.order_by_tables.is_empty());
         assert_eq!(config.delivery.lanes, 64);
         assert_eq!(config.delivery.max_inflight_bytes, 256 * 1024 * 1024);
         assert_eq!(config.delivery.park_after, Duration::from_secs(30));
@@ -2023,6 +2113,7 @@ state_store:
             config.delivery,
             DeliveryConfig {
                 order_by: OrderBy::Column("tenant_id".to_owned()),
+                order_by_tables: BTreeMap::new(),
                 lanes: 8,
                 max_inflight_bytes: 64 << 20,
                 park_after: Duration::from_secs(120),
@@ -2047,6 +2138,94 @@ state_store:
         assert_eq!(config.delivery.max_inflight_bytes, 1 << 30);
         assert_eq!(config.delivery.park_after, Duration::from_millis(500));
         assert_eq!(config.delivery.max_parked_events, 25);
+    }
+
+    fn table_overrides(entries: &[(&str, &str)]) -> BTreeMap<TableName, OrderBy> {
+        entries
+            .iter()
+            .map(|(table, order_by)| (table.parse().unwrap(), order_by.parse().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn parses_per_table_order_overrides() {
+        let yaml = MINIMAL.replace(
+            "sink:",
+            "delivery:\n  order_by: key\n  order_by_tables:\n    public.orders: column:id\n    public.order_items: column:order_id\n    audit.log: table\nsink:",
+        );
+        let config = parse(&yaml, with_password()).unwrap();
+        assert_eq!(config.delivery.order_by, OrderBy::Key);
+        assert_eq!(
+            config.delivery.order_by_tables,
+            table_overrides(&[
+                ("public.orders", "column:id"),
+                ("public.order_items", "column:order_id"),
+                ("audit.log", "table"),
+            ])
+        );
+        assert_eq!(config.unknown_keys, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn environment_sets_per_table_order_overrides_as_a_list() {
+        let mut vars = with_password();
+        vars.extend(env(&[(
+            "PGCDC__DELIVERY__ORDER_BY_TABLES",
+            "public.orders=column:id, public.order_items=column:order_id",
+        )]));
+        let config = parse(MINIMAL, vars).unwrap();
+        assert_eq!(
+            config.delivery.order_by_tables,
+            table_overrides(&[
+                ("public.orders", "column:id"),
+                ("public.order_items", "column:order_id"),
+            ])
+        );
+        assert_eq!(config.unknown_keys, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn rejects_invalid_per_table_order_overrides() {
+        let tables = |body: &str| {
+            MINIMAL.replace(
+                "sink:",
+                &format!("delivery:\n  order_by_tables:\n{body}\nsink:"),
+            )
+        };
+        for body in [
+            "    orders: column:id",
+            "    public.orders: random",
+            "    public.orders: \"column:\"",
+            "    - public.orders",
+        ] {
+            assert!(
+                matches!(
+                    parse(&tables(body), with_password()),
+                    Err(ConfigError::Invalid(_))
+                ),
+                "{body}"
+            );
+        }
+        for text in [
+            "public.orders",
+            "public.orders=column:id,public.orders=table",
+        ] {
+            let mut vars = with_password();
+            vars.extend(env(&[("PGCDC__DELIVERY__ORDER_BY_TABLES", text)]));
+            assert!(
+                matches!(parse(MINIMAL, vars), Err(ConfigError::Invalid(_))),
+                "{text}"
+            );
+        }
+        let error = parse(&tables("    public.orders: pipeline"), with_password()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::InvalidValue { field: "delivery.order_by_tables", value, .. }
+                    if value == "public.orders"
+            ),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2438,8 +2617,8 @@ state_store:
                 "future_section",
             ),
             (
-                MINIMAL.replace("sink:", "delivery:\n  order_by_tables: orders\nsink:"),
-                "delivery.order_by_tables",
+                MINIMAL.replace("sink:", "delivery:\n  order_by_columns: orders\nsink:"),
+                "delivery.order_by_columns",
             ),
             (
                 MINIMAL.replace("  slot:", "  sslmode: require\n  slot:"),
@@ -2480,8 +2659,8 @@ state_store:
     fn unknown_environment_keys_are_ignored_and_named_by_their_dotted_path() {
         for (vars, key) in [
             (
-                vec![("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders")],
-                "delivery.order_by_tables",
+                vec![("PGCDC__DELIVERY__ORDER_BY_COLUMNS", "orders")],
+                "delivery.order_by_columns",
             ),
             (vec![("PGCDC__FUTURE__ENABLED", "true")], "future"),
             (vec![("PGCDC__PIPELINE__NAME", "x")], "pipeline.name"),
@@ -2513,16 +2692,16 @@ state_store:
     fn unknown_keys_are_sorted_and_listed_once() {
         let yaml = format!(
             "{}zeta: 1\nalpha:\n  nested: true\n",
-            MINIMAL.replace("sink:", "delivery:\n  order_by_tables: orders\nsink:")
+            MINIMAL.replace("sink:", "delivery:\n  order_by_columns: orders\nsink:")
         );
         let keys = unknown_keys(
             &yaml,
             &[
-                ("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders"),
+                ("PGCDC__DELIVERY__ORDER_BY_COLUMNS", "orders"),
                 ("PGCDC__ALPHA__OTHER", "x"),
             ],
         );
-        assert_eq!(keys, ["alpha", "delivery.order_by_tables", "zeta"]);
+        assert_eq!(keys, ["alpha", "delivery.order_by_columns", "zeta"]);
     }
 
     #[test]
@@ -2545,7 +2724,7 @@ state_store:
         ));
         let mut vars = with_password();
         vars.extend(env(&[
-            ("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders"),
+            ("PGCDC__DELIVERY__ORDER_BY_COLUMNS", "orders"),
             ("PGCDC__DELIVERY__LANES", "0"),
         ]));
         assert!(matches!(
@@ -2653,6 +2832,7 @@ state_store:
             "state_store.bucket",
             "payload_store.bucket",
             "delivery.park_after",
+            "delivery.order_by_tables",
             "leadership.lease_timeout",
             "admin.listen",
             "telemetry.sentry.dsn",

@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use pg_cdc_decoder::Lsn;
 use pg_cdc_decoder::value::{TypeKind, builtin_kind};
 use tokio_postgres::Client;
+
+use crate::order::TableName;
 
 const MAX_TYPE_DEPTH: usize = 16;
 
@@ -30,6 +32,21 @@ const IDENTITY_SQL: &str = "SELECT pt.schemaname::text, pt.tablename::text FROM 
      JOIN pg_namespace n ON n.nspname = pt.schemaname \
      JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename \
      WHERE pt.pubname = $1 AND c.relreplident <> 'f' ORDER BY 1, 2";
+
+const VERSION_SQL: &str = "SELECT current_setting('server_version_num')::int";
+
+const REPLICATED_COLUMNS: &str = "ARRAY(SELECT a.attname::text FROM pg_attribute a \
+     WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = '' \
+     {listed} ORDER BY a.attnum)";
+
+const PUBLISHED_TABLES_SQL: &str = "SELECT pt.schemaname::text, pt.tablename::text, {columns} \
+     FROM pg_publication_tables pt \
+     JOIN pg_namespace n ON n.nspname = pt.schemaname \
+     JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename \
+     WHERE pt.pubname = $1";
+
+const COLUMN_LISTS_SINCE: i32 = 150_000;
+const GENERATED_COLUMNS_SINCE: i32 = 180_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -169,6 +186,34 @@ pub async fn tables_without_full_identity(
     rows.iter()
         .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
         .collect()
+}
+
+pub async fn published_columns(
+    client: &Client,
+    publication: &str,
+) -> Result<BTreeMap<TableName, Vec<String>>, CatalogError> {
+    let version: i32 = client.query_one(VERSION_SQL, &[]).await?.try_get(0)?;
+    let columns = if version >= GENERATED_COLUMNS_SINCE {
+        "coalesce(pt.attnames::text[], '{}')".to_owned()
+    } else if version >= COLUMN_LISTS_SINCE {
+        REPLICATED_COLUMNS.replace(
+            "{listed}",
+            "AND (pt.attnames IS NULL OR a.attname = ANY (pt.attnames))",
+        )
+    } else {
+        REPLICATED_COLUMNS.replace("{listed}", "")
+    };
+    let sql = PUBLISHED_TABLES_SQL.replace("{columns}", &columns);
+    let rows = client.query(&sql, &[&publication]).await?;
+    let mut tables = BTreeMap::new();
+    for row in &rows {
+        let name = TableName {
+            schema: row.try_get(0)?,
+            table: row.try_get(1)?,
+        };
+        tables.insert(name, row.try_get(2)?);
+    }
+    Ok(tables)
 }
 
 #[cfg(test)]

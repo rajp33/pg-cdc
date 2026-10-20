@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -32,6 +33,68 @@ impl FromStr for OrderBy {
                 _ => Err(InvalidOrderBy(text.to_owned())),
             },
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TableName {
+    pub schema: String,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not a schema-qualified table name such as public.orders")]
+pub struct InvalidTableName(pub String);
+
+impl FromStr for TableName {
+    type Err = InvalidTableName;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.split_once('.') {
+            Some((schema, table)) if !schema.is_empty() && !table.is_empty() => Ok(Self {
+                schema: schema.to_owned(),
+                table: table.to_owned(),
+            }),
+            _ => Err(InvalidTableName(text.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for TableName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.schema, self.table)
+    }
+}
+
+pub fn table_override<'a>(
+    tables: &'a BTreeMap<TableName, OrderBy>,
+    schema: &str,
+    table: &str,
+) -> Option<&'a OrderBy> {
+    tables
+        .iter()
+        .find(|(name, _)| name.schema == schema && name.table == table)
+        .map(|(_, order_by)| order_by)
+}
+
+pub fn table_order_by<'a>(
+    default: &'a OrderBy,
+    tables: &'a BTreeMap<TableName, OrderBy>,
+    schema: &str,
+    table: &str,
+) -> &'a OrderBy {
+    table_override(tables, schema, table).unwrap_or(default)
+}
+
+pub fn missing_order_column<'a, S: AsRef<str>>(
+    order_by: &'a OrderBy,
+    columns: &[S],
+) -> Option<&'a str> {
+    match order_by {
+        OrderBy::Column(name) if !columns.iter().any(|column| column.as_ref() == name) => {
+            Some(name)
+        }
+        _ => None,
     }
 }
 
@@ -283,6 +346,125 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    fn in_table(table: &str, mut event: Envelope) -> Envelope {
+        table.clone_into(&mut event.table);
+        event
+    }
+
+    fn overrides(entries: &[(&str, OrderBy)]) -> BTreeMap<TableName, OrderBy> {
+        entries
+            .iter()
+            .map(|(name, order_by)| (name.parse().unwrap(), order_by.clone()))
+            .collect()
+    }
+
+    fn column(name: &str) -> OrderBy {
+        OrderBy::Column(name.to_owned())
+    }
+
+    #[test]
+    fn table_names_parse_as_schema_dot_table() {
+        assert_eq!(
+            "public.orders".parse(),
+            Ok(TableName {
+                schema: "public".to_owned(),
+                table: "orders".to_owned(),
+            })
+        );
+        assert_eq!(
+            "sales.order.items"
+                .parse::<TableName>()
+                .map(|name| name.to_string()),
+            Ok("sales.order.items".to_owned())
+        );
+        for bad in ["", "orders", ".orders", "public.", "."] {
+            assert_eq!(
+                bad.parse::<TableName>(),
+                Err(InvalidTableName(bad.to_owned())),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_override_replaces_the_default_for_that_table_only() {
+        let tables = overrides(&[
+            ("public.orders", column("id")),
+            ("sales.orders", OrderBy::Table),
+        ]);
+        assert_eq!(
+            table_order_by(&OrderBy::Key, &tables, "public", "orders"),
+            &column("id")
+        );
+        assert_eq!(
+            table_order_by(&OrderBy::Key, &tables, "sales", "orders"),
+            &OrderBy::Table
+        );
+        assert_eq!(
+            table_order_by(&OrderBy::Key, &tables, "public", "order_items"),
+            &OrderBy::Key
+        );
+        assert_eq!(
+            table_order_by(&OrderBy::Pipeline, &BTreeMap::new(), "public", "orders"),
+            &OrderBy::Pipeline
+        );
+    }
+
+    #[test]
+    fn only_a_column_mode_can_miss_its_column() {
+        let columns = ["id", "order_id"];
+        assert_eq!(missing_order_column(&column("order_id"), &columns), None);
+        assert_eq!(
+            missing_order_column(&column("order_ref"), &columns),
+            Some("order_ref")
+        );
+        for order_by in [OrderBy::Key, OrderBy::Table, OrderBy::Pipeline] {
+            assert_eq!(missing_order_column(&order_by, &columns), None);
+        }
+    }
+
+    #[test]
+    fn a_parent_id_and_its_children_foreign_key_share_one_order_key() {
+        let order = in_table("orders", insert(json!({"id": 42, "status": "paid"})));
+        let item = in_table(
+            "order_items",
+            insert(json!({"id": 7, "order_id": 42, "sku": "a"})),
+        );
+        let other_item = in_table("order_items", insert(json!({"id": 8, "order_id": 43})));
+        let by_id = column("id");
+        let by_order = column("order_id");
+        assert_eq!(canonical_order_key(&by_id, &order).to_string(), "[42]");
+        assert_eq!(canonical_order_key(&by_order, &item).to_string(), "[42]");
+        let key = order_key(&by_id, &order);
+        assert_eq!(key, order_key(&by_order, &item));
+        assert_eq!(key, OrderKeyId::of(b"[42]"));
+        assert_eq!(key.lane(64), order_key(&by_order, &item).lane(64));
+        assert_ne!(key, order_key(&by_order, &other_item));
+    }
+
+    #[test]
+    fn an_override_falls_back_to_its_table_when_the_column_is_absent_or_null() {
+        let by_order = column("order_id");
+        for after in [json!({"id": 7}), json!({"id": 7, "order_id": null})] {
+            assert_eq!(
+                canonical_order_key(&by_order, &in_table("order_items", insert(after))).to_string(),
+                r#"["public","order_items"]"#
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncate_orders_by_its_table_under_its_tables_effective_mode() {
+        let tables = overrides(&[("public.orders", column("id"))]);
+        let truncate = |table: &str| in_table(table, envelope(Op::Truncate, None, None, None));
+        let canonical = |table: &str| {
+            let order_by = table_order_by(&OrderBy::Pipeline, &tables, "public", table);
+            canonical_order_key(order_by, &truncate(table)).to_string()
+        };
+        assert_eq!(canonical("orders"), r#"["public","orders"]"#);
+        assert_eq!(canonical("order_items"), "[]");
     }
 
     proptest! {

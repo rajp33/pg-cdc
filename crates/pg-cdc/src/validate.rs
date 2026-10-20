@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use tokio_postgres::Client;
 
 use crate::catalog::CatalogError;
+use crate::order::{OrderBy, TableName, missing_order_column};
 
 pub const PGOUTPUT: &str = "pgoutput";
 
@@ -51,6 +54,10 @@ pub enum Invalid {
     PublicationMissing(String),
     #[error("the configured role cannot open a replication connection: {0}")]
     ReplicationDenied(String),
+    #[error(
+        "delivery.order_by_tables orders {table} by column {column}, which publication does not replicate; publish the column or order the table by table"
+    )]
+    OrderColumnUnpublished { table: String, column: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +138,26 @@ pub async fn validate(
 ) -> Result<Verdict, ValidationError> {
     let facts = source_facts(client, slot, publication).await?;
     Ok(assess(&facts, slot, publication)?)
+}
+
+pub fn judge_order_overrides<'a>(
+    overrides: &'a BTreeMap<TableName, OrderBy>,
+    published: &BTreeMap<TableName, Vec<String>>,
+) -> Result<Vec<&'a TableName>, Invalid> {
+    let mut unpublished = Vec::new();
+    for (table, order_by) in overrides {
+        let Some(columns) = published.get(table) else {
+            unpublished.push(table);
+            continue;
+        };
+        if let Some(column) = missing_order_column(order_by, columns) {
+            return Err(Invalid::OrderColumnUnpublished {
+                table: table.to_string(),
+                column: column.to_owned(),
+            });
+        }
+    }
+    Ok(unpublished)
 }
 
 fn assess(facts: &SourceFacts, slot: &str, publication: &str) -> Result<Verdict, Invalid> {
@@ -292,6 +319,42 @@ mod tests {
     fn judge_lets_an_unreserved_slot_through() {
         let facts = with_slot(|slot| slot.wal_status = Some("unreserved".to_owned()));
         assert_eq!(judge(&facts, SLOT, PUBLICATION), Ok(Verdict::Unreserved));
+    }
+
+    #[test]
+    fn an_override_column_the_publication_does_not_replicate_fails_validation() {
+        let table = |name: &str| TableName {
+            schema: "public".to_owned(),
+            table: name.to_owned(),
+        };
+        let published = BTreeMap::from([
+            (table("orders"), vec!["id".to_owned(), "status".to_owned()]),
+            (
+                table("order_items"),
+                vec!["id".to_owned(), "sku".to_owned()],
+            ),
+        ]);
+        let column = |name: &str| OrderBy::Column(name.to_owned());
+        let fine = BTreeMap::from([
+            (table("orders"), column("id")),
+            (table("order_items"), OrderBy::Key),
+            (table("staged"), column("order_id")),
+        ]);
+        assert_eq!(
+            judge_order_overrides(&fine, &published),
+            Ok(vec![&table("staged")])
+        );
+        let unpublished_column = BTreeMap::from([
+            (table("orders"), column("id")),
+            (table("order_items"), column("order_id")),
+        ]);
+        assert_eq!(
+            judge_order_overrides(&unpublished_column, &published),
+            Err(Invalid::OrderColumnUnpublished {
+                table: "public.order_items".to_owned(),
+                column: "order_id".to_owned(),
+            })
+        );
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

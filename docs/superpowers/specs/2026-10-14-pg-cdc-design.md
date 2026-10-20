@@ -281,10 +281,16 @@ The xid is left out of the envelope: it is 32 bits and wraps, and `commit_lsn` a
 | `column:<name>` | the value of that column; schema and table when the column is absent or null |
 | `pipeline` | one constant key: total order, with one event in flight at a time |
 
+- **Per-table overrides.** `delivery.order_by_tables` maps `schema.table` to `key`, `table` or `column:<name>` (not `pipeline`); other tables use `delivery.order_by`.
+  - The effective mode is resolved once per Relation message and cached with the relation, so events never look it up by name.
+  - Fallbacks and truncates (§7.4) follow the table's effective mode.
+  - Startup validation (§13.2) fails on an override column the publication does not replicate, and warns about a named table outside the publication.
+  - Each key's events stay in commit order, but a row's events stay on one key only while its order column keeps its value; a changed or nulled value, a rename or a column the stream stops carrying moves later events to another key.
+  - A mapping change gives rows new keys while parked queues keep their old ones, so parked events can be delivered out of order relative to new events. pg-cdc does not check for this; operators drain parked events before changing the mapping.
 - **The canonical order key** is a compact JSON array:
   - `[schema, table, v1, v2, …]` for `key`, with values in key column order;
   - `[schema, table]` for `table`, and for any fallback to the table;
-  - `[value]` for `column:<name>`;
+  - `[value]` for `column:<name>`, so tables keyed by columns holding equal values share an order key;
   - `[]` for `pipeline`.
 - **The order key id** is the 128-bit xxh3 hash of the canonical order key, written as 32 hex digits.
   - It names parked queues (§11.4), FIFO message groups (§11.2) and admin handles.
@@ -292,7 +298,7 @@ The xid is left out of the envelope: it is 32 bits and wraps, and `commit_lsn` a
 
 ### 7.4 Truncate
 
-A truncate produces one event per truncated relation, with `key`, `before` and `after` all `null`. Its order key is the table, so under `order_by: key` it is not ordered relative to that table's row events.
+A truncate produces one event per truncated relation, with `key`, `before` and `after` all `null`. Its order key follows the relation's effective mode (§7.3): the table under `key`, `table` and `column:<name>`, and the constant key under `pipeline`. Under `key` and `column:<name>` it is therefore not ordered relative to that table's row events.
 
 ### 7.5 Oversize events
 
@@ -669,6 +675,8 @@ At process start, in any role, pg-cdc checks over the control connection that:
 - the slot exists, uses `pgoutput`, belongs to the configured database, and has a `wal_status` other than `lost`;
 - the publication exists.
 
+It also reads, in one query, every published table and the columns the publication replicates (its column list on Postgres 15 and later; generated columns only from 18). An override whose `column:<name>` is not replicated fails validation, since every event of that table would fall back to its table key. A named table that is not in the publication logs a warning and does not block.
+
 It then opens a replication connection and closes it without `START_REPLICATION`, to check that the role can log in for replication.
 
 On failure:
@@ -762,6 +770,9 @@ source:
 
 delivery:
   order_by: key
+  order_by_tables:
+    public.orders: column:id
+    public.order_items: column:order_id
   lanes: 64
   park_after: 30s
   max_parked_events: 10000000
@@ -809,6 +820,7 @@ With `credentials.type: password`, the password comes from `PGCDC__SOURCE__CREDE
 | `source.tls.mode` | `verify-full` |
 | `source.status_interval` | `10s` |
 | `delivery.order_by` | `key` |
+| `delivery.order_by_tables` | empty |
 | `delivery.lanes` | `64` |
 | `delivery.park_after` | `30s` |
 | `delivery.max_parked_events` | `10000000` (`0` = unlimited) |

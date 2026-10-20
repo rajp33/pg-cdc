@@ -4,9 +4,9 @@ pg-cdc reads one YAML file, passed as `pg-cdc run --config <file>`. The [runbook
 
 ## Loading rules
 
-- **Environment overrides.** Any key can be set or overridden with `PGCDC__<SECTION>__<KEY>`, for example `PGCDC__DELIVERY__PARK_AFTER=60s` or `PGCDC__SINK__ATTRIBUTE_COLUMNS=tenant_id,region` (lists as comma-separated values). A `PGCDC__` variable whose path does not name a configuration key is an unknown key: it is never merged into the configuration, so it cannot create a section, change how a known key is read, or appear in an error message. A variable with an empty segment, such as `PGCDC__SOURCE____PORT`, is an error.
+- **Environment overrides.** Any key can be set or overridden with `PGCDC__<SECTION>__<KEY>`, for example `PGCDC__DELIVERY__PARK_AFTER=60s` or `PGCDC__SINK__ATTRIBUTE_COLUMNS=tenant_id,region` (lists as comma-separated values). `delivery.order_by_tables` is set as a whole, as comma-separated `schema.table=order_by` pairs; a variable naming one of its tables is an unknown key. A `PGCDC__` variable whose path does not name a configuration key is an unknown key: it is never merged into the configuration, so it cannot create a section, change how a known key is read, or appear in an error message. A variable with an empty segment, such as `PGCDC__SOURCE____PORT`, is an error.
 - **Secrets come from the environment only.** With `credentials.type: password`, the password is read from `PGCDC__SOURCE__CREDENTIALS__PASSWORD`; a password in the file is rejected.
-- **Unknown keys are ignored with a warning.** A key this version does not know, in the file or from a `PGCDC__` variable, does not stop startup. pg-cdc logs one warning, `ignoring unknown configuration keys`, whose `keys` field names each one by its dotted path up to the first name this version does not know (`delivery.order_by_tables`, `future_section`), never with its value, and carries on. A key that belongs to a different `type` of the same section, such as `topic_arn` under a `stdout` sink, is reported the same way. That lets a key added by a newer version, or left behind after a rollback, through without a crash loop. The trade-off is that a misspelled key or section name is ignored too and its setting quietly keeps its default, so check the startup log for that warning after every configuration change. Startup still stops on a known key with an invalid value, on a missing required key, and on a `type` that is not a plain string naming one of the documented types.
+- **Unknown keys are ignored with a warning.** A key this version does not know, in the file or from a `PGCDC__` variable, does not stop startup. pg-cdc logs one warning, `ignoring unknown configuration keys`, whose `keys` field names each one by its dotted path up to the first name this version does not know (`delivery.order_by_columns`, `future_section`), never with its value, and carries on. A key that belongs to a different `type` of the same section, such as `topic_arn` under a `stdout` sink, is reported the same way. That lets a key added by a newer version, or left behind after a rollback, through without a crash loop. The trade-off is that a misspelled key or section name is ignored too and its setting quietly keeps its default, so check the startup log for that warning after every configuration change. Startup still stops on a known key with an invalid value, on a missing required key, and on a `type` that is not a plain string naming one of the documented types.
 - **Units.** Durations are whole numbers with `ms`, `s`, `m` or `h` (`30s`); sizes are whole numbers with `B`, `KiB`, `MiB` or `GiB` (`256MiB`).
 
 ## Full example
@@ -82,6 +82,7 @@ telemetry:
 | `source.slot`, `source.publication` | required | 1 to 63 lowercase letters, digits or underscores. pg-cdc never creates or drops either. |
 | `source.status_interval` | `10s` | How often the confirmed position is reported to Postgres. |
 | `delivery.order_by` | `key` | `key`, `table`, `column:<name>` or `pipeline` (see [Order keys](#order-keys)). |
+| `delivery.order_by_tables` | `{}` | Per-table overrides of `order_by`: `schema.table` to `key`, `table` or `column:<name>` (see [Order keys](#order-keys)). In the environment, comma-separated `schema.table=order_by` pairs. |
 | `delivery.lanes` | `64` | 1 to 4,096. An event goes to lane `order key id mod lanes`. |
 | `delivery.max_inflight_bytes` | `256MiB` | The reader stops when in-flight events (their encoded bodies) reach this size. |
 | `delivery.park_after` | `30s` | How long an event may stay undelivered after its first failure before it is parked. |
@@ -126,6 +127,24 @@ The order key decides ordering and lane placement. Events of one order key are d
 | `pipeline` | one key for everything: total order, one event in flight at a time |
 
 A truncate has no key: its order key is its table under `key`, `table` and the `column:<name>` fallback, and the one constant key under `pipeline`. Under `key` and `column:<name>` it is therefore not ordered relative to that table's row events that use a different order key. One order key moves at most one event per sink round trip, roughly 20 to 50 events/s against SNS, so choose `order_by` so that no single key carries a high rate.
+
+`delivery.order_by_tables` overrides `order_by` for the tables it names; every other table keeps `order_by`:
+
+```yaml
+delivery:
+  order_by: key
+  order_by_tables:
+    public.orders: column:id
+    public.order_items: column:order_id
+```
+
+- **Values.** A value is `key`, `table` or `column:<name>`; `pipeline` is rejected, since it orders the whole pipeline. The fallback to the table and the truncate rule above follow each table's own mode.
+- **Table names.** Each key is `schema.table`, split at the first dot, trimmed and matched exactly against the replicated schema and table names, with no SQL quoting. A schema whose name contains a dot cannot be named. From the environment the map is one variable of comma-separated pairs, `PGCDC__DELIVERY__ORDER_BY_TABLES=public.orders=column:id,public.order_items=column:order_id`, with no escaping: a table name containing `,` or `=`, or a column name containing `,`, needs the YAML form.
+- **Grouping across tables.** `column:<name>` keys by the value alone, so above an order and its items share one order key, one lane and, on a FIFO topic, one message group, also within one transaction. The two columns must hold equal JSON values: an `int` and a `text` column never match. Unrelated `column:<name>` tables whose values coincide share a key too, which only serializes them.
+- **Order holds per key, not per row.** Each order key's events are delivered in commit order, but a row's history stays on one key only while its order column keeps its value. An update that changes `order_id` from 42 to 43, sets it to or from NULL (NULL falls back to the table key), or changes a parent's primary key sends the row's later events to another key, and they can be delivered before its earlier events still waiting on the old one. So can a table rename (the override no longer matches the new name) and a column the stream stops carrying. Choose order columns whose values never change.
+- **Columns the event must carry.** The value is read from `after`, or from `before` for a delete. A delete carries a non-key column only under `REPLICA IDENTITY FULL`; an unchanged TOASTed value (a large `text`, `bytea` or `jsonb`) is left out of an update's `after` unless the table uses FULL identity, which fills it in. Fixed-size types such as `int`, `bigint` and `uuid` are never TOASTed. Without the value, the event falls back to its table key.
+- **Startup check.** Validation fails, and the task stays unhealthy and retries, when an override names a column the publication does not replicate (a missing column, one left out of a publication column list on Postgres 15 and later, or a generated column before 18); order such a table by `table` if that is the intent. A named table outside the publication only logs a warning. A Relation message that drops an override's column during streaming also logs a warning.
+- **Changing it** gives rows new keys while parked events keep their old ones, so parked events can be delivered out of order relative to new events under the new key. pg-cdc does not check for this; drain the parked events first, as the [runbook](runbook.md#5-parked-and-dead-events) describes.
 
 ## Sinks
 

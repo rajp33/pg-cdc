@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,12 +32,14 @@ use crate::leader::standby::{
     AcquireError, OBJECT_IN_USE, ProbeError, SlotHolder, SlotProbe, StartError, acquire,
 };
 use crate::metrics::{self, ErrorComponent, ErrorKind, EventOutcome, Measurement};
-use crate::order::{OrderBy, order_key};
+use crate::order::{
+    OrderBy, OrderKeyId, TableName, missing_order_column, order_key, table_order_by, table_override,
+};
 use crate::sink::{Outbound, Sink, metric_labels};
 use crate::state::StateStore;
 use crate::state::instrumented::instrumented;
 use crate::status::{ParkedAccess, Status};
-use crate::validate::{Invalid, ValidationError, validate};
+use crate::validate::{Invalid, ValidationError, judge_order_overrides, validate};
 
 pub const REPLICATION_BUFFER: usize = 64;
 pub const HANDOVER_TAIL: Duration = Duration::from_secs(3);
@@ -65,6 +67,7 @@ pub struct SessionConfig {
     pub status_interval: Duration,
     pub buffer: usize,
     pub order_by: OrderBy,
+    pub order_by_tables: BTreeMap<TableName, OrderBy>,
     pub lanes: usize,
     pub sink_concurrency: usize,
     pub attribute_columns: Vec<String>,
@@ -326,6 +329,7 @@ async fn serve(
         parked_store: gated.state,
         status,
         order_by: &config.order_by,
+        order_by_tables: &config.order_by_tables,
         attribute_columns: &config.attribute_columns,
         max_inflight_bytes: config.max_inflight_bytes,
         slot: &config.slot,
@@ -581,6 +585,20 @@ async fn check_source(
         tracing::warn!(%schema, %table, "published table does not use REPLICA IDENTITY FULL");
     }
     status.set_tables_without_full_identity(u64::try_from(unsafe_tables.len()).unwrap_or(u64::MAX));
+    if !config.order_by_tables.is_empty() {
+        let published = catalog::published_columns(control.client(), &config.publication).await?;
+        match judge_order_overrides(&config.order_by_tables, &published) {
+            Ok(unpublished) => {
+                for table in unpublished {
+                    tracing::warn!(%table, "delivery.order_by_tables names a table that is not in the publication");
+                }
+            }
+            Err(invalid) => {
+                health.set_validated(false);
+                return Err(invalid.into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -718,13 +736,14 @@ struct Leadership {
 struct Session<'a> {
     control: &'a ControlConnection,
     types: TypeResolver,
-    relations: HashMap<u32, RelationInfo>,
+    relations: HashMap<u32, KnownRelation>,
     builder: Builder,
     ack: AckTracker,
     lanes: Lanes,
     parked_store: Arc<dyn StateStore>,
     status: &'a Status,
     order_by: &'a OrderBy,
+    order_by_tables: &'a BTreeMap<TableName, OrderBy>,
     attribute_columns: &'a [String],
     max_inflight_bytes: u64,
     slot: &'a str,
@@ -987,7 +1006,7 @@ impl Session<'_> {
     async fn message(&mut self, wal_start: Lsn, data: &[u8]) -> Result<Option<Lsn>, SessionError> {
         let message = decode(data).map_err(|source| SessionError::Decode { wal_start, source })?;
         let build_error = |source| SessionError::Build { wal_start, source };
-        let built = match message {
+        let (key, built) = match message {
             LogicalMessage::Begin(begin) => {
                 self.builder
                     .begin(begin.final_lsn, begin.commit_ts)
@@ -1017,32 +1036,39 @@ impl Session<'_> {
             LogicalMessage::Type(_) | LogicalMessage::Origin(_) => return Ok(None),
             LogicalMessage::Insert(insert) => {
                 let relation = known(&self.relations, wal_start, insert.relation_oid)?;
-                self.builder
-                    .insert(relation, &insert)
-                    .map_err(build_error)?
+                let built = self
+                    .builder
+                    .insert(&relation.info, &insert)
+                    .map_err(build_error)?;
+                relation.keyed(built)
             }
             LogicalMessage::Update(update) => {
                 let relation = known(&self.relations, wal_start, update.relation_oid)?;
-                self.builder
-                    .update(relation, &update)
-                    .map_err(build_error)?
+                let built = self
+                    .builder
+                    .update(&relation.info, &update)
+                    .map_err(build_error)?;
+                relation.keyed(built)
             }
             LogicalMessage::Delete(delete) => {
                 let relation = known(&self.relations, wal_start, delete.relation_oid)?;
-                self.builder
-                    .delete(relation, &delete)
-                    .map_err(build_error)?
+                let built = self
+                    .builder
+                    .delete(&relation.info, &delete)
+                    .map_err(build_error)?;
+                relation.keyed(built)
             }
             LogicalMessage::Truncate(truncate) => {
                 for oid in truncate.relation_oids {
                     let relation = known(&self.relations, wal_start, oid)?;
-                    let event = self.builder.truncate(relation).map_err(build_error)?;
-                    self.emit(&event)?;
+                    let built = self.builder.truncate(&relation.info).map_err(build_error)?;
+                    let (key, built) = relation.keyed(built);
+                    self.emit(&built, key)?;
                 }
                 return Ok(None);
             }
         };
-        self.emit(&built)?;
+        self.emit(&built, key)?;
         Ok(None)
     }
 
@@ -1064,6 +1090,21 @@ impl Session<'_> {
         } else {
             relation.namespace
         };
+        if let Some(column) = table_override(self.order_by_tables, &schema, &relation.name)
+            .and_then(|order_by| {
+                let names: Vec<&str> = columns.iter().map(|column| column.name.as_str()).collect();
+                missing_order_column(order_by, &names)
+            })
+        {
+            tracing::warn!(
+                %schema,
+                table = %relation.name,
+                %column,
+                "the replication stream no longer carries this table's delivery.order_by_tables column; its events order by table"
+            );
+        }
+        let order_by =
+            table_order_by(self.order_by, self.order_by_tables, &schema, &relation.name).clone();
         let info = RelationInfo {
             oid: relation.oid,
             schema,
@@ -1071,11 +1112,12 @@ impl Session<'_> {
             columns,
             key_columns,
         };
-        self.relations.insert(relation.oid, info);
+        self.relations
+            .insert(relation.oid, KnownRelation { info, order_by });
         Ok(())
     }
 
-    fn emit(&mut self, built: &Built) -> Result<(), SessionError> {
+    fn emit(&mut self, built: &Built, key: OrderKeyId) -> Result<(), SessionError> {
         for fallback in &built.fallbacks {
             metrics::record(Measurement::DecodeFallback {
                 type_oid: fallback.type_oid,
@@ -1087,7 +1129,6 @@ impl Session<'_> {
                 "value fell back to its text form"
             );
         }
-        let key = order_key(self.order_by, &built.envelope);
         let outbound = Outbound::encode(&built.envelope, key, self.attribute_columns)?;
         let bytes = u64::try_from(outbound.body.len()).unwrap_or(u64::MAX);
         let ticket = self.ack.track(bytes)?;
@@ -1112,11 +1153,22 @@ impl Session<'_> {
     }
 }
 
+struct KnownRelation {
+    info: RelationInfo,
+    order_by: OrderBy,
+}
+
+impl KnownRelation {
+    fn keyed(&self, built: Built) -> (OrderKeyId, Built) {
+        (order_key(&self.order_by, &built.envelope), built)
+    }
+}
+
 fn known(
-    relations: &HashMap<u32, RelationInfo>,
+    relations: &HashMap<u32, KnownRelation>,
     wal_start: Lsn,
     oid: u32,
-) -> Result<&RelationInfo, SessionError> {
+) -> Result<&KnownRelation, SessionError> {
     relations
         .get(&oid)
         .ok_or(SessionError::UnknownRelation { wal_start, oid })

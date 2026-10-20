@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -85,6 +86,7 @@ pub(crate) fn config(status_interval: Duration, buffer: usize) -> SessionConfig 
         status_interval,
         buffer,
         order_by: OrderBy::Pipeline,
+        order_by_tables: BTreeMap::new(),
         lanes: 1,
         sink_concurrency: 4,
         attribute_columns: Vec::new(),
@@ -419,7 +421,7 @@ pub(crate) struct TestSink {
     limits: SinkCapabilities,
     mode: watch::Receiver<Mode>,
     failures: watch::Sender<u64>,
-    delivered: mpsc::UnboundedSender<Bytes>,
+    delivered: mpsc::UnboundedSender<(OrderKeyId, Bytes)>,
     calls: watch::Sender<u64>,
 }
 
@@ -464,7 +466,9 @@ impl Sink for TestSink {
                     self.failures.send_modify(|count| *count += 1);
                     Outcome::Retryable(SinkError("test sink is failing".to_owned()))
                 } else {
-                    let _ = self.delivered.send(outbound.body.clone());
+                    let _ = self
+                        .delivered
+                        .send((outbound.order_key, outbound.body.clone()));
                     Outcome::Delivered
                 }
             })
@@ -475,7 +479,7 @@ impl Sink for TestSink {
 pub(crate) struct Running {
     shutdown: CancellationToken,
     task: JoinHandle<Result<(), SessionError>>,
-    events: mpsc::UnboundedReceiver<Bytes>,
+    events: mpsc::UnboundedReceiver<(OrderKeyId, Bytes)>,
     mode: watch::Sender<Mode>,
     failures: watch::Receiver<u64>,
     calls: watch::Receiver<u64>,
@@ -585,14 +589,18 @@ fn spawn_run(
 
 impl Running {
     pub(crate) async fn next_event(&mut self) -> TestResult<Value> {
-        let Some(body) = tokio::time::timeout(WAIT, self.events.recv()).await? else {
+        Ok(self.next_keyed_event().await?.1)
+    }
+
+    pub(crate) async fn next_keyed_event(&mut self) -> TestResult<(OrderKeyId, Value)> {
+        let Some((key, body)) = tokio::time::timeout(WAIT, self.events.recv()).await? else {
             return Err(match (&mut self.task).await {
                 Ok(Ok(())) => "the session ended before delivering the event".into(),
                 Ok(Err(error)) => format!("the session failed: {error}").into(),
                 Err(error) => format!("the session task failed: {error}").into(),
             });
         };
-        Ok(serde_json::from_slice(&body)?)
+        Ok((key, serde_json::from_slice(&body)?))
     }
 
     pub(crate) async fn next_events(&mut self, count: usize) -> TestResult<Vec<Value>> {

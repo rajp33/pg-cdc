@@ -160,6 +160,14 @@ Discard removes the head only if it is still that event (409 with the current he
 
 **Startup and takeover.** Reading starts at once; delivery for an order key waits until the parked queue heads of its partition (the first byte of the order key id, 256 partitions) have loaded. Replayed events below a queue's head are skipped. Store calls, including the listing during head loading, are bounded by `state_store.max_concurrency`.
 
+**Changing order keys.** Changing `delivery.order_by` or `delivery.order_by_tables` gives the affected rows a new order key, lane and FIFO message group. Parked queues are named by order key id (`parked/<order key id>/`), so a queue parked under the old mapping keeps draining under its old key, while new events of the same rows take the new key and do not wait behind it: parked events can be delivered out of order relative to new events under the new key. A replayed event that is already parked is no longer recognized under its new key, so it is delivered live and again when the old queue drains; consumers dedupe on the event `id` (a FIFO topic dedupes only within SNS's 5-minute window). pg-cdc does not check for any of this: keeping order across the change is up to the operator. An event that is retrying when the old task stops is parked during its shutdown, so check the parked count with writes stopped and nothing in flight. Change the mapping at a stable cutoff:
+
+1. Stop writes to the affected tables, or accept that changes made during the switch may be reordered.
+2. Let the running tasks, still on the old config, catch up and deliver everything. Drain the parked events, or redrive or discard them (section 5), until, on the active task, `/status` shows `inflight.events` 0 and `parked.events` 0, `pg-cdc parked list` is empty, and the slot's `confirmed_flush_lsn` reaches `pg_current_wal_lsn()`.
+3. Stop every task on the old config.
+4. Let consumers drain their queues: on a FIFO topic, events still waiting in an old message group can be processed after newer events in the new group.
+5. Start the tasks with the new config, then resume writes.
+
 **The parked count is approximate.** It is loaded from the store at startup and can over-count replayed events until the next restart, so `max_parked_events` errs towards stalling early. During a large parking backlog it also trails the store.
 
 **Memory bound.** Memory is bounded by `delivery.max_inflight_bytes`, measured on encoded event bodies, plus one event above the bound, up to 65 raw replication messages read ahead of the bound (so the read-ahead depends on the widest row, not the transaction size), one sink batch of parked events per lane loaded for redelivery (`delivery.lanes` x 10 for SNS, x 1,024 for stdout and discard), and the parked order keys below. Measurements are in [docs/load.md](load.md#memory-criterion-6).
