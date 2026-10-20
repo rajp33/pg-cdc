@@ -2712,6 +2712,81 @@ state_store:
     }
 
     #[test]
+    fn tagged_section_errors_keep_their_messages() {
+        let sink = "sink:\n  type: stdout\n";
+        let no_sink = MINIMAL.replace(sink, "");
+        let expects_map = "expected a map with a type key";
+        let sink_types = "expected one of `stdout`, `discard`, `sns`";
+        for (yaml, vars, expected) in [
+            (
+                MINIMAL.replace(sink, "sink:\n  max_concurrency: 2\n"),
+                vec![],
+                "missing field `type`".to_owned(),
+            ),
+            (
+                MINIMAL.replace("credentials:\n    type: password", "credentials: {}"),
+                vec![],
+                "missing field `type`".to_owned(),
+            ),
+            (
+                MINIMAL.replace("type: stdout", "type: kafka"),
+                vec![],
+                format!("unknown variant `kafka`, {sink_types}"),
+            ),
+            (
+                MINIMAL.replace("type: stdout", "type: {stdout: null}"),
+                vec![],
+                "invalid type: map, expected a string".to_owned(),
+            ),
+            (
+                MINIMAL.replace(sink, "sink: stdout\n"),
+                vec![],
+                format!("invalid type: string \"stdout\", {expects_map}"),
+            ),
+            (
+                MINIMAL.replace(sink, "sink:\n"),
+                vec![],
+                format!("invalid type: null, {expects_map}"),
+            ),
+            (
+                MINIMAL.replace(sink, "sink: [stdout]\n"),
+                vec![],
+                format!("invalid type: sequence, {expects_map}"),
+            ),
+            (
+                no_sink.clone(),
+                vec![("PGCDC__SINK__MAX_CONCURRENCY", "2")],
+                "missing field `type`".to_owned(),
+            ),
+            (
+                MINIMAL.to_owned(),
+                vec![("PGCDC__SINK__TYPE", "kafka")],
+                format!("unknown variant `kafka`, {sink_types}"),
+            ),
+            (
+                no_sink.clone(),
+                vec![("PGCDC__SINK", "stdout")],
+                format!("invalid type: string \"stdout\", {expects_map}"),
+            ),
+            (
+                MINIMAL.to_owned(),
+                vec![("PGCDC__SINK", "stdout")],
+                format!("invalid type: string \"stdout\", {expects_map}"),
+            ),
+            (no_sink, vec![], "missing field `sink`".to_owned()),
+        ] {
+            let mut all = with_password();
+            all.extend(env(&vars));
+            let error = parse(&yaml, all).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!("invalid configuration: {expected}"),
+                "{yaml}\n{vars:?}"
+            );
+        }
+    }
+
+    #[test]
     fn password_is_redacted_in_debug() {
         let config = parse(MINIMAL, with_password()).unwrap();
         let debug = format!("{config:?}");
