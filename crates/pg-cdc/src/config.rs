@@ -40,6 +40,7 @@ pub const DEFAULT_SENTRY_SAMPLE_RATE: f64 = 1.0;
 pub const DEFAULT_ADMIN_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9187);
 const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
 const TAG: &str = "type";
+const TAGGED: &str = "$pg_cdc::tagged";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -564,6 +565,8 @@ pub enum ConfigError {
     MissingPassword,
     #[error("environment variable {0} has an empty key between its __ separators")]
     BadEnvKey(String),
+    #[error("configuration keys cannot be mapped to environment variables: {0}")]
+    Schema(String),
     #[error("{field} {value:?} is invalid: {reason}")]
     InvalidValue {
         field: &'static str,
@@ -595,6 +598,9 @@ pub fn parse(
     if tree.pointer("/source/credentials/password").is_some() {
         return Err(ConfigError::PasswordInFile);
     }
+    let known = KNOWN_PATHS
+        .as_ref()
+        .map_err(|error| ConfigError::Schema(error.clone()))?;
     let mut unknown_keys = Vec::new();
     for (name, value) in env {
         let Some(path) = name.strip_prefix(ENV_PREFIX) else {
@@ -604,7 +610,7 @@ pub fn parse(
         if keys.iter().any(String::is_empty) {
             return Err(ConfigError::BadEnvKey(name));
         }
-        match unknown_prefix(&keys) {
+        match unknown_prefix(known, &keys) {
             Some(prefix) => unknown_keys.push(prefix),
             None => set_path(&mut tree, &keys, Value::String(value)),
         }
@@ -696,7 +702,7 @@ fn de_tagged<'de, T: Tagged, D: Deserializer<'de>>(deserializer: D) -> Result<T,
         }
     }
 
-    deserializer.deserialize_map(TaggedVisitor(PhantomData))
+    deserializer.deserialize_struct(TAGGED, &[TAG], TaggedVisitor(PhantomData))
 }
 
 fn set_path(tree: &mut Value, keys: &[String], value: Value) {
@@ -713,20 +719,21 @@ fn set_path(tree: &mut Value, keys: &[String], value: Value) {
     *node = value;
 }
 
-fn unknown_prefix(keys: &[String]) -> Option<String> {
+fn unknown_prefix(known: &BTreeSet<Vec<String>>, keys: &[String]) -> Option<String> {
     let mut prefix = Vec::new();
     for key in keys {
         prefix.push(key.clone());
-        if !KNOWN_PATHS.contains(&prefix) {
+        if !known.contains(&prefix) {
             return Some(prefix.join("."));
         }
     }
     None
 }
 
-static KNOWN_PATHS: LazyLock<BTreeSet<Vec<String>>> = LazyLock::new(known_paths);
+static KNOWN_PATHS: LazyLock<Result<BTreeSet<Vec<String>>, String>> =
+    LazyLock::new(known_paths::<Config>);
 
-fn known_paths() -> BTreeSet<Vec<String>> {
+fn known_paths<T: DeserializeOwned>() -> Result<BTreeSet<Vec<String>>, String> {
     let schema = RefCell::new(Schema::default());
     let mut next = vec![Vec::new()];
     while let Some(route) = next.pop() {
@@ -736,10 +743,19 @@ fn known_paths() -> BTreeSet<Vec<String>> {
             path: Vec::new(),
             schema: &schema,
         };
-        let _ = Config::deserialize(probe);
+        let _ = T::deserialize(probe);
         next.append(&mut schema.borrow_mut().pending);
     }
-    schema.into_inner().known
+    let schema = schema.into_inner();
+    if let Some(path) = schema.unsupported.first() {
+        return Err(format!(
+            "{path} is not a plain struct or a tagged section, for example it uses #[serde(flatten)] or is a map"
+        ));
+    }
+    if schema.known.is_empty() {
+        return Err("no configuration keys were found".to_owned());
+    }
+    Ok(schema.known)
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -753,6 +769,7 @@ struct Schema {
     known: BTreeSet<Vec<String>>,
     routes: BTreeSet<Vec<Step>>,
     pending: Vec<Vec<Step>>,
+    unsupported: Vec<String>,
 }
 
 impl Schema {
@@ -784,6 +801,16 @@ impl<'a> Probe<'a> {
             path,
             schema: self.schema,
         }
+    }
+
+    fn unsupported<T>(&self) -> Result<T, de::value::Error> {
+        let path = if self.path.is_empty() {
+            "the root".to_owned()
+        } else {
+            self.path.join(".")
+        };
+        self.schema.borrow_mut().unsupported.push(path);
+        leaf()
     }
 
     fn know(&self, key: &str) {
@@ -818,10 +845,19 @@ impl<'de> Deserializer<'de> for Probe<'_> {
 
     fn deserialize_struct<V: Visitor<'de>>(
         self,
-        _: &'static str,
+        name: &'static str,
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        if name == TAGGED {
+            return match self.rest.first() {
+                None | Some(Step::Variant(_)) => {
+                    self.know(TAG);
+                    visitor.visit_enum(self)
+                }
+                Some(Step::Key(_)) => self.unsupported(),
+            };
+        }
         match self.rest.split_first() {
             None => {
                 for &field in fields {
@@ -833,13 +869,12 @@ impl<'de> Deserializer<'de> for Probe<'_> {
             Some((step @ &Step::Key(key), rest)) => {
                 visitor.visit_map(ProbeEntry(Some((key, self.advance(step, rest, Some(key))))))
             }
-            Some((Step::Variant(_), _)) => leaf(),
+            Some((Step::Variant(_), _)) => self.unsupported(),
         }
     }
 
-    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        self.know(TAG);
-        visitor.visit_enum(self)
+    fn deserialize_map<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+        self.unsupported()
     }
 
     forward_to_deserialize_any! {
@@ -944,7 +979,7 @@ impl<'de> Deserializer<'de> for ProbeTag<'_, '_> {
                 leaf()
             }
             Some(&Step::Variant(variant)) => visitor.visit_enum(StrDeserializer::new(variant)),
-            Some(Step::Key(_)) => leaf(),
+            Some(Step::Key(_)) => probe.unsupported(),
         }
     }
 
@@ -2546,6 +2581,67 @@ state_store:
         assert_eq!(config.source.port, 5433);
         assert!(config.payload_store.is_some());
         assert_eq!(config.unknown_keys, [] as [&str; 0]);
+    }
+
+    fn path(dotted: &str) -> Vec<String> {
+        dotted.split('.').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn discovery_maps_the_full_configuration() {
+        let known = known_paths::<Config>().unwrap();
+        for dotted in [
+            "pipeline",
+            "source.port",
+            "source.tls.mode",
+            "source.credentials.type",
+            "source.credentials.password",
+            "source.credentials.region",
+            "sink.type",
+            "sink.topic_arn",
+            "sink.attribute_columns",
+            "state_store.path",
+            "state_store.bucket",
+            "payload_store.bucket",
+            "delivery.park_after",
+            "leadership.lease_timeout",
+            "admin.listen",
+            "telemetry.sentry.dsn",
+        ] {
+            assert!(known.contains(&path(dotted)), "{dotted}");
+        }
+    }
+
+    #[test]
+    fn every_discovered_key_is_lowercase() {
+        for keys in known_paths::<Config>().unwrap() {
+            for key in &keys {
+                assert_eq!(*key, key.to_ascii_lowercase(), "{keys:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_flattened_sections() {
+        #[derive(Deserialize)]
+        struct Shared {
+            _name: String,
+        }
+
+        #[derive(Deserialize)]
+        struct Section {
+            #[serde(flatten)]
+            _shared: Shared,
+        }
+
+        #[derive(Deserialize)]
+        struct Outer {
+            _pipeline: String,
+            _section: Option<Section>,
+        }
+
+        let error = known_paths::<Outer>().unwrap_err();
+        assert!(error.contains("_section"), "{error}");
     }
 
     #[test]
