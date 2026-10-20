@@ -741,6 +741,7 @@ Each invariant has an enforcement mechanism listed in §14.6. A runtime violatio
 
 - **One YAML file,** passed with `--config`. Any key can be overridden by an environment variable named `PGCDC__<SECTION>__<KEY>`.
 - **Secrets come from the environment only.** A password in the file is rejected.
+- **Unknown keys are ignored with a warning.** Keys this version does not know, from the file or the environment, are logged once at startup at warn level as dotted paths, never with their values, and startup continues, so a key added by a newer version or left behind after a rollback cannot crash-loop a task. An environment variable is merged only when its path names a known key, so an unknown one cannot create a section, change how a known key is read, or appear in an error. A known key with an invalid value, and a `type` that is not a plain string naming a known type, still fail startup. Persisted state (the leader record and parked events) still rejects unknown fields.
 - **Units.** Durations take units (`30s`), and sizes take binary units (`256MiB`).
 
 ```yaml

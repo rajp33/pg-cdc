@@ -90,6 +90,7 @@ sentry = { version = "0.49.3", default-features = false, features = [
   "rustls",
 ] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_ignored = "0.1.14"
 serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 serde_json = { version = "1.0.154", features = [
   "arbitrary_precision",

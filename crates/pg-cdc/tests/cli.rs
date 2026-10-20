@@ -842,14 +842,8 @@ async fn parked_commands_reject_malformed_ids_before_sending() -> TestResult {
 #[tokio::test]
 async fn a_task_that_cannot_reach_postgres_serves_status_and_refuses_parked_operations()
 -> TestResult {
-    let state = tempfile::tempdir()?;
-    let mut file = tempfile::NamedTempFile::new()?;
-    write!(
-        file,
-        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  port: 1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: {}\n{LEADERSHIP}{ADMIN_ANY_PORT}",
-        state.path().display()
-    )?;
-    let mut child = spawn(file.path(), "unused", Stdio::piped())?;
+    let config = write_unreachable_config("")?;
+    let mut child = spawn(config.path(), "unused", Stdio::piped())?;
     let mut stderr = BufReader::new(child.stderr.take().ok_or("no stderr")?).lines();
     let addr = admin_addr(&mut stderr).await?;
 
@@ -868,5 +862,89 @@ async fn a_task_that_cannot_reach_postgres_serves_status_and_refuses_parked_oper
 
     sigterm(&child).await?;
     assert!(tokio::time::timeout(WAIT, child.wait()).await??.success());
+    Ok(())
+}
+
+fn write_unreachable_config(extra: &str) -> TestResult<ConfigFile> {
+    let state = tempfile::tempdir()?;
+    let mut file = tempfile::NamedTempFile::new()?;
+    write!(
+        file,
+        "pipeline: cli\nsource:\n  host: 127.0.0.1\n  port: 1\n  database: postgres\n  user: pgcdc\n  credentials:\n    type: password\n  tls:\n    mode: disable\n  slot: s\n  publication: p\nsink:\n  type: stdout\nstate_store:\n  type: filesystem\n  path: {}\n{LEADERSHIP}{ADMIN_ANY_PORT}{extra}",
+        state.path().display()
+    )?;
+    Ok(ConfigFile { file, state })
+}
+
+async fn lines_until<R: AsyncBufRead + Unpin>(
+    lines: &mut Lines<R>,
+    needle: &str,
+) -> TestResult<Vec<String>> {
+    tokio::time::timeout(WAIT, async {
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next_line().await? {
+            let found = line.contains(needle);
+            seen.push(line);
+            if found {
+                return Ok(seen);
+            }
+        }
+        Err(format!("output ended before {needle:?}").into())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn unknown_config_keys_start_the_task_with_one_warning_naming_them_without_values()
+-> TestResult {
+    for (extra, env, key) in [
+        ("future_section: hunter2-top\n", vec![], "future_section"),
+        (
+            "delivery:\n  order_by_tables: hunter2-nested\n",
+            vec![],
+            "delivery.order_by_tables",
+        ),
+        (
+            "",
+            vec![("PGCDC__DELIVERY__ORDER_BY_TABLES", "hunter2-env")],
+            "delivery.order_by_tables",
+        ),
+    ] {
+        let config = write_unreachable_config(extra)?;
+        let mut child = spawn_with_env(config.path(), "unused", Stdio::piped(), &env)?;
+        let mut stderr = BufReader::new(child.stderr.take().ok_or("no stderr")?).lines();
+        let lines = lines_until(&mut stderr, "admin listening").await?;
+        let warnings: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("unknown configuration keys"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{key}: {lines:?}");
+        let warning: Value = serde_json::from_str(warnings[0])?;
+        assert_eq!(warning["level"], "WARN", "{warning}");
+        assert_eq!(warning["fields"]["keys"], key, "{warning}");
+        assert!(
+            lines.iter().all(|line| !line.contains("hunter2")),
+            "{lines:?}"
+        );
+        sigterm(&child).await?;
+        assert!(tokio::time::timeout(WAIT, child.wait()).await??.success());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_invalid_known_value_still_stops_the_task_when_unknown_keys_are_present() -> TestResult {
+    let config = write_unreachable_config("future_section: 1\ndelivery:\n  lanes: 0\n")?;
+    let child = spawn_with_env(
+        config.path(),
+        "unused",
+        Stdio::piped(),
+        &[("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders")],
+    )?;
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await??;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid configuration"), "{stderr}");
+    assert!(stderr.contains("delivery.lanes"), "{stderr}");
     Ok(())
 }

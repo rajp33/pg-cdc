@@ -1,12 +1,21 @@
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::fmt;
+use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use serde::de::{self, Deserializer, Visitor};
+use serde::de::value::{MapAccessDeserializer, StrDeserializer, StringDeserializer};
+use serde::de::{
+    self, DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess, MapAccess, SeqAccess,
+    VariantAccess, Visitor,
+};
+use serde::forward_to_deserialize_any;
 use serde_json::{Map, Value};
 
 use crate::leader::POLL_INTERVAL;
@@ -30,9 +39,10 @@ pub const DEFAULT_TRACE_SAMPLE_RATIO: f64 = 0.01;
 pub const DEFAULT_SENTRY_SAMPLE_RATE: f64 = 1.0;
 pub const DEFAULT_ADMIN_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9187);
 const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
+const TAG: &str = "type";
+const TAGGED: &str = "$pg_cdc::tagged";
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(deserialize_with = "de_string")]
     pub pipeline: String,
@@ -49,10 +59,11 @@ pub struct Config {
     pub admin: AdminConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(skip)]
+    pub unknown_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     #[serde(deserialize_with = "de_string")]
     pub host: String,
@@ -73,25 +84,61 @@ pub struct SourceConfig {
     pub status_interval: Duration,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub enum Credentials {
-    Password {
-        password: Option<SecretString>,
-    },
-    AwsRdsIam {
-        #[serde(default, deserialize_with = "de_opt_string")]
-        region: Option<String>,
-    },
+    Password { password: Option<SecretString> },
+    AwsRdsIam { region: Option<String> },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TlsSection {
     #[serde(default)]
     pub mode: TlsMode,
     #[serde(default, deserialize_with = "de_opt_path")]
     pub ca_file: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CredentialsType {
+    Password,
+    AwsRdsIam,
+}
+
+#[derive(Deserialize)]
+struct PasswordFields {
+    #[serde(default)]
+    password: Option<SecretString>,
+}
+
+#[derive(Deserialize)]
+struct AwsRdsIamFields {
+    #[serde(default, deserialize_with = "de_opt_string")]
+    region: Option<String>,
+}
+
+impl Tagged for Credentials {
+    type Tag = CredentialsType;
+
+    fn from_fields<'de, D: Deserializer<'de>>(
+        tag: CredentialsType,
+        fields: D,
+    ) -> Result<Self, D::Error> {
+        Ok(match tag {
+            CredentialsType::Password => Self::Password {
+                password: PasswordFields::deserialize(fields)?.password,
+            },
+            CredentialsType::AwsRdsIam => Self::AwsRdsIam {
+                region: AwsRdsIamFields::deserialize(fields)?.region,
+            },
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Credentials {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        de_tagged(deserializer)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -105,7 +152,6 @@ pub enum TlsMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DeliveryConfig {
     #[serde(default, deserialize_with = "de_order_by")]
     pub order_by: OrderBy,
@@ -132,7 +178,6 @@ impl Default for DeliveryConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LeadershipConfig {
     #[serde(default = "default_lease_timeout", deserialize_with = "de_duration")]
     pub lease_timeout: Duration,
@@ -153,7 +198,6 @@ impl Default for LeadershipConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     #[serde(default = "default_admin_listen", deserialize_with = "de_socket_addr")]
     pub listen: SocketAddr,
@@ -168,7 +212,6 @@ impl Default for AdminConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     #[serde(default, deserialize_with = "de_opt_string")]
     pub otlp_endpoint: Option<String>,
@@ -189,7 +232,6 @@ impl Default for TelemetryConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SentryConfig {
     #[serde(default)]
     pub dsn: Option<SecretString>,
@@ -226,15 +268,13 @@ impl PartialEq for SentryConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateStoreConfig {
     S3(S3StoreConfig),
     Filesystem(FilesystemStoreConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct S3StoreConfig {
     #[serde(deserialize_with = "de_string")]
     pub bucket: String,
@@ -247,12 +287,40 @@ pub struct S3StoreConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FilesystemStoreConfig {
     #[serde(deserialize_with = "de_path")]
     pub path: PathBuf,
     #[serde(default = "default_store_concurrency", deserialize_with = "de_count")]
     pub max_concurrency: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StateStoreType {
+    S3,
+    Filesystem,
+}
+
+impl Tagged for StateStoreConfig {
+    type Tag = StateStoreType;
+
+    fn from_fields<'de, D: Deserializer<'de>>(
+        tag: StateStoreType,
+        fields: D,
+    ) -> Result<Self, D::Error> {
+        match tag {
+            StateStoreType::S3 => S3StoreConfig::deserialize(fields).map(Self::S3),
+            StateStoreType::Filesystem => {
+                FilesystemStoreConfig::deserialize(fields).map(Self::Filesystem)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StateStoreConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        de_tagged(deserializer)
+    }
 }
 
 impl StateStoreConfig {
@@ -279,14 +347,37 @@ impl StateStoreConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PayloadStoreConfig {
     S3(S3PayloadConfig),
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PayloadStoreType {
+    S3,
+}
+
+impl Tagged for PayloadStoreConfig {
+    type Tag = PayloadStoreType;
+
+    fn from_fields<'de, D: Deserializer<'de>>(
+        tag: PayloadStoreType,
+        fields: D,
+    ) -> Result<Self, D::Error> {
+        match tag {
+            PayloadStoreType::S3 => S3PayloadConfig::deserialize(fields).map(Self::S3),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PayloadStoreConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        de_tagged(deserializer)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct S3PayloadConfig {
     #[serde(deserialize_with = "de_string")]
     pub bucket: String,
@@ -318,8 +409,7 @@ fn validate_bucket(field: &'static str, bucket: &str) -> Result<(), ConfigError>
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkConfig {
     Stdout(BasicSinkConfig),
     Discard(BasicSinkConfig),
@@ -327,7 +417,6 @@ pub enum SinkConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BasicSinkConfig {
     #[serde(default = "default_sink_concurrency", deserialize_with = "de_count")]
     pub max_concurrency: usize,
@@ -342,7 +431,6 @@ impl Default for BasicSinkConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SnsConfig {
     #[serde(deserialize_with = "de_string")]
     pub topic_arn: String,
@@ -354,6 +442,32 @@ pub struct SnsConfig {
     pub attribute_columns: Vec<String>,
     #[serde(default, deserialize_with = "de_fair_queue_group")]
     pub fair_queue_group: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SinkType {
+    Stdout,
+    Discard,
+    Sns,
+}
+
+impl Tagged for SinkConfig {
+    type Tag = SinkType;
+
+    fn from_fields<'de, D: Deserializer<'de>>(tag: SinkType, fields: D) -> Result<Self, D::Error> {
+        match tag {
+            SinkType::Stdout => BasicSinkConfig::deserialize(fields).map(Self::Stdout),
+            SinkType::Discard => BasicSinkConfig::deserialize(fields).map(Self::Discard),
+            SinkType::Sns => SnsConfig::deserialize(fields).map(Self::Sns),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SinkConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        de_tagged(deserializer)
+    }
 }
 
 impl SinkConfig {
@@ -449,8 +563,10 @@ pub enum ConfigError {
     PasswordInFile,
     #[error("password credentials need PGCDC__SOURCE__CREDENTIALS__PASSWORD")]
     MissingPassword,
-    #[error("environment variable {0} does not name a configuration key")]
+    #[error("environment variable {0} has an empty key between its __ separators")]
     BadEnvKey(String),
+    #[error("configuration keys cannot be mapped to environment variables: {0}")]
+    Schema(String),
     #[error("{field} {value:?} is invalid: {reason}")]
     InvalidValue {
         field: &'static str,
@@ -482,39 +598,412 @@ pub fn parse(
     if tree.pointer("/source/credentials/password").is_some() {
         return Err(ConfigError::PasswordInFile);
     }
+    let known = KNOWN_PATHS
+        .as_ref()
+        .map_err(|error| ConfigError::Schema(error.clone()))?;
+    let mut unknown_keys = Vec::new();
     for (name, value) in env {
         let Some(path) = name.strip_prefix(ENV_PREFIX) else {
             continue;
         };
         let keys: Vec<String> = path.split("__").map(str::to_ascii_lowercase).collect();
-        if keys.iter().any(String::is_empty)
-            || set_path(&mut tree, &keys, Value::String(value)).is_none()
-        {
+        if keys.iter().any(String::is_empty) {
             return Err(ConfigError::BadEnvKey(name));
         }
+        match unknown_prefix(known, &keys) {
+            Some(prefix) => unknown_keys.push(prefix),
+            None => set_path(&mut tree, &keys, Value::String(value)),
+        }
     }
-    let config: Config = serde_json::from_value(tree)?;
+    tag_first(&mut tree);
+    let mut config: Config =
+        serde_ignored::deserialize(tree, |path| unknown_keys.push(dotted(&path)))?;
     config.validate()?;
+    unknown_keys.sort();
+    unknown_keys.dedup();
+    config.unknown_keys = unknown_keys;
     Ok(config)
 }
 
-fn set_path(tree: &mut Value, keys: &[String], value: Value) -> Option<()> {
-    let (last, parents) = keys.split_last()?;
+fn tag_first(node: &mut Value) {
+    match node {
+        Value::Object(map) => {
+            if let Some(tag) = map.shift_remove(TAG) {
+                map.shift_insert(0, TAG.to_owned(), tag);
+            }
+            map.values_mut().for_each(tag_first);
+        }
+        Value::Array(items) => items.iter_mut().for_each(tag_first),
+        _ => {}
+    }
+}
+
+fn dotted(path: &serde_ignored::Path<'_>) -> String {
+    let mut keys = Vec::new();
+    let mut node = path;
+    loop {
+        node = match node {
+            serde_ignored::Path::Root => break,
+            serde_ignored::Path::Map { parent, key } => {
+                keys.push(key.clone());
+                parent
+            }
+            serde_ignored::Path::Seq { parent, index } => {
+                keys.push(index.to_string());
+                parent
+            }
+            serde_ignored::Path::Some { parent }
+            | serde_ignored::Path::NewtypeStruct { parent }
+            | serde_ignored::Path::NewtypeVariant { parent } => parent,
+        };
+    }
+    keys.reverse();
+    keys.join(".")
+}
+
+struct FieldsSeed<T: Tagged>(T::Tag);
+
+impl<'de, T: Tagged> DeserializeSeed<'de> for FieldsSeed<T> {
+    type Value = T;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<T, D::Error> {
+        T::from_fields(self.0, deserializer)
+    }
+}
+
+trait Tagged: Sized {
+    type Tag: DeserializeOwned;
+
+    fn from_fields<'de, D: Deserializer<'de>>(tag: Self::Tag, fields: D) -> Result<Self, D::Error>;
+}
+
+fn de_tagged<'de, T: Tagged, D: Deserializer<'de>>(deserializer: D) -> Result<T, D::Error> {
+    struct TaggedVisitor<T>(PhantomData<T>);
+
+    impl<'de, T: Tagged> Visitor<'de> for TaggedVisitor<T> {
+        type Value = T;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map with a type key")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<T, A::Error> {
+            if map.next_key::<String>()?.as_deref() != Some(TAG) {
+                return Err(de::Error::missing_field(TAG));
+            }
+            let tag: String = map.next_value()?;
+            let tag = T::Tag::deserialize(StringDeserializer::<A::Error>::new(tag))?;
+            T::from_fields(tag, MapAccessDeserializer::new(map))
+        }
+
+        fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<T, A::Error> {
+            let (tag, fields) = data.variant()?;
+            fields.newtype_variant_seed(FieldsSeed::<T>(tag))
+        }
+    }
+
+    deserializer.deserialize_struct(TAGGED, &[TAG], TaggedVisitor(PhantomData))
+}
+
+fn set_path(tree: &mut Value, keys: &[String], value: Value) {
     let mut node = tree;
-    for key in parents {
+    for key in keys {
         if node.is_null() {
             *node = Value::Object(Map::new());
         }
-        node = node
-            .as_object_mut()?
-            .entry(key.clone())
-            .or_insert(Value::Null);
+        let Some(map) = node.as_object_mut() else {
+            return;
+        };
+        node = map.entry(key.clone()).or_insert(Value::Null);
     }
-    if node.is_null() {
-        *node = Value::Object(Map::new());
+    *node = value;
+}
+
+fn unknown_prefix(known: &BTreeSet<Vec<String>>, keys: &[String]) -> Option<String> {
+    let mut prefix = Vec::new();
+    for key in keys {
+        prefix.push(key.clone());
+        if !known.contains(&prefix) {
+            return Some(prefix.join("."));
+        }
     }
-    node.as_object_mut()?.insert(last.clone(), value);
-    Some(())
+    None
+}
+
+static KNOWN_PATHS: LazyLock<Result<BTreeSet<Vec<String>>, String>> =
+    LazyLock::new(known_paths::<Config>);
+
+fn known_paths<T: DeserializeOwned>() -> Result<BTreeSet<Vec<String>>, String> {
+    let schema = RefCell::new(Schema::default());
+    let mut next = vec![Vec::new()];
+    while let Some(route) = next.pop() {
+        let probe = Probe {
+            done: Vec::new(),
+            rest: &route,
+            path: Vec::new(),
+            schema: &schema,
+        };
+        let _ = T::deserialize(probe);
+        next.append(&mut schema.borrow_mut().pending);
+    }
+    let schema = schema.into_inner();
+    if let Some(path) = schema.unsupported.first() {
+        return Err(format!(
+            "{path} is not a plain struct or a tagged section, for example it uses #[serde(flatten)] or is a map"
+        ));
+    }
+    if schema.known.is_empty() {
+        return Err("no configuration keys were found".to_owned());
+    }
+    Ok(schema.known)
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Step {
+    Key(&'static str),
+    Variant(&'static str),
+}
+
+#[derive(Default)]
+struct Schema {
+    known: BTreeSet<Vec<String>>,
+    routes: BTreeSet<Vec<Step>>,
+    pending: Vec<Vec<Step>>,
+    unsupported: Vec<String>,
+}
+
+impl Schema {
+    fn visit(&mut self, done: &[Step], step: Step) {
+        let mut route = done.to_vec();
+        route.push(step);
+        if self.routes.insert(route.clone()) {
+            self.pending.push(route);
+        }
+    }
+}
+
+struct Probe<'a> {
+    done: Vec<Step>,
+    rest: &'a [Step],
+    path: Vec<&'static str>,
+    schema: &'a RefCell<Schema>,
+}
+
+impl<'a> Probe<'a> {
+    fn advance(&self, step: &Step, rest: &'a [Step], key: Option<&'static str>) -> Self {
+        let mut path = self.path.clone();
+        path.extend(key);
+        let mut done = self.done.clone();
+        done.push(step.clone());
+        Self {
+            done,
+            rest,
+            path,
+            schema: self.schema,
+        }
+    }
+
+    fn unsupported<T>(&self) -> Result<T, de::value::Error> {
+        let path = if self.path.is_empty() {
+            "the root".to_owned()
+        } else {
+            self.path.join(".")
+        };
+        self.schema.borrow_mut().unsupported.push(path);
+        leaf()
+    }
+
+    fn know(&self, key: &str) {
+        let mut path: Vec<String> = self.path.iter().map(|&key| key.to_owned()).collect();
+        path.push(key.to_owned());
+        self.schema.borrow_mut().known.insert(path);
+    }
+}
+
+fn leaf<T>() -> Result<T, de::value::Error> {
+    Err(de::Error::custom("leaf"))
+}
+
+impl<'de> Deserializer<'de> for Probe<'_> {
+    type Error = de::value::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_map(MapReader(&self))
+    }
+
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        if name == TAGGED {
+            return match self.rest.first() {
+                None | Some(Step::Variant(_)) => {
+                    self.know(TAG);
+                    visitor.visit_enum(self)
+                }
+                Some(Step::Key(_)) => self.unsupported(),
+            };
+        }
+        match self.rest.split_first() {
+            None => {
+                for &field in fields {
+                    self.know(field);
+                    self.schema.borrow_mut().visit(&self.done, Step::Key(field));
+                }
+                leaf()
+            }
+            Some((step @ &Step::Key(key), rest)) => {
+                visitor.visit_map(ProbeEntry(Some((key, self.advance(step, rest, Some(key))))))
+            }
+            Some((Step::Variant(_), _)) => self.unsupported(),
+        }
+    }
+
+    fn deserialize_map<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+        self.unsupported()
+    }
+
+    forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf unit
+        unit_struct seq tuple tuple_struct enum identifier ignored_any
+    }
+}
+
+struct MapReader<'p, 'a>(&'p Probe<'a>);
+
+impl<'de> MapAccess<'de> for MapReader<'_, '_> {
+    type Error = de::value::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        _: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        self.0.unsupported()
+    }
+
+    fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, _: S) -> Result<S::Value, Self::Error> {
+        self.0.unsupported()
+    }
+}
+
+struct ProbeEntry<'a>(Option<(&'static str, Probe<'a>)>);
+
+impl<'de> MapAccess<'de> for ProbeEntry<'_> {
+    type Error = de::value::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        match &self.0 {
+            Some((key, _)) => seed.deserialize(StrDeserializer::new(key)).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn next_value_seed<S: DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Result<S::Value, Self::Error> {
+        match self.0.take() {
+            Some((_, probe)) => seed.deserialize(probe),
+            None => leaf(),
+        }
+    }
+}
+
+impl<'de> EnumAccess<'de> for Probe<'_> {
+    type Error = de::value::Error;
+    type Variant = Self;
+
+    fn variant_seed<S: DeserializeSeed<'de>>(
+        self,
+        seed: S,
+    ) -> Result<(S::Value, Self), Self::Error> {
+        let tag = seed.deserialize(ProbeTag(&self))?;
+        let Some((step, rest)) = self.rest.split_first() else {
+            return leaf();
+        };
+        Ok((tag, self.advance(step, rest, None)))
+    }
+}
+
+impl<'de> VariantAccess<'de> for Probe<'_> {
+    type Error = de::value::Error;
+
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        leaf()
+    }
+
+    fn newtype_variant_seed<S: DeserializeSeed<'de>>(
+        self,
+        seed: S,
+    ) -> Result<S::Value, Self::Error> {
+        seed.deserialize(self)
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(self, _: usize, _: V) -> Result<V::Value, Self::Error> {
+        leaf()
+    }
+
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _: &'static [&'static str],
+        _: V,
+    ) -> Result<V::Value, Self::Error> {
+        leaf()
+    }
+}
+
+struct ProbeTag<'p, 'a>(&'p Probe<'a>);
+
+impl<'de> Deserializer<'de> for ProbeTag<'_, '_> {
+    type Error = de::value::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+        self.0.unsupported()
+    }
+
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _: &'static str,
+        variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        let probe = self.0;
+        match probe.rest.first() {
+            None => {
+                for &variant in variants {
+                    probe
+                        .schema
+                        .borrow_mut()
+                        .visit(&probe.done, Step::Variant(variant));
+                }
+                leaf()
+            }
+            Some(&Step::Variant(variant)) => visitor.visit_enum(StrDeserializer::new(variant)),
+            Some(Step::Key(_)) => probe.unsupported(),
+        }
+    }
+
+    forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option
+        unit unit_struct newtype_struct seq tuple tuple_struct map struct identifier ignored_any
+    }
 }
 
 pub fn parse_size(text: &str) -> Option<u64> {
@@ -812,23 +1301,55 @@ fn default_store_concurrency() -> usize {
 }
 
 fn de_string_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ListField {
-        List(Vec<StringField>),
-        Text(StringField),
+    struct ListVisitor;
+
+    impl<'de> Visitor<'de> for ListVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a list of strings or a comma-separated string")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
+            let mut items = Vec::new();
+            while let Some(StringField(item)) = seq.next_element()? {
+                items.push(item);
+            }
+            Ok(items)
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<String>, E> {
+            Ok(split_list(value))
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Vec<String>, E> {
+            StringVisitor.visit_u64(value).map(|text| split_list(&text))
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Vec<String>, E> {
+            StringVisitor.visit_i64(value).map(|text| split_list(&text))
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<Vec<String>, E> {
+            StringVisitor.visit_f64(value).map(|text| split_list(&text))
+        }
+
+        fn visit_bool<E: de::Error>(self, value: bool) -> Result<Vec<String>, E> {
+            StringVisitor
+                .visit_bool(value)
+                .map(|text| split_list(&text))
+        }
     }
 
-    Ok(match ListField::deserialize(deserializer)? {
-        ListField::List(items) => items.into_iter().map(|item| item.0).collect(),
-        ListField::Text(text) => text
-            .0
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    })
+    deserializer.deserialize_any(ListVisitor)
+}
+
+fn split_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn de_fair_queue_group<'de, D: Deserializer<'de>>(
@@ -933,41 +1454,41 @@ fn de_socket_addr<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SocketAd
 }
 
 fn de_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    struct StringVisitor;
+    deserializer.deserialize_any(StringVisitor)
+}
 
-    impl Visitor<'_> for StringVisitor {
-        type Value = String;
+struct StringVisitor;
 
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a string")
-        }
+impl Visitor<'_> for StringVisitor {
+    type Value = String;
 
-        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
-            Ok(value.to_owned())
-        }
-
-        fn visit_string<E: de::Error>(self, value: String) -> Result<String, E> {
-            Ok(value)
-        }
-
-        fn visit_u64<E: de::Error>(self, value: u64) -> Result<String, E> {
-            Ok(value.to_string())
-        }
-
-        fn visit_i64<E: de::Error>(self, value: i64) -> Result<String, E> {
-            Ok(value.to_string())
-        }
-
-        fn visit_f64<E: de::Error>(self, value: f64) -> Result<String, E> {
-            Ok(value.to_string())
-        }
-
-        fn visit_bool<E: de::Error>(self, value: bool) -> Result<String, E> {
-            Ok(value.to_string())
-        }
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a string")
     }
 
-    deserializer.deserialize_any(StringVisitor)
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+        Ok(value.to_owned())
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<String, E> {
+        Ok(value)
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<String, E> {
+        Ok(value.to_string())
+    }
 }
 
 fn de_opt_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
@@ -1125,17 +1646,22 @@ state_store:
     }
 
     #[test]
-    fn rejects_unknown_keys_and_types() {
-        let unknown_key = MINIMAL.replace("  slot:", "  sslmode: require\n  slot:");
-        assert!(matches!(
-            parse(&unknown_key, with_password()),
-            Err(ConfigError::Invalid(_))
-        ));
-        let unknown_sink = MINIMAL.replace("type: stdout", "type: kafka");
-        assert!(matches!(
-            parse(&unknown_sink, with_password()),
-            Err(ConfigError::Invalid(_))
-        ));
+    fn rejects_unknown_types_and_malformed_yaml() {
+        for yaml in [
+            MINIMAL.replace("type: stdout", "type: kafka"),
+            MINIMAL.replace("type: stdout", "type: {stdout: null}"),
+            MINIMAL.replace("type: password", "type: kerberos"),
+            MINIMAL.replace("type: password", "type: {password: null}"),
+            MINIMAL.replace("type: filesystem", "type: nfs"),
+            MINIMAL.replace("type: filesystem", "type: {filesystem: null}"),
+            format!("{MINIMAL}payload_store:\n  type: gcs\n  bucket: b\n"),
+            format!("{MINIMAL}payload_store:\n  type: {{s3: null}}\n  bucket: b\n"),
+        ] {
+            assert!(
+                matches!(parse(&yaml, with_password()), Err(ConfigError::Invalid(_))),
+                "{yaml}"
+            );
+        }
         assert!(matches!(
             parse("pipeline: [", with_password()),
             Err(ConfigError::Yaml(_))
@@ -1255,12 +1781,6 @@ state_store:
         empty_segment.push(("PGCDC__SOURCE____PORT".to_owned(), "1".to_owned()));
         assert!(matches!(
             parse(MINIMAL, empty_segment),
-            Err(ConfigError::BadEnvKey(_))
-        ));
-        let mut scalar_parent = with_password();
-        scalar_parent.push(("PGCDC__PIPELINE__NAME".to_owned(), "x".to_owned()));
-        assert!(matches!(
-            parse(MINIMAL, scalar_parent),
             Err(ConfigError::BadEnvKey(_))
         ));
         let mut bad_port = with_password();
@@ -1404,15 +1924,10 @@ state_store:
                 ..
             })
         ));
-        for extra in ["  fair_queue_group: tenant\n", "  topic: x\n"] {
-            assert!(
-                matches!(
-                    parse(&sns(extra), with_password()),
-                    Err(ConfigError::Invalid(_))
-                ),
-                "{extra}"
-            );
-        }
+        assert!(matches!(
+            parse(&sns("  fair_queue_group: tenant\n"), with_password()),
+            Err(ConfigError::Invalid(_))
+        ));
         let missing_arn = MINIMAL.replace("type: stdout", "type: sns");
         assert!(matches!(
             parse(&missing_arn, with_password()),
@@ -1478,11 +1993,9 @@ state_store:
 
             let unknown =
                 MINIMAL.replace("type: stdout\n", &format!("type: {sink}\n  topic_arn: x\n"));
-            assert!(
-                matches!(
-                    parse(&unknown, with_password()),
-                    Err(ConfigError::Invalid(_))
-                ),
+            assert_eq!(
+                parse(&unknown, with_password()).unwrap().unknown_keys,
+                ["sink.topic_arn"],
                 "{sink}"
             );
         }
@@ -1713,7 +2226,6 @@ state_store:
         for sections in [
             "state_store:\n  type: postgres\n",
             "state_store:\n  type: s3\n",
-            "state_store:\n  type: s3\n  bucket: b\n  path: /x\n",
             "state_store:\n  type: filesystem\n  path: /x\npayload_store:\n  type: filesystem\n  path: /y\n",
             "state_store:\n  type: filesystem\n  path: /x\npayload_store:\n  type: s3\n",
         ] {
@@ -1906,13 +2418,371 @@ state_store:
         assert_eq!(config.admin.listen.port(), 0);
     }
 
+    fn unknown_keys(yaml: &str, vars: &[(&str, &str)]) -> Vec<String> {
+        let mut all = with_password();
+        all.extend(env(vars));
+        parse(yaml, all).unwrap().unknown_keys
+    }
+
     #[test]
-    fn unknown_leadership_and_admin_keys_are_rejected() {
-        for yaml in [leadership("  lease: 6s"), admin("  port: 1")] {
-            assert!(matches!(
-                parse(&yaml, with_password()),
-                Err(ConfigError::Invalid(_))
-            ));
+    fn the_minimal_config_has_no_unknown_keys() {
+        assert_eq!(unknown_keys(MINIMAL, &[]), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn unknown_keys_in_every_section_are_ignored_and_named_by_their_dotted_path() {
+        let s3_store = "state_store:\n  type: s3\n  bucket: b\n";
+        for (yaml, key) in [
+            (
+                format!("{MINIMAL}future_section:\n  enabled: true\n"),
+                "future_section",
+            ),
+            (
+                MINIMAL.replace("sink:", "delivery:\n  order_by_tables: orders\nsink:"),
+                "delivery.order_by_tables",
+            ),
+            (
+                MINIMAL.replace("  slot:", "  sslmode: require\n  slot:"),
+                "source.sslmode",
+            ),
+            (
+                MINIMAL.replace("type: password", "type: password\n    region: x"),
+                "source.credentials.region",
+            ),
+            (
+                MINIMAL.replace("  slot:", "  tls:\n    verify: no\n  slot:"),
+                "source.tls.verify",
+            ),
+            (sns("  topic: x\n"), "sink.topic"),
+            (
+                stores(&format!("{s3_store}  path: /x\n")),
+                "state_store.path",
+            ),
+            (
+                stores(&format!(
+                    "{s3_store}payload_store:\n  type: s3\n  bucket: p\n  kms_key: k\n"
+                )),
+                "payload_store.kms_key",
+            ),
+            (leadership("  lease: 6s"), "leadership.lease"),
+            (admin("  port: 1"), "admin.port"),
+            (telemetry("  endpoint: x"), "telemetry.endpoint"),
+            (
+                telemetry("  sentry:\n    traces: 1"),
+                "telemetry.sentry.traces",
+            ),
+        ] {
+            assert_eq!(unknown_keys(&yaml, &[]), [key], "{yaml}");
+        }
+    }
+
+    #[test]
+    fn unknown_environment_keys_are_ignored_and_named_by_their_dotted_path() {
+        for (vars, key) in [
+            (
+                vec![("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders")],
+                "delivery.order_by_tables",
+            ),
+            (vec![("PGCDC__FUTURE__ENABLED", "true")], "future"),
+            (vec![("PGCDC__PIPELINE__NAME", "x")], "pipeline.name"),
+            (vec![("PGCDC__SINK__TOPIC", "x")], "sink.topic"),
+            (
+                vec![("PGCDC__SOURCE__CREDENTIALS__REGION", "us-east-1")],
+                "source.credentials.region",
+            ),
+        ] {
+            assert_eq!(unknown_keys(MINIMAL, &vars), [key], "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn a_state_store_type_set_after_its_fields_still_finds_unknown_keys() {
+        let vars = [
+            ("PGCDC__STATE_STORE__BUCKET", "from-env"),
+            ("PGCDC__STATE_STORE__PATH", "/x"),
+            ("PGCDC__STATE_STORE__TYPE", "s3"),
+        ];
+        let mut all = with_password();
+        all.extend(env(&vars));
+        let config = parse(&stores(""), all).unwrap();
+        assert_eq!(config.unknown_keys, ["state_store.path"]);
+        assert!(matches!(&config.state_store, StateStoreConfig::S3(s3) if s3.bucket == "from-env"));
+    }
+
+    #[test]
+    fn unknown_keys_are_sorted_and_listed_once() {
+        let yaml = format!(
+            "{}zeta: 1\nalpha:\n  nested: true\n",
+            MINIMAL.replace("sink:", "delivery:\n  order_by_tables: orders\nsink:")
+        );
+        let keys = unknown_keys(
+            &yaml,
+            &[
+                ("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders"),
+                ("PGCDC__ALPHA__OTHER", "x"),
+            ],
+        );
+        assert_eq!(keys, ["alpha", "delivery.order_by_tables", "zeta"]);
+    }
+
+    #[test]
+    fn unknown_keys_never_carry_their_values() {
+        let yaml = format!("{MINIMAL}future_section: hunter2-file\n");
+        let keys = unknown_keys(&yaml, &[("PGCDC__SINK__TOKEN", "hunter2-env")]);
+        assert_eq!(keys, ["future_section", "sink.token"]);
+        assert!(keys.iter().all(|key| !key.contains("hunter2")), "{keys:?}");
+    }
+
+    #[test]
+    fn a_known_key_with_an_invalid_value_still_fails_beside_unknown_keys() {
+        let yaml = format!(
+            "{}future_section: 1\n",
+            MINIMAL.replace("sink:", "delivery:\n  lanes: many\nsink:")
+        );
+        assert!(matches!(
+            parse(&yaml, with_password()),
+            Err(ConfigError::Invalid(_))
+        ));
+        let mut vars = with_password();
+        vars.extend(env(&[
+            ("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders"),
+            ("PGCDC__DELIVERY__LANES", "0"),
+        ]));
+        assert!(matches!(
+            parse(MINIMAL, vars),
+            Err(ConfigError::InvalidValue {
+                field: "delivery.lanes",
+                ..
+            })
+        ));
+        let mut vars = with_password();
+        vars.extend(env(&[
+            ("PGCDC__FUTURE__ENABLED", "true"),
+            ("PGCDC__SINK__TYPE", "kafka"),
+        ]));
+        assert!(matches!(parse(MINIMAL, vars), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn unknown_environment_paths_never_reach_the_tree() {
+        for (vars, key) in [
+            (
+                vec![("PGCDC__SOURCE__PORT__FUTURE", "x")],
+                "source.port.future",
+            ),
+            (
+                vec![("PGCDC__SOURCE__TLS__MODE__DISABLE", "review-secret-canary")],
+                "source.tls.mode.disable",
+            ),
+            (vec![("PGCDC__SINK__TYPE__SNS", "x")], "sink.type.sns"),
+        ] {
+            assert_eq!(unknown_keys(MINIMAL, &vars), [key], "{vars:?}");
+        }
+        let null_delivery = MINIMAL.replace("sink:", "delivery:\nsink:");
+        assert!(matches!(
+            parse(&null_delivery, with_password()),
+            Err(ConfigError::Invalid(_))
+        ));
+        let mut vars = with_password();
+        vars.extend(env(&[("PGCDC__DELIVERY__FUTURE", "x")]));
+        assert!(matches!(
+            parse(&null_delivery, vars),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn errors_never_carry_values_from_unknown_environment_paths() {
+        let canary = "review-secret-canary";
+        let invalid_sink = MINIMAL.replace("type: stdout", "type: kafka");
+        let null_delivery = MINIMAL.replace("sink:", "delivery:\nsink:");
+        for yaml in [&invalid_sink, &null_delivery] {
+            for name in [
+                "PGCDC__SOURCE__PORT__FUTURE",
+                "PGCDC__SOURCE__TLS__MODE__DISABLE",
+                "PGCDC__DELIVERY__FUTURE",
+                "PGCDC__DELIVERY__LANES__MAX",
+                "PGCDC__PIPELINE__NAME",
+                "PGCDC__SINK__TYPE__KAFKA",
+                "PGCDC__FUTURE__ENABLED",
+            ] {
+                let mut vars = with_password();
+                vars.push((name.to_owned(), canary.to_owned()));
+                let error = parse(yaml, vars).unwrap_err().to_string();
+                assert!(!error.contains(canary), "{name}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn known_environment_keys_under_omitted_sections_still_apply() {
+        let mut vars = with_password();
+        vars.extend(env(&[
+            ("PGCDC__DELIVERY__PARK_AFTER", "60s"),
+            ("PGCDC__SOURCE__TLS__MODE", "disable"),
+            ("PGCDC__SOURCE__PORT", "5433"),
+            ("PGCDC__PAYLOAD_STORE__TYPE", "s3"),
+            ("PGCDC__PAYLOAD_STORE__BUCKET", "payloads"),
+        ]));
+        let config = parse(MINIMAL, vars).unwrap();
+        assert_eq!(config.delivery.park_after, Duration::from_secs(60));
+        assert_eq!(config.source.tls.mode, TlsMode::Disable);
+        assert_eq!(config.source.port, 5433);
+        assert!(config.payload_store.is_some());
+        assert_eq!(config.unknown_keys, [] as [&str; 0]);
+    }
+
+    fn path(dotted: &str) -> Vec<String> {
+        dotted.split('.').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn discovery_maps_the_full_configuration() {
+        let known = known_paths::<Config>().unwrap();
+        for dotted in [
+            "pipeline",
+            "source.port",
+            "source.tls.mode",
+            "source.credentials.type",
+            "source.credentials.password",
+            "source.credentials.region",
+            "sink.type",
+            "sink.topic_arn",
+            "sink.attribute_columns",
+            "state_store.path",
+            "state_store.bucket",
+            "payload_store.bucket",
+            "delivery.park_after",
+            "leadership.lease_timeout",
+            "admin.listen",
+            "telemetry.sentry.dsn",
+        ] {
+            assert!(known.contains(&path(dotted)), "{dotted}");
+        }
+    }
+
+    #[test]
+    fn every_discovered_key_is_lowercase() {
+        for keys in known_paths::<Config>().unwrap() {
+            for key in &keys {
+                assert_eq!(*key, key.to_ascii_lowercase(), "{keys:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_flattened_sections() {
+        #[derive(Deserialize)]
+        struct Shared {
+            _name: String,
+        }
+
+        #[derive(Deserialize)]
+        struct Section {
+            #[serde(flatten)]
+            _shared: Shared,
+        }
+
+        #[derive(Deserialize)]
+        struct Outer {
+            _pipeline: String,
+            _section: Option<Section>,
+        }
+
+        let error = known_paths::<Outer>().unwrap_err();
+        assert!(error.contains("_section"), "{error}");
+    }
+
+    #[test]
+    fn discovery_rejects_untagged_sections() {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Section {
+            Named { _name: String },
+        }
+
+        #[derive(Deserialize)]
+        struct Outer {
+            _pipeline: String,
+            _section: Section,
+        }
+
+        let error = known_paths::<Outer>().unwrap_err();
+        assert!(error.contains("_section"), "{error}");
+    }
+
+    #[test]
+    fn tagged_section_errors_keep_their_messages() {
+        let sink = "sink:\n  type: stdout\n";
+        let no_sink = MINIMAL.replace(sink, "");
+        let expects_map = "expected a map with a type key";
+        let sink_types = "expected one of `stdout`, `discard`, `sns`";
+        for (yaml, vars, expected) in [
+            (
+                MINIMAL.replace(sink, "sink:\n  max_concurrency: 2\n"),
+                vec![],
+                "missing field `type`".to_owned(),
+            ),
+            (
+                MINIMAL.replace("credentials:\n    type: password", "credentials: {}"),
+                vec![],
+                "missing field `type`".to_owned(),
+            ),
+            (
+                MINIMAL.replace("type: stdout", "type: kafka"),
+                vec![],
+                format!("unknown variant `kafka`, {sink_types}"),
+            ),
+            (
+                MINIMAL.replace("type: stdout", "type: {stdout: null}"),
+                vec![],
+                "invalid type: map, expected a string".to_owned(),
+            ),
+            (
+                MINIMAL.replace(sink, "sink: stdout\n"),
+                vec![],
+                format!("invalid type: string \"stdout\", {expects_map}"),
+            ),
+            (
+                MINIMAL.replace(sink, "sink:\n"),
+                vec![],
+                format!("invalid type: null, {expects_map}"),
+            ),
+            (
+                MINIMAL.replace(sink, "sink: [stdout]\n"),
+                vec![],
+                format!("invalid type: sequence, {expects_map}"),
+            ),
+            (
+                no_sink.clone(),
+                vec![("PGCDC__SINK__MAX_CONCURRENCY", "2")],
+                "missing field `type`".to_owned(),
+            ),
+            (
+                MINIMAL.to_owned(),
+                vec![("PGCDC__SINK__TYPE", "kafka")],
+                format!("unknown variant `kafka`, {sink_types}"),
+            ),
+            (
+                no_sink.clone(),
+                vec![("PGCDC__SINK", "stdout")],
+                format!("invalid type: string \"stdout\", {expects_map}"),
+            ),
+            (
+                MINIMAL.to_owned(),
+                vec![("PGCDC__SINK", "stdout")],
+                format!("invalid type: string \"stdout\", {expects_map}"),
+            ),
+            (no_sink, vec![], "missing field `sink`".to_owned()),
+        ] {
+            let mut all = with_password();
+            all.extend(env(&vars));
+            let error = parse(&yaml, all).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!("invalid configuration: {expected}"),
+                "{yaml}\n{vars:?}"
+            );
         }
     }
 
@@ -2049,10 +2919,6 @@ state_store:
         ] {
             assert_eq!(invalid_field(&telemetry(body)), field, "{body}");
         }
-        assert!(matches!(
-            parse(&telemetry("  sentry:\n    traces: 1"), with_password()),
-            Err(ConfigError::Invalid(_))
-        ));
     }
 
     #[test]
@@ -2075,10 +2941,6 @@ state_store:
             .unwrap_err()
             .to_string();
         assert!(text.contains("telemetry.trace_sample_ratio"), "{text}");
-        assert!(matches!(
-            parse(&telemetry("  endpoint: x"), with_password()),
-            Err(ConfigError::Invalid(_))
-        ));
         let empty = parse(&telemetry("  otlp_endpoint: \"\""), with_password()).unwrap();
         assert_eq!(
             crate::telemetry::plan(&empty.telemetry, None),
