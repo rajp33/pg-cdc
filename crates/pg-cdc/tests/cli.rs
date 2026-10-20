@@ -900,14 +900,14 @@ async fn unknown_config_keys_start_the_task_with_one_warning_naming_them_without
     for (extra, env, key) in [
         ("future_section: hunter2-top\n", vec![], "future_section"),
         (
-            "delivery:\n  order_by_tables: hunter2-nested\n",
+            "delivery:\n  order_by_columns: hunter2-nested\n",
             vec![],
-            "delivery.order_by_tables",
+            "delivery.order_by_columns",
         ),
         (
             "",
-            vec![("PGCDC__DELIVERY__ORDER_BY_TABLES", "hunter2-env")],
-            "delivery.order_by_tables",
+            vec![("PGCDC__DELIVERY__ORDER_BY_COLUMNS", "hunter2-env")],
+            "delivery.order_by_columns",
         ),
     ] {
         let config = write_unreachable_config(extra)?;
@@ -939,7 +939,7 @@ async fn an_invalid_known_value_still_stops_the_task_when_unknown_keys_are_prese
         config.path(),
         "unused",
         Stdio::piped(),
-        &[("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders")],
+        &[("PGCDC__DELIVERY__ORDER_BY_COLUMNS", "orders")],
     )?;
     let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await??;
     assert_eq!(output.status.code(), Some(1));
