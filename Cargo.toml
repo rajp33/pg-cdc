@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -73,9 +73,9 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
   "metrics",
   "logs",
 ] }
-pg-cdc-decoder = { path = "crates/decoder", version = "0.1.0" }
-pg-cdc-replication = { path = "crates/replication", version = "0.1.0" }
-pg-cdc-testkit = { path = "crates/testkit", version = "0.1.0" }
+pg-cdc-decoder = { path = "crates/decoder", version = "0.2.0" }
+pg-cdc-replication = { path = "crates/replication", version = "0.2.0" }
+pg-cdc-testkit = { path = "crates/testkit", version = "0.2.0" }
 postgres-protocol = "0.6.12"
 proptest = "1.12.0"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
