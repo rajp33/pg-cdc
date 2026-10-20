@@ -12,8 +12,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde::de::value::{MapAccessDeserializer, StrDeserializer, StringDeserializer};
 use serde::de::{
-    self, DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess, MapAccess, VariantAccess,
-    Visitor,
+    self, DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess, MapAccess, SeqAccess,
+    VariantAccess, Visitor,
 };
 use serde::forward_to_deserialize_any;
 use serde_json::{Map, Value};
@@ -827,8 +827,8 @@ fn leaf<T>() -> Result<T, de::value::Error> {
 impl<'de> Deserializer<'de> for Probe<'_> {
     type Error = de::value::Error;
 
-    fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
-        leaf()
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_map(MapReader(&self))
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -880,6 +880,23 @@ impl<'de> Deserializer<'de> for Probe<'_> {
     forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf unit
         unit_struct seq tuple tuple_struct enum identifier ignored_any
+    }
+}
+
+struct MapReader<'p, 'a>(&'p Probe<'a>);
+
+impl<'de> MapAccess<'de> for MapReader<'_, '_> {
+    type Error = de::value::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        _: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        self.0.unsupported()
+    }
+
+    fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, _: S) -> Result<S::Value, Self::Error> {
+        self.0.unsupported()
     }
 }
 
@@ -958,7 +975,7 @@ impl<'de> Deserializer<'de> for ProbeTag<'_, '_> {
     type Error = de::value::Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
-        leaf()
+        self.0.unsupported()
     }
 
     fn deserialize_enum<V: Visitor<'de>>(
@@ -1284,23 +1301,55 @@ fn default_store_concurrency() -> usize {
 }
 
 fn de_string_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ListField {
-        List(Vec<StringField>),
-        Text(StringField),
+    struct ListVisitor;
+
+    impl<'de> Visitor<'de> for ListVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a list of strings or a comma-separated string")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
+            let mut items = Vec::new();
+            while let Some(StringField(item)) = seq.next_element()? {
+                items.push(item);
+            }
+            Ok(items)
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<String>, E> {
+            Ok(split_list(value))
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Vec<String>, E> {
+            StringVisitor.visit_u64(value).map(|text| split_list(&text))
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Vec<String>, E> {
+            StringVisitor.visit_i64(value).map(|text| split_list(&text))
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<Vec<String>, E> {
+            StringVisitor.visit_f64(value).map(|text| split_list(&text))
+        }
+
+        fn visit_bool<E: de::Error>(self, value: bool) -> Result<Vec<String>, E> {
+            StringVisitor
+                .visit_bool(value)
+                .map(|text| split_list(&text))
+        }
     }
 
-    Ok(match ListField::deserialize(deserializer)? {
-        ListField::List(items) => items.into_iter().map(|item| item.0).collect(),
-        ListField::Text(text) => text
-            .0
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    })
+    deserializer.deserialize_any(ListVisitor)
+}
+
+fn split_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn de_fair_queue_group<'de, D: Deserializer<'de>>(
@@ -1405,41 +1454,41 @@ fn de_socket_addr<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SocketAd
 }
 
 fn de_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    struct StringVisitor;
+    deserializer.deserialize_any(StringVisitor)
+}
 
-    impl Visitor<'_> for StringVisitor {
-        type Value = String;
+struct StringVisitor;
 
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a string")
-        }
+impl Visitor<'_> for StringVisitor {
+    type Value = String;
 
-        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
-            Ok(value.to_owned())
-        }
-
-        fn visit_string<E: de::Error>(self, value: String) -> Result<String, E> {
-            Ok(value)
-        }
-
-        fn visit_u64<E: de::Error>(self, value: u64) -> Result<String, E> {
-            Ok(value.to_string())
-        }
-
-        fn visit_i64<E: de::Error>(self, value: i64) -> Result<String, E> {
-            Ok(value.to_string())
-        }
-
-        fn visit_f64<E: de::Error>(self, value: f64) -> Result<String, E> {
-            Ok(value.to_string())
-        }
-
-        fn visit_bool<E: de::Error>(self, value: bool) -> Result<String, E> {
-            Ok(value.to_string())
-        }
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a string")
     }
 
-    deserializer.deserialize_any(StringVisitor)
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+        Ok(value.to_owned())
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<String, E> {
+        Ok(value)
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<String, E> {
+        Ok(value.to_string())
+    }
 }
 
 fn de_opt_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
@@ -2638,6 +2687,24 @@ state_store:
         struct Outer {
             _pipeline: String,
             _section: Option<Section>,
+        }
+
+        let error = known_paths::<Outer>().unwrap_err();
+        assert!(error.contains("_section"), "{error}");
+    }
+
+    #[test]
+    fn discovery_rejects_untagged_sections() {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Section {
+            Named { _name: String },
+        }
+
+        #[derive(Deserialize)]
+        struct Outer {
+            _pipeline: String,
+            _section: Section,
         }
 
         let error = known_paths::<Outer>().unwrap_err();
