@@ -41,6 +41,7 @@ pub const DEFAULT_ADMIN_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr
 const RESERVED_ATTRIBUTES: [&str; 3] = ["schema", "table", "op"];
 const TAG: &str = "type";
 const TAGGED: &str = "$pg_cdc::tagged";
+const LEAF: &str = "$pg_cdc::leaf";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -840,9 +841,12 @@ impl<'de> Deserializer<'de> for Probe<'_> {
 
     fn deserialize_newtype_struct<V: Visitor<'de>>(
         self,
-        _: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        if name == LEAF {
+            return leaf();
+        }
         visitor.visit_newtype_struct(self)
     }
 
@@ -1435,7 +1439,24 @@ fn de_order_by_tables<'de, D: Deserializer<'de>>(
         }
     }
 
-    deserializer.deserialize_any(TablesVisitor)
+    struct LeafVisitor;
+
+    impl<'de> Visitor<'de> for LeafVisitor {
+        type Value = BTreeMap<TableName, OrderBy>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            TablesVisitor.expecting(formatter)
+        }
+
+        fn visit_newtype_struct<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(TablesVisitor)
+        }
+    }
+
+    deserializer.deserialize_newtype_struct(LEAF, LeafVisitor)
 }
 
 fn de_size<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
@@ -2142,6 +2163,7 @@ state_store:
                 ("audit.log", "table"),
             ])
         );
+        assert_eq!(config.unknown_keys, [] as [&str; 0]);
     }
 
     #[test]
@@ -2159,6 +2181,7 @@ state_store:
                 ("public.order_items", "column:order_id"),
             ])
         );
+        assert_eq!(config.unknown_keys, [] as [&str; 0]);
     }
 
     #[test]
@@ -2594,8 +2617,8 @@ state_store:
                 "future_section",
             ),
             (
-                MINIMAL.replace("sink:", "delivery:\n  order_by_tables: orders\nsink:"),
-                "delivery.order_by_tables",
+                MINIMAL.replace("sink:", "delivery:\n  order_by_columns: orders\nsink:"),
+                "delivery.order_by_columns",
             ),
             (
                 MINIMAL.replace("  slot:", "  sslmode: require\n  slot:"),
@@ -2636,8 +2659,8 @@ state_store:
     fn unknown_environment_keys_are_ignored_and_named_by_their_dotted_path() {
         for (vars, key) in [
             (
-                vec![("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders")],
-                "delivery.order_by_tables",
+                vec![("PGCDC__DELIVERY__ORDER_BY_COLUMNS", "orders")],
+                "delivery.order_by_columns",
             ),
             (vec![("PGCDC__FUTURE__ENABLED", "true")], "future"),
             (vec![("PGCDC__PIPELINE__NAME", "x")], "pipeline.name"),
@@ -2669,16 +2692,16 @@ state_store:
     fn unknown_keys_are_sorted_and_listed_once() {
         let yaml = format!(
             "{}zeta: 1\nalpha:\n  nested: true\n",
-            MINIMAL.replace("sink:", "delivery:\n  order_by_tables: orders\nsink:")
+            MINIMAL.replace("sink:", "delivery:\n  order_by_columns: orders\nsink:")
         );
         let keys = unknown_keys(
             &yaml,
             &[
-                ("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders"),
+                ("PGCDC__DELIVERY__ORDER_BY_COLUMNS", "orders"),
                 ("PGCDC__ALPHA__OTHER", "x"),
             ],
         );
-        assert_eq!(keys, ["alpha", "delivery.order_by_tables", "zeta"]);
+        assert_eq!(keys, ["alpha", "delivery.order_by_columns", "zeta"]);
     }
 
     #[test]
@@ -2701,7 +2724,7 @@ state_store:
         ));
         let mut vars = with_password();
         vars.extend(env(&[
-            ("PGCDC__DELIVERY__ORDER_BY_TABLES", "orders"),
+            ("PGCDC__DELIVERY__ORDER_BY_COLUMNS", "orders"),
             ("PGCDC__DELIVERY__LANES", "0"),
         ]));
         assert!(matches!(
@@ -2809,6 +2832,7 @@ state_store:
             "state_store.bucket",
             "payload_store.bucket",
             "delivery.park_after",
+            "delivery.order_by_tables",
             "leadership.lease_timeout",
             "admin.listen",
             "telemetry.sentry.dsn",
