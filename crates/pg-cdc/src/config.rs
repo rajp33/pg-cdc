@@ -1,14 +1,21 @@
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use serde::de::value::MapAccessDeserializer;
-use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
+use serde::de::value::{MapAccessDeserializer, StrDeserializer, StringDeserializer};
+use serde::de::{
+    self, DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess, MapAccess, VariantAccess,
+    Visitor,
+};
+use serde::forward_to_deserialize_any;
 use serde_json::{Map, Value};
 
 use crate::leader::POLL_INTERVAL;
@@ -597,8 +604,9 @@ pub fn parse(
         if keys.iter().any(String::is_empty) {
             return Err(ConfigError::BadEnvKey(name));
         }
-        if set_path(&mut tree, &keys, Value::String(value)).is_none() {
-            unknown_keys.push(keys.join("."));
+        match unknown_prefix(&keys) {
+            Some(prefix) => unknown_keys.push(prefix),
+            None => set_path(&mut tree, &keys, Value::String(value)),
         }
     }
     tag_first(&mut tree);
@@ -647,6 +655,16 @@ fn dotted(path: &serde_ignored::Path<'_>) -> String {
     keys.join(".")
 }
 
+struct FieldsSeed<T: Tagged>(T::Tag);
+
+impl<'de, T: Tagged> DeserializeSeed<'de> for FieldsSeed<T> {
+    type Value = T;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<T, D::Error> {
+        T::from_fields(self.0, deserializer)
+    }
+}
+
 trait Tagged: Sized {
     type Tag: DeserializeOwned;
 
@@ -667,31 +685,273 @@ fn de_tagged<'de, T: Tagged, D: Deserializer<'de>>(deserializer: D) -> Result<T,
             if map.next_key::<String>()?.as_deref() != Some(TAG) {
                 return Err(de::Error::missing_field(TAG));
             }
-            let tag = map.next_value()?;
+            let tag: String = map.next_value()?;
+            let tag = T::Tag::deserialize(StringDeserializer::<A::Error>::new(tag))?;
             T::from_fields(tag, MapAccessDeserializer::new(map))
+        }
+
+        fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<T, A::Error> {
+            let (tag, fields) = data.variant()?;
+            fields.newtype_variant_seed(FieldsSeed::<T>(tag))
         }
     }
 
     deserializer.deserialize_map(TaggedVisitor(PhantomData))
 }
 
-fn set_path(tree: &mut Value, keys: &[String], value: Value) -> Option<()> {
-    let (last, parents) = keys.split_last()?;
+fn set_path(tree: &mut Value, keys: &[String], value: Value) {
     let mut node = tree;
-    for key in parents {
+    for key in keys {
         if node.is_null() {
             *node = Value::Object(Map::new());
         }
-        node = node
-            .as_object_mut()?
-            .entry(key.clone())
-            .or_insert(Value::Null);
+        let Some(map) = node.as_object_mut() else {
+            return;
+        };
+        node = map.entry(key.clone()).or_insert(Value::Null);
     }
-    if node.is_null() {
-        *node = Value::Object(Map::new());
+    *node = value;
+}
+
+fn unknown_prefix(keys: &[String]) -> Option<String> {
+    let mut prefix = Vec::new();
+    for key in keys {
+        prefix.push(key.clone());
+        if !KNOWN_PATHS.contains(&prefix) {
+            return Some(prefix.join("."));
+        }
     }
-    node.as_object_mut()?.insert(last.clone(), value);
-    Some(())
+    None
+}
+
+static KNOWN_PATHS: LazyLock<BTreeSet<Vec<String>>> = LazyLock::new(known_paths);
+
+fn known_paths() -> BTreeSet<Vec<String>> {
+    let schema = RefCell::new(Schema::default());
+    let mut next = vec![Vec::new()];
+    while let Some(route) = next.pop() {
+        let probe = Probe {
+            done: Vec::new(),
+            rest: &route,
+            path: Vec::new(),
+            schema: &schema,
+        };
+        let _ = Config::deserialize(probe);
+        next.append(&mut schema.borrow_mut().pending);
+    }
+    schema.into_inner().known
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Step {
+    Key(&'static str),
+    Variant(&'static str),
+}
+
+#[derive(Default)]
+struct Schema {
+    known: BTreeSet<Vec<String>>,
+    routes: BTreeSet<Vec<Step>>,
+    pending: Vec<Vec<Step>>,
+}
+
+impl Schema {
+    fn visit(&mut self, done: &[Step], step: Step) {
+        let mut route = done.to_vec();
+        route.push(step);
+        if self.routes.insert(route.clone()) {
+            self.pending.push(route);
+        }
+    }
+}
+
+struct Probe<'a> {
+    done: Vec<Step>,
+    rest: &'a [Step],
+    path: Vec<&'static str>,
+    schema: &'a RefCell<Schema>,
+}
+
+impl<'a> Probe<'a> {
+    fn advance(&self, step: &Step, rest: &'a [Step], key: Option<&'static str>) -> Self {
+        let mut path = self.path.clone();
+        path.extend(key);
+        let mut done = self.done.clone();
+        done.push(step.clone());
+        Self {
+            done,
+            rest,
+            path,
+            schema: self.schema,
+        }
+    }
+
+    fn know(&self, key: &str) {
+        let mut path: Vec<String> = self.path.iter().map(|&key| key.to_owned()).collect();
+        path.push(key.to_owned());
+        self.schema.borrow_mut().known.insert(path);
+    }
+}
+
+fn leaf<T>() -> Result<T, de::value::Error> {
+    Err(de::Error::custom("leaf"))
+}
+
+impl<'de> Deserializer<'de> for Probe<'_> {
+    type Error = de::value::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+        leaf()
+    }
+
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self.rest.split_first() {
+            None => {
+                for &field in fields {
+                    self.know(field);
+                    self.schema.borrow_mut().visit(&self.done, Step::Key(field));
+                }
+                leaf()
+            }
+            Some((step @ &Step::Key(key), rest)) => {
+                visitor.visit_map(ProbeEntry(Some((key, self.advance(step, rest, Some(key))))))
+            }
+            Some((Step::Variant(_), _)) => leaf(),
+        }
+    }
+
+    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.know(TAG);
+        visitor.visit_enum(self)
+    }
+
+    forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf unit
+        unit_struct seq tuple tuple_struct enum identifier ignored_any
+    }
+}
+
+struct ProbeEntry<'a>(Option<(&'static str, Probe<'a>)>);
+
+impl<'de> MapAccess<'de> for ProbeEntry<'_> {
+    type Error = de::value::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        match &self.0 {
+            Some((key, _)) => seed.deserialize(StrDeserializer::new(key)).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn next_value_seed<S: DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Result<S::Value, Self::Error> {
+        match self.0.take() {
+            Some((_, probe)) => seed.deserialize(probe),
+            None => leaf(),
+        }
+    }
+}
+
+impl<'de> EnumAccess<'de> for Probe<'_> {
+    type Error = de::value::Error;
+    type Variant = Self;
+
+    fn variant_seed<S: DeserializeSeed<'de>>(
+        self,
+        seed: S,
+    ) -> Result<(S::Value, Self), Self::Error> {
+        let tag = seed.deserialize(ProbeTag(&self))?;
+        let Some((step, rest)) = self.rest.split_first() else {
+            return leaf();
+        };
+        Ok((tag, self.advance(step, rest, None)))
+    }
+}
+
+impl<'de> VariantAccess<'de> for Probe<'_> {
+    type Error = de::value::Error;
+
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        leaf()
+    }
+
+    fn newtype_variant_seed<S: DeserializeSeed<'de>>(
+        self,
+        seed: S,
+    ) -> Result<S::Value, Self::Error> {
+        seed.deserialize(self)
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(self, _: usize, _: V) -> Result<V::Value, Self::Error> {
+        leaf()
+    }
+
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _: &'static [&'static str],
+        _: V,
+    ) -> Result<V::Value, Self::Error> {
+        leaf()
+    }
+}
+
+struct ProbeTag<'p, 'a>(&'p Probe<'a>);
+
+impl<'de> Deserializer<'de> for ProbeTag<'_, '_> {
+    type Error = de::value::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+        leaf()
+    }
+
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _: &'static str,
+        variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        let probe = self.0;
+        match probe.rest.first() {
+            None => {
+                for &variant in variants {
+                    probe
+                        .schema
+                        .borrow_mut()
+                        .visit(&probe.done, Step::Variant(variant));
+                }
+                leaf()
+            }
+            Some(&Step::Variant(variant)) => visitor.visit_enum(StrDeserializer::new(variant)),
+            Some(Step::Key(_)) => leaf(),
+        }
+    }
+
+    forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option
+        unit unit_struct newtype_struct seq tuple tuple_struct map struct identifier ignored_any
+    }
 }
 
 pub fn parse_size(text: &str) -> Option<u64> {
@@ -1303,11 +1563,21 @@ state_store:
 
     #[test]
     fn rejects_unknown_types_and_malformed_yaml() {
-        let unknown_sink = MINIMAL.replace("type: stdout", "type: kafka");
-        assert!(matches!(
-            parse(&unknown_sink, with_password()),
-            Err(ConfigError::Invalid(_))
-        ));
+        for yaml in [
+            MINIMAL.replace("type: stdout", "type: kafka"),
+            MINIMAL.replace("type: stdout", "type: {stdout: null}"),
+            MINIMAL.replace("type: password", "type: kerberos"),
+            MINIMAL.replace("type: password", "type: {password: null}"),
+            MINIMAL.replace("type: filesystem", "type: nfs"),
+            MINIMAL.replace("type: filesystem", "type: {filesystem: null}"),
+            format!("{MINIMAL}payload_store:\n  type: gcs\n  bucket: b\n"),
+            format!("{MINIMAL}payload_store:\n  type: {{s3: null}}\n  bucket: b\n"),
+        ] {
+            assert!(
+                matches!(parse(&yaml, with_password()), Err(ConfigError::Invalid(_))),
+                "{yaml}"
+            );
+        }
         assert!(matches!(
             parse("pipeline: [", with_password()),
             Err(ConfigError::Yaml(_))
@@ -2207,6 +2477,75 @@ state_store:
             ("PGCDC__SINK__TYPE", "kafka"),
         ]));
         assert!(matches!(parse(MINIMAL, vars), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn unknown_environment_paths_never_reach_the_tree() {
+        for (vars, key) in [
+            (
+                vec![("PGCDC__SOURCE__PORT__FUTURE", "x")],
+                "source.port.future",
+            ),
+            (
+                vec![("PGCDC__SOURCE__TLS__MODE__DISABLE", "review-secret-canary")],
+                "source.tls.mode.disable",
+            ),
+            (vec![("PGCDC__SINK__TYPE__SNS", "x")], "sink.type.sns"),
+        ] {
+            assert_eq!(unknown_keys(MINIMAL, &vars), [key], "{vars:?}");
+        }
+        let null_delivery = MINIMAL.replace("sink:", "delivery:\nsink:");
+        assert!(matches!(
+            parse(&null_delivery, with_password()),
+            Err(ConfigError::Invalid(_))
+        ));
+        let mut vars = with_password();
+        vars.extend(env(&[("PGCDC__DELIVERY__FUTURE", "x")]));
+        assert!(matches!(
+            parse(&null_delivery, vars),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn errors_never_carry_values_from_unknown_environment_paths() {
+        let canary = "review-secret-canary";
+        let invalid_sink = MINIMAL.replace("type: stdout", "type: kafka");
+        let null_delivery = MINIMAL.replace("sink:", "delivery:\nsink:");
+        for yaml in [&invalid_sink, &null_delivery] {
+            for name in [
+                "PGCDC__SOURCE__PORT__FUTURE",
+                "PGCDC__SOURCE__TLS__MODE__DISABLE",
+                "PGCDC__DELIVERY__FUTURE",
+                "PGCDC__DELIVERY__LANES__MAX",
+                "PGCDC__PIPELINE__NAME",
+                "PGCDC__SINK__TYPE__KAFKA",
+                "PGCDC__FUTURE__ENABLED",
+            ] {
+                let mut vars = with_password();
+                vars.push((name.to_owned(), canary.to_owned()));
+                let error = parse(yaml, vars).unwrap_err().to_string();
+                assert!(!error.contains(canary), "{name}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn known_environment_keys_under_omitted_sections_still_apply() {
+        let mut vars = with_password();
+        vars.extend(env(&[
+            ("PGCDC__DELIVERY__PARK_AFTER", "60s"),
+            ("PGCDC__SOURCE__TLS__MODE", "disable"),
+            ("PGCDC__SOURCE__PORT", "5433"),
+            ("PGCDC__PAYLOAD_STORE__TYPE", "s3"),
+            ("PGCDC__PAYLOAD_STORE__BUCKET", "payloads"),
+        ]));
+        let config = parse(MINIMAL, vars).unwrap();
+        assert_eq!(config.delivery.park_after, Duration::from_secs(60));
+        assert_eq!(config.source.tls.mode, TlsMode::Disable);
+        assert_eq!(config.source.port, 5433);
+        assert!(config.payload_store.is_some());
+        assert_eq!(config.unknown_keys, [] as [&str; 0]);
     }
 
     #[test]
