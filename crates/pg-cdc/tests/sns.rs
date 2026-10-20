@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use aws_sdk_sqs::types::{MessageAttributeValue, MessageSystemAttributeName};
+use aws_sdk_sqs::types::{MessageAttributeValue, MessageSystemAttributeName, QueueAttributeName};
 use pg_cdc::event::{ENVELOPE_VERSION, Envelope, EventId, Op, Source};
 use pg_cdc::order::{OrderBy, order_key};
 use pg_cdc::sink::sns::SnsSink;
 use pg_cdc::sink::{Outbound, Outcome, Sink, SinkCapabilities};
 use pg_cdc_decoder::Lsn;
-use pg_cdc_testkit::AwsEmulator;
+use pg_cdc_testkit::{AwsEmulator, TestkitError};
 use serde_json::json;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -14,8 +14,20 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 const WAIT: Duration = Duration::from_secs(30);
 
 fn outbound(ordinal: u32, tenant: &str) -> Result<Outbound, serde_json::Error> {
+    encode(&envelope(ordinal, tenant))
+}
+
+fn encode(envelope: &Envelope) -> Result<Outbound, serde_json::Error> {
+    Outbound::encode(
+        envelope,
+        order_key(&OrderBy::Key, envelope),
+        &["tenant".to_owned()],
+    )
+}
+
+fn envelope(ordinal: u32, tenant: &str) -> Envelope {
     let row = json!({"id": ordinal, "tenant": tenant});
-    let envelope = Envelope {
+    Envelope {
         id: EventId::new(Lsn(0x1A2B_3C4D), ordinal),
         version: ENVELOPE_VERSION,
         op: Op::Insert,
@@ -25,17 +37,13 @@ fn outbound(ordinal: u32, tenant: &str) -> Result<Outbound, serde_json::Error> {
         before: None,
         after: row.as_object().cloned(),
         unchanged_toast: Vec::new(),
+        changed: None,
         source: Source {
             pipeline: "orders".to_owned(),
             commit_lsn: "0/1A2B3C4D".to_owned(),
             commit_ts: "2026-10-14T12:00:00.123456+00:00".to_owned(),
         },
-    };
-    Outbound::encode(
-        &envelope,
-        order_key(&OrderBy::Key, &envelope),
-        &["tenant".to_owned()],
-    )
+    }
 }
 
 #[tokio::test]
@@ -107,6 +115,86 @@ async fn a_standard_topic_delivers_bodies_and_attributes_to_sqs() -> TestResult 
             Some("String")
         );
     }
+    Ok(())
+}
+
+async fn filtered_queue(
+    aws: &AwsEmulator,
+    topic_arn: &str,
+    name: &str,
+    body_filter: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let sqs = aws.sqs().await;
+    let queue_url = sqs
+        .create_queue()
+        .queue_name(name)
+        .send()
+        .await?
+        .queue_url()
+        .ok_or("no queue URL")?
+        .to_owned();
+    let queue_arn = sqs
+        .get_queue_attributes()
+        .queue_url(&queue_url)
+        .attribute_names(QueueAttributeName::QueueArn)
+        .send()
+        .await?
+        .attributes()
+        .and_then(|attributes| attributes.get(&QueueAttributeName::QueueArn))
+        .ok_or("no queue ARN")?
+        .clone();
+    aws.sns()
+        .await
+        .subscribe()
+        .topic_arn(topic_arn)
+        .protocol("sqs")
+        .endpoint(queue_arn)
+        .attributes("RawMessageDelivery", "true")
+        .attributes("FilterPolicyScope", "MessageBody")
+        .attributes("FilterPolicy", body_filter)
+        .send()
+        .await?;
+    Ok(queue_url)
+}
+
+#[tokio::test]
+async fn a_body_filter_on_changed_selects_updates_that_touched_the_column() -> TestResult {
+    let aws = AwsEmulator::start().await?;
+    let route = aws.topic_with_queue("orders", false).await?;
+    let revisions = filtered_queue(
+        &aws,
+        &route.topic_arn,
+        "revisions",
+        r#"{"changed":["revision"]}"#,
+    )
+    .await?;
+    let sink = SnsSink::new(aws.sns().await, "orders", route.topic_arn, None);
+    sink.preflight().await?;
+    let update = |ordinal: u32, changed: &[&str]| {
+        let mut envelope = envelope(ordinal, "acme");
+        envelope.op = Op::Update;
+        envelope.changed = Some(changed.iter().map(|&name| name.to_owned()).collect());
+        encode(&envelope)
+    };
+    let batch = vec![
+        update(1, &["status", "revision"])?,
+        update(2, &["status"])?,
+        update(3, &[])?,
+        outbound(4, "acme")?,
+    ];
+    assert_eq!(sink.send(&batch).await, vec![Outcome::Delivered; 4]);
+    aws.receive(&route.queue_url, 4, WAIT).await?;
+    let matched = aws.receive(&revisions, 1, WAIT).await?;
+    let bodies: Vec<serde_json::Value> = matched
+        .iter()
+        .map(|message| serde_json::from_str(message.body().unwrap_or_default()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        bodies.iter().map(|body| &body["id"]).collect::<Vec<_>>(),
+        [&json!(batch[0].id.to_string())]
+    );
+    let more = aws.receive(&revisions, 1, Duration::from_secs(2)).await;
+    assert!(matches!(more, Err(TestkitError::Timeout(_))), "{more:?}");
     Ok(())
 }
 

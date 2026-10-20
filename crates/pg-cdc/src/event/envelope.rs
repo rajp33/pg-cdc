@@ -46,6 +46,8 @@ pub struct Envelope {
     pub after: Option<Row>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unchanged_toast: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<Vec<String>>,
     pub source: Source,
 }
 
@@ -73,6 +75,7 @@ pub(crate) fn sample_envelope(
         before: row(before),
         after: row(after),
         unchanged_toast: Vec::new(),
+        changed: None,
         source: Source {
             pipeline: "orders".to_owned(),
             commit_lsn: "0/1A2B3C4D".to_owned(),

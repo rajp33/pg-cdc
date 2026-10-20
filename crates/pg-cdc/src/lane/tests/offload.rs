@@ -41,6 +41,42 @@ async fn an_oversize_event_is_sent_as_a_pointer_to_its_stored_payload() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_event_pushed_over_the_limit_by_changed_becomes_a_pointer_that_keeps_it() {
+    let mut update = crate::event::sample_envelope(
+        crate::event::Op::Update,
+        Some(serde_json::json!({"id": 42})),
+        Some(serde_json::json!({"id": 42, "status": "x".repeat(200)})),
+        Some(serde_json::json!({"id": 42, "status": "y".repeat(200)})),
+    );
+    let without = Bytes::from(update.encode().unwrap());
+    update.changed = Some(vec!["status".to_owned()]);
+    let with = Bytes::from(update.encode().unwrap());
+    let payloads = Arc::new(TestPayloads::default());
+    let mut harness = Harness::start_with_payloads(
+        Setup::default(),
+        limited(without.len()),
+        TestStore::default(),
+        Some(Arc::clone(&payloads)),
+    )
+    .await;
+    harness.send_body(0, b"with", with.clone()).unwrap();
+    harness.send_body(1, b"without", without.clone()).unwrap();
+    assert_eq!(harness.settle(2).await, Lsn(101));
+    let stored = payloads.stored.lock().unwrap().clone();
+    assert_eq!(
+        stored.into_iter().collect::<Vec<_>>(),
+        [(EventId::new(Lsn(0x10), 0), with)]
+    );
+    let bodies = harness.sink.bodies.lock().unwrap().clone();
+    let pointer = std::str::from_utf8(&bodies[&0]).unwrap();
+    assert!(
+        pointer.contains(r#""changed":["status"],"payload_ref":{"#),
+        "{pointer}"
+    );
+    assert_eq!(bodies[&1], without);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_payload_store_outage_retries_and_then_parks_the_full_event() {
     let payloads = Arc::new(TestPayloads::default());
     payloads.fail.store(u32::MAX, Ordering::SeqCst);

@@ -159,6 +159,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pointer_keeps_the_changed_columns_for_body_filters() {
+        let mut envelope = sample_envelope(
+            Op::Update,
+            Some(json!({"id": 42})),
+            Some(json!({"id": 42, "status": "pending"})),
+            Some(json!({"id": 42, "status": "paid"})),
+        );
+        envelope.changed = Some(vec!["status".to_owned()]);
+        let body = envelope.encode().unwrap();
+        let pointer = pointer_body(&body, &reference()).unwrap();
+        assert!(
+            std::str::from_utf8(&pointer)
+                .unwrap()
+                .contains(r#""key":{"id":42},"changed":["status"],"payload_ref":{"#),
+            "{pointer:?}"
+        );
+    }
+
+    #[test]
     fn a_pointer_keeps_exact_key_values() {
         let body = br#"{"id":"x","key":{"id":123456789012345678901234567890.000},"after":{"a":1},"source":{}}"#;
         let pointer = pointer_body(body, &reference()).unwrap();

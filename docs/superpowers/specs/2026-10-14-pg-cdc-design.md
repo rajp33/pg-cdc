@@ -123,7 +123,7 @@ admin HTTP: /healthz /readyz /status /parked
 | leader | Waits as standby until the slot is free, takes it over, renews a lease, and hands over on SIGTERM (§12) |
 | reader | Opens the replication connection, issues `START_REPLICATION`, and reads raw WAL messages |
 | decoder | Turns pgoutput messages and Postgres text values into typed rows (crate `pg-cdc-decoder`, no I/O) |
-| builder | Builds the envelope, order key and event id, and fills unchanged TOAST columns (§7) |
+| builder | Builds the envelope, order key and event id, fills unchanged TOAST columns and lists changed columns (§7) |
 | router | Maps an order key to a lane |
 | lanes | Each owns a subset of order keys: batching, retries, parking, and draining parked queues (§8, §10) |
 | ack tracker | Computes the confirmed LSN from settled transactions and sends status updates on its own timer (§9) |
@@ -211,6 +211,10 @@ JSON output matches `to_jsonb` for the same value. Integration tests use Postgre
   - only the key columns when it carries a `K` tuple (DEFAULT or index identity, key changed);
   - otherwise `null`.
 - **`before` for a delete:** the full old row with an `O` tuple, or only the key columns with a `K` tuple.
+- **`changed` for an update:**
+  - With an `O` tuple, the columns whose text differs between the old and the new tuple, in column order. Null to a value and back count as changes; null to null does not.
+  - A `u` column in the new tuple counts as unchanged. Under FULL identity Postgres sends `u` only for a TOAST value the update left alone, and the old tuple carries that value in full.
+  - Without an old tuple, or with a `K` tuple, `changed` is left out. A `K` tuple is not used even when every column is a key column, so a table either always or never has `changed` on its updates, decided by its replica identity alone.
 - **Startup warning.** pg-cdc logs a warning and sets a metric for every published table whose replica identity is not FULL.
 
 ## 7. Event model
@@ -227,6 +231,7 @@ JSON output matches `to_jsonb` for the same value. Integration tests use Postgre
   "key": { "id": 42 },
   "before": { "id": 42, "status": "pending" },
   "after": { "id": 42, "status": "paid" },
+  "changed": ["status"],
   "source": {
     "pipeline": "orders",
     "commit_lsn": "0/1A2B3C4D",
@@ -245,6 +250,7 @@ JSON output matches `to_jsonb` for the same value. Integration tests use Postgre
 | `before` | The old row as far as Postgres sent it (§6.5), or `null`. |
 | `after` | The new row for `insert` and `update`; otherwise `null`. |
 | `unchanged_toast` | Present only when non-empty: columns that exist but whose unchanged value Postgres did not send. Consumers keep the value they already have. |
+| `changed` | Present only on an `update` with a full old tuple (`REPLICA IDENTITY FULL`): the columns whose value changed, in column order, or `[]` when the update changed nothing (§6.5). Only columns that pgoutput sends can appear: generated columns (never replicated by Postgres 17 and earlier; on Postgres 18 only when the publication sets `publish_generated_columns = stored` or names them in a column list) and columns left out of a publication column list are never listed, even when their value changes. Values are compared as the text Postgres sent, so a change to a column it sends is never missed, but a value written differently yet equal is listed too: numeric scale (`1.50` to `1.5`), `json` (not `jsonb`) key order or spacing, and float `-0` to `0`. |
 | `payload_ref` | Present only on an oversize pointer event (§7.5). |
 | `source.pipeline` | Pipeline name from config. |
 | `source.commit_lsn` | Commit LSN in Postgres notation. Every event of one transaction shares it. |
@@ -292,7 +298,7 @@ A truncate produces one event per truncated relation, with `key`, `before` and `
 
 When the encoded message (body plus attributes) exceeds the sink's `max_message_bytes`:
 
-- **With a PayloadStore,** the full envelope is stored there, and the sink receives a pointer event instead. The pointer is the same envelope without `before`, `after` and `unchanged_toast`, plus `"payload_ref": { "uri": "s3://<bucket>/<prefix>/<pipeline>/payloads/<id>.json", "bytes": 912345 }`.
+- **With a PayloadStore,** the full envelope is stored there, and the sink receives a pointer event instead. The pointer is the same envelope without `before`, `after` and `unchanged_toast`, so it keeps `changed` for body filters, plus `"payload_ref": { "uri": "s3://<bucket>/<prefix>/<pipeline>/payloads/<id>.json", "bytes": 912345 }`.
 - **Without a PayloadStore,** the event is terminal and is parked as `dead` (§10.4).
 
 ## 8. Ordering and lanes

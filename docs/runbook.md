@@ -28,7 +28,7 @@ FROM pg_settings WHERE name = 'max_wal_senders';
 
 With none free, the new task logs SQLSTATE 53300 (`number of requested standby connections exceeds max_wal_senders`), stays unhealthy and retries. Raising `max_wal_senders` needs a restart; size it with one spare per task that may start at the same time.
 
-**FULL identity.** Give every published table `REPLICA IDENTITY FULL`, so updates and deletes carry the whole old row. `/status` and the `pgcdc.tables_without_full_identity` gauge count published tables without it.
+**FULL identity.** Give every published table `REPLICA IDENTITY FULL`, so updates and deletes carry the whole old row and updates list their `changed` columns. `/status` and the `pgcdc.tables_without_full_identity` gauge count published tables without it.
 
 **S3.** One bucket (or prefix) for the state store and, if oversize rows are possible, one for the payload store. Turn on default encryption (SSE-KMS): parked events and payloads hold row data. Give the payload prefix a lifecycle rule that expires objects after your consumers' retention; never expire the state store's `parked/` objects or `leader.json`. The state store lives under `<prefix>/<pipeline>/` (`leader.json`, `parked/<order key id>/<event id>.json`), payloads under `<prefix>/<pipeline>/payloads/<event id>.json`.
 

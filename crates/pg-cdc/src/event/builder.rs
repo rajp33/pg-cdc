@@ -69,6 +69,7 @@ struct Change {
     before: Option<Row>,
     after: Option<Row>,
     unchanged_toast: Vec<String>,
+    changed: Option<Vec<String>>,
 }
 
 impl Builder {
@@ -112,6 +113,7 @@ impl Builder {
             before: None,
             after: Some(after),
             unchanged_toast,
+            changed: None,
         };
         self.emit(relation, change, fallbacks)
     }
@@ -126,6 +128,10 @@ impl Builder {
         let before = match &update.old {
             Some(old) => Some(old_image(relation, old, &mut fallbacks)?),
             None => None,
+        };
+        let changed = match &update.old {
+            Some(OldTuple::Full(old)) => Some(changed_columns(relation, old, &update.new)),
+            _ => None,
         };
         let new_values: Vec<TupleValue> = match &update.old {
             Some(OldTuple::Full(old)) => update
@@ -149,6 +155,7 @@ impl Builder {
             before,
             after: Some(after),
             unchanged_toast,
+            changed,
         };
         self.emit(relation, change, fallbacks)
     }
@@ -166,6 +173,7 @@ impl Builder {
             before: Some(before),
             after: None,
             unchanged_toast: Vec::new(),
+            changed: None,
         };
         self.emit(relation, change, fallbacks)
     }
@@ -177,6 +185,7 @@ impl Builder {
             before: None,
             after: None,
             unchanged_toast: Vec::new(),
+            changed: None,
         };
         self.emit(relation, change, Vec::new())
     }
@@ -200,6 +209,7 @@ impl Builder {
             before: change.before,
             after: change.after,
             unchanged_toast: change.unchanged_toast,
+            changed: change.changed,
             source: Source {
                 pipeline: self.pipeline.clone(),
                 commit_lsn: txn.commit_lsn.to_string(),
@@ -211,6 +221,16 @@ impl Builder {
             fallbacks,
         })
     }
+}
+
+fn changed_columns(relation: &RelationInfo, old: &Tuple, new: &Tuple) -> Vec<String> {
+    relation
+        .columns
+        .iter()
+        .zip(old.0.iter().zip(&new.0))
+        .filter(|(_, (old, new))| !matches!(new, TupleValue::UnchangedToast) && old != new)
+        .map(|(column, _)| column.name.clone())
+        .collect()
 }
 
 fn check_shape(relation: &RelationInfo, tuple: &Tuple) -> Result<(), BuildError> {
@@ -388,8 +408,137 @@ mod tests {
         let built = builder.update(&relation, &update).unwrap();
         assert_eq!(
             encoded(&built),
-            r#"{"id":"000000001a2b3c4d-00000003","version":1,"op":"update","schema":"public","table":"orders","key":{"id":42},"before":{"id":42,"status":"pending"},"after":{"id":42,"status":"paid"},"source":{"pipeline":"orders","commit_lsn":"0/1A2B3C4D","commit_ts":"2026-10-14T12:00:00.123456+00:00"}}"#
+            r#"{"id":"000000001a2b3c4d-00000003","version":1,"op":"update","schema":"public","table":"orders","key":{"id":42},"before":{"id":42,"status":"pending"},"after":{"id":42,"status":"paid"},"changed":["status"],"source":{"pipeline":"orders","commit_lsn":"0/1A2B3C4D","commit_ts":"2026-10-14T12:00:00.123456+00:00"}}"#
         );
+    }
+
+    fn full_update(relation: &RelationInfo, old: Vec<TupleValue>, new: Vec<TupleValue>) -> Built {
+        let update = Update {
+            relation_oid: 16_384,
+            old: Some(OldTuple::Full(Tuple(old))),
+            new: Tuple(new),
+        };
+        open().update(relation, &update).unwrap()
+    }
+
+    fn changed(built: &Built) -> Option<Vec<&str>> {
+        built
+            .envelope
+            .changed
+            .as_ref()
+            .map(|columns| columns.iter().map(String::as_str).collect())
+    }
+
+    #[test]
+    fn changed_lists_the_columns_whose_text_differs_in_relation_order() {
+        let built = full_update(
+            &three_columns(),
+            vec![t("41"), t("pending"), t("a")],
+            vec![t("42"), t("pending"), t("b")],
+        );
+        assert_eq!(changed(&built), Some(vec!["id", "note"]));
+    }
+
+    #[test]
+    fn an_unchanged_toast_column_under_full_identity_is_not_changed() {
+        let built = full_update(
+            &three_columns(),
+            vec![t("42"), t("pending"), t("long text")],
+            vec![t("42"), t("paid"), TupleValue::UnchangedToast],
+        );
+        assert_eq!(changed(&built), Some(vec!["status"]));
+
+        let built = full_update(
+            &three_columns(),
+            vec![t("42"), t("paid"), t("long text")],
+            vec![t("42"), t("paid"), TupleValue::UnchangedToast],
+        );
+        assert_eq!(changed(&built), Some(Vec::new()));
+    }
+
+    #[test]
+    fn null_transitions_are_changes_and_null_to_null_is_not() {
+        let relation = orders(vec![
+            column("id", TypeKind::Integer, 23, true),
+            column("status", TypeKind::Text, 25, false),
+            column("note", TypeKind::Text, 25, false),
+            column("memo", TypeKind::Text, 25, false),
+        ]);
+        let built = full_update(
+            &relation,
+            vec![t("42"), TupleValue::Null, t("n"), TupleValue::Null],
+            vec![t("42"), t("paid"), TupleValue::Null, TupleValue::Null],
+        );
+        assert_eq!(changed(&built), Some(vec!["status", "note"]));
+    }
+
+    #[test]
+    fn a_no_op_update_has_an_empty_changed_list() {
+        let built = full_update(
+            &two_columns(),
+            vec![t("42"), t("paid")],
+            vec![t("42"), t("paid")],
+        );
+        assert_eq!(changed(&built), Some(Vec::new()));
+        assert!(
+            encoded(&built).contains(r#""after":{"id":42,"status":"paid"},"changed":[],"source":"#)
+        );
+    }
+
+    #[test]
+    fn changed_compares_raw_text_so_equal_values_written_differently_are_listed() {
+        let relation = orders(vec![
+            column("id", TypeKind::Integer, 23, true),
+            column("doc", TypeKind::Json, 114, false),
+            column("amount", TypeKind::Numeric, 1700, false),
+            column("ratio", TypeKind::Float, 701, false),
+        ]);
+        let built = full_update(
+            &relation,
+            vec![t("1"), t(r#"{"a":1,"b":2}"#), t("1.50"), t("0")],
+            vec![t("1"), t(r#"{"b":2,"a":1}"#), t("1.5"), t("-0")],
+        );
+        assert_eq!(changed(&built), Some(vec!["doc", "amount", "ratio"]));
+    }
+
+    #[test]
+    fn changed_is_absent_without_a_full_old_tuple() {
+        for old in [
+            None,
+            Some(OldTuple::Key(Tuple(vec![t("41"), TupleValue::Null]))),
+            Some(OldTuple::Key(Tuple(vec![t("41"), t("paid")]))),
+        ] {
+            let update = Update {
+                relation_oid: 16_384,
+                old,
+                new: Tuple(vec![t("42"), t("paid")]),
+            };
+            let built = open().update(&two_columns(), &update).unwrap();
+            assert_eq!(built.envelope.changed, None);
+            assert!(!encoded(&built).contains("changed"));
+        }
+    }
+
+    #[test]
+    fn changed_is_absent_on_inserts_deletes_and_truncates() {
+        let mut builder = open();
+        let insert = Insert {
+            relation_oid: 16_384,
+            new: Tuple(vec![t("42"), t("paid")]),
+        };
+        let delete = Delete {
+            relation_oid: 16_384,
+            old: OldTuple::Full(Tuple(vec![t("42"), t("paid")])),
+        };
+        let built = [
+            builder.insert(&two_columns(), &insert).unwrap(),
+            builder.delete(&two_columns(), &delete).unwrap(),
+            builder.truncate(&two_columns()).unwrap(),
+        ];
+        for built in &built {
+            assert_eq!(built.envelope.changed, None);
+            assert!(!encoded(built).contains("changed"));
+        }
     }
 
     #[test]
