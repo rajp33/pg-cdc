@@ -42,7 +42,7 @@ clap = { version = "4.6.7", default-features = false, features = [
   "usage",
   "error-context",
 ] }
-fallible-iterator = "0.2.0"
+fallible-iterator = "0.3.0"
 fastrand = "2.5.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 http-body-util = "0.1.5"
