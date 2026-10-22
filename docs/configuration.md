@@ -30,7 +30,7 @@ source:
 delivery:
   order_by: key
   lanes: 64
-  max_inflight_bytes: 256MiB
+  max_inflight_bytes: 32MiB
   park_after: 30s
   max_parked_events: 10000000
 
@@ -84,7 +84,7 @@ telemetry:
 | `delivery.order_by` | `key` | `key`, `table`, `column:<name>` or `pipeline` (see [Order keys](#order-keys)). |
 | `delivery.order_by_tables` | `{}` | Per-table overrides of `order_by`: `schema.table` to `key`, `table` or `column:<name>` (see [Order keys](#order-keys)). In the environment, comma-separated `schema.table=order_by` pairs. |
 | `delivery.lanes` | `64` | 1 to 4,096. An event goes to lane `order key id mod lanes`. |
-| `delivery.max_inflight_bytes` | `256MiB` | The reader stops when in-flight events (their encoded bodies) reach this size. |
+| `delivery.max_inflight_bytes` | `32MiB` | The reader stops when in-flight events reach this size. Each event counts its encoded size (body and message attributes) plus 1 KiB for the memory pg-cdc holds per event in flight. |
 | `delivery.park_after` | `30s` | How long an event may stay undelivered after its first failure before it is parked. |
 | `delivery.max_parked_events` | `10000000` | `0` is unlimited. Also bounds parked-key memory (see [runbook](runbook.md#5-parked-and-dead-events)). |
 | `sink.type` | required | `sns`, `stdout` or `discard`. |

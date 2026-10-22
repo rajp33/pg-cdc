@@ -7,6 +7,8 @@ use crate::event::EventId;
 use crate::sink::Outcome;
 use crate::state::StoreError;
 
+pub const EVENT_OVERHEAD_BYTES: u64 = 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AckError {
     #[error("a transaction is already open")]
@@ -122,6 +124,10 @@ impl AckTracker {
         self.inflight_bytes
     }
 
+    pub fn has_room(&self, max_inflight_bytes: u64) -> bool {
+        self.inflight_bytes < max_inflight_bytes
+    }
+
     pub fn is_idle(&self) -> bool {
         self.txns.is_empty()
     }
@@ -158,7 +164,8 @@ impl AckTracker {
         }
     }
 
-    pub fn track(&mut self, bytes: u64) -> Result<Ticket, AckError> {
+    pub fn track(&mut self, encoded_len: u64) -> Result<Ticket, AckError> {
+        let bytes = encoded_len.saturating_add(EVENT_OVERHEAD_BYTES);
         let (seq, txn) = self.open_txn()?;
         txn.unsettled += 1;
         self.inflight_events += 1;
@@ -281,7 +288,7 @@ mod tests {
         let ticket = ticket.settle(&retry).unwrap_err();
         let terminal = Outcome::Terminal(SinkError("rejected".to_owned()));
         let ticket = ticket.settle(&terminal).unwrap_err();
-        assert_eq!(ticket.bytes(), 7);
+        assert_eq!(ticket.bytes(), 7 + EVENT_OVERHEAD_BYTES);
         assert_eq!(ack.commit(Lsn(200)), Ok(Lsn(100)));
         assert_eq!(ack.settle(delivered(ticket)), Ok(Lsn(200)));
     }
@@ -520,11 +527,31 @@ mod tests {
         ack.begin().unwrap();
         let small = ack.track(10).unwrap();
         let large = ack.track(1000).unwrap();
-        assert_eq!((ack.inflight_events(), ack.inflight_bytes()), (2, 1010));
+        assert_eq!(
+            (ack.inflight_events(), ack.inflight_bytes()),
+            (2, 1010 + 2 * EVENT_OVERHEAD_BYTES)
+        );
         ack.settle(delivered(large)).unwrap();
-        assert_eq!((ack.inflight_events(), ack.inflight_bytes()), (1, 10));
+        assert_eq!(
+            (ack.inflight_events(), ack.inflight_bytes()),
+            (1, 10 + EVENT_OVERHEAD_BYTES)
+        );
         ack.settle(delivered(small)).unwrap();
         assert_eq!((ack.inflight_events(), ack.inflight_bytes()), (0, 0));
+    }
+
+    #[test]
+    fn the_read_gate_closes_once_events_and_their_overhead_fill_the_bound() {
+        let (bound, size): (u64, u64) = (64 * 1024, 500);
+        let mut ack = AckTracker::new(Lsn(0));
+        ack.begin().unwrap();
+        let mut read = 0;
+        while ack.has_room(bound) {
+            ack.track(size).unwrap();
+            read += 1;
+        }
+        assert_eq!(read, bound.div_ceil(size + EVENT_OVERHEAD_BYTES));
+        assert_eq!(ack.inflight_bytes(), read * (size + EVENT_OVERHEAD_BYTES));
     }
 
     #[test]
