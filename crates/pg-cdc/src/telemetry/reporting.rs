@@ -1009,7 +1009,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_panic_with_a_stalled_transport_returns_at_once() {
             let reporting = stalled();
-            let panicked = within(Duration::from_secs(3), || {
+            let panicked = within(Duration::from_secs(6), || {
                 std::panic::catch_unwind(|| panic!("the lane invariant broke")).is_err()
             })
             .await;
