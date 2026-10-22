@@ -220,9 +220,9 @@ impl Lanes {
 struct Key {
     queue: VecDeque<Pending>,
     backoff: Backoff,
-    failure: Option<Failure>,
-    stored: Option<Stored>,
-    offloaded: Option<Outbound>,
+    failure: Option<Box<Failure>>,
+    stored: Option<Box<Stored>>,
+    offloaded: Option<Box<Outbound>>,
     reserved: u64,
     counted: u64,
 }
@@ -471,6 +471,7 @@ impl Lane {
             }
             Entry::Vacant(entry) => {
                 let mut state = Key::new();
+                state.queue = VecDeque::with_capacity(1);
                 state.queue.push_back(pending);
                 entry.insert(state);
                 if self.closing && self.is_loaded(key) {
@@ -527,7 +528,7 @@ impl Lane {
             Some(stored) => stored.head.as_ref(),
             None => state
                 .offloaded
-                .as_ref()
+                .as_deref()
                 .or_else(|| state.queue.front().map(|pending| &pending.outbound)),
         }
     }
