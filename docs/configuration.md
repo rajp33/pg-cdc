@@ -88,7 +88,7 @@ telemetry:
 | `delivery.park_after` | `30s` | How long an event may stay undelivered after its first failure before it is parked. |
 | `delivery.max_parked_events` | `10000000` | `0` is unlimited. Also bounds parked-key memory (see [runbook](runbook.md#5-parked-and-dead-events)). |
 | `sink.type` | required | `sns`, `stdout` or `discard`. |
-| `sink.max_concurrency` | `32` | 1 to 4,096 concurrent sink calls, for any sink type. |
+| `sink.max_concurrency` | `32` | 1 to 4,096 concurrent sink calls, for any sink type. Each call can carry entries from any lane. |
 | `sink.topic_arn` | required for `sns` | |
 | `sink.region` | the default AWS region | `sns` only. |
 | `sink.attribute_columns` | `[]` | `sns` only. Up to 7 distinct column names sent as message attributes; `schema`, `table` and `op` are reserved. |
@@ -108,7 +108,7 @@ telemetry:
 | `telemetry.sentry.environment` | unset (Sentry's default) | Tags every event. |
 | `telemetry.sentry.sample_rate` | `1.0` | 0 to 1; the share of error events sent. |
 
-Fixed internal values: standby poll and lease check every 2 s; batch linger 5 ms; sink retry backoff 100 ms to 30 s; reconnect backoff 1 s to 30 s.
+Fixed internal values: standby poll and lease check every 2 s; sink batch linger 5 ms, shared by all lanes; sink retry backoff 100 ms to 30 s; reconnect backoff 1 s to 30 s.
 
 ## Credentials
 
@@ -126,7 +126,7 @@ The order key decides ordering and lane placement. Events of one order key are d
 | `column:<name>` | the value of that column; schema and table when it is absent or null |
 | `pipeline` | one key for everything: total order, one event in flight at a time |
 
-A truncate has no key: its order key is its table under `key`, `table` and the `column:<name>` fallback, and the one constant key under `pipeline`. Under `key` and `column:<name>` it is therefore not ordered relative to that table's row events that use a different order key. One order key moves at most one event per sink round trip, roughly 20 to 50 events/s against SNS, so choose `order_by` so that no single key carries a high rate.
+A truncate has no key: its order key is its table under `key`, `table` and the `column:<name>` fallback, and the one constant key under `pipeline`. Under `key` and `column:<name>` it is therefore not ordered relative to that table's row events that use a different order key. One order key moves at most one event per sink round trip plus up to the batch linger, roughly 20 to 50 events/s against SNS, so choose `order_by` so that no single key carries a high rate.
 
 `delivery.order_by_tables` overrides `order_by` for the tables it names; every other table keeps `order_by`:
 

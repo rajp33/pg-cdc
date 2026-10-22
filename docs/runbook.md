@@ -277,7 +277,7 @@ Telemetry is configured under `telemetry` ([docs/configuration.md](configuration
 |---|---|---|
 | `pgcdc.events` | counter | `table`, `op`, `outcome` (`received`, `delivered`, `parked`, `dead`) |
 | `pgcdc.commit_to_delivery` | histogram (s) | (live deliveries only, from the transaction's commit time) |
-| `pgcdc.sink.duration` | histogram (s) | `outcome` (`delivered`, `retryable`, `terminal`) |
+| `pgcdc.sink.duration` | histogram (s) | `outcome` (`delivered`, `retryable`, `terminal`): one point per sink call, whatever lanes its entries came from |
 | `pgcdc.store.duration` | histogram (s) | `operation` |
 | `pgcdc.takeovers` | counter | `kind` (`clean`, `unclean`; a first takeover counts as `clean`) |
 | `pgcdc.decode.fallbacks` | counter | `type` |
@@ -305,7 +305,7 @@ Every attribute value comes from a fixed set; none is a table, key, error messag
 
 The counters overlap on purpose, so do not add them up: a throttled SNS publish counts in `pgcdc.sink.throttled` and, for the same messages, in `pgcdc.errors{component="sink",kind="retryable"}`. A throttled S3 attempt that a retry recovers counts only in `pgcdc.store.throttled`; one whose call still fails also counts once in `pgcdc.errors{component="store",kind="unavailable"}`.
 
-Spans: `transaction` (`commit_lsn`, `xid`, `events`), `sink_send` (`sink`, `size`, `delivered`, `retryable`, `terminal`), `store` (`operation`, `count`), `park` and `drain` (`events`) and `status_update` (`lsn`) at debug; `takeover` (`holder`, `kind`, `epoch`) and `role_change` (`from`, `to`) at info. Only pg-cdc's own spans at debug and above are exported, sampled by `trace_sample_ratio`. Logs at info and above are exported too, and while telemetry is enabled a JSON log line written inside a sampled span gains `"trace_id"` (32 hex digits) and `"span_id"` (16 hex digits).
+Spans: `transaction` (`commit_lsn`, `xid`, `events`), `sink_send` (`sink`, `size`, `delivered`, `retryable`, `terminal`; one per sink call, `size` counts the entries from all lanes in that call), `store` (`operation`, `count`), `park` and `drain` (`events`) and `status_update` (`lsn`) at debug; `takeover` (`holder`, `kind`, `epoch`) and `role_change` (`from`, `to`) at info. Only pg-cdc's own spans at debug and above are exported, sampled by `trace_sample_ratio`. Logs at info and above are exported too, and while telemetry is enabled a JSON log line written inside a sampled span gains `"trace_id"` (32 hex digits) and `"span_id"` (16 hex digits).
 
 ### Error reporting (Sentry)
 

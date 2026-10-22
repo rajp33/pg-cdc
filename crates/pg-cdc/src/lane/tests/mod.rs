@@ -1,3 +1,4 @@
+mod batch;
 mod drain;
 mod gauges;
 mod metrics;
@@ -9,6 +10,7 @@ mod stored;
 
 use super::*;
 use crate::ack::AckTracker;
+use crate::leader::gate::{GatedSink, WriteGate};
 use crate::payload::PayloadRef;
 use crate::state::memory::MemoryStateStore;
 use crate::state::{
@@ -549,7 +551,6 @@ impl Harness {
                 body,
             },
             ticket,
-            arrived: Instant::now(),
             committed_ms: None,
         })
     }
@@ -660,11 +661,11 @@ async fn batches_respect_the_sink_message_and_byte_limits() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_batch_that_is_not_full_lingers_five_milliseconds_from_its_oldest_arrival() {
+async fn a_lane_submits_as_soon_as_a_key_is_ready_and_the_batcher_lingers() {
     let mut harness = Harness::new(1, 1, ScriptedSink::delivering()).await;
     let start = Instant::now();
     harness.send(0, b"a", 10).unwrap();
-    tokio::time::advance(Duration::from_millis(3)).await;
+    tokio::time::sleep(Duration::from_millis(3)).await;
     harness.send(1, b"b", 10).unwrap();
     harness.settle(2).await;
     let later = Instant::now() + Duration::from_secs(1);
@@ -672,9 +673,39 @@ async fn a_batch_that_is_not_full_lingers_five_milliseconds_from_its_oldest_arri
     harness.send(2, b"c", 10).unwrap();
     harness.settle(1).await;
     let sends = harness.sink.sends();
-    assert_eq!(harness.sink.batches(), vec![vec![0, 1], vec![2]]);
+    assert_eq!(harness.sink.batches(), vec![vec![0], vec![1], vec![2]]);
     assert_eq!(sends[0].at, start + LINGER);
+    assert_eq!(sends[1].at, start + LINGER * 2);
     assert_eq!(sends[2].at, later + LINGER);
+}
+
+#[tokio::test(start_paused = true)]
+async fn events_of_two_lanes_arriving_within_the_linger_share_one_call() {
+    let mut harness = Harness::new(2, 1, ScriptedSink::delivering()).await;
+    let start = Instant::now();
+    harness.send(0, &key_in_lane(0, 2, 0), 10).unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    harness.send(1, &key_in_lane(1, 2, 0), 10).unwrap();
+    harness.settle(2).await;
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1]]);
+    assert_eq!(harness.sink.sends()[0].at, start + LINGER);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lanes_second_event_waits_for_its_call_in_flight() {
+    let mut sink = ScriptedSink::delivering();
+    sink.latency = Duration::from_millis(20);
+    let mut harness = Harness::new(1, 1, sink).await;
+    harness.send(0, b"a", 10).unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    harness.send(1, b"b", 10).unwrap();
+    harness.settle(2).await;
+    let sends = harness.sink.sends();
+    assert_eq!(harness.sink.batches(), vec![vec![0], vec![1]]);
+    assert_eq!(
+        sends[1].at - sends[0].at,
+        LINGER + Duration::from_millis(20)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -727,8 +758,8 @@ async fn a_retryable_outcome_backs_off_only_its_key() {
             (3, true)
         ]
     );
-    assert!(sends[3].at - sends[0].at <= RETRY_BASE);
-    assert!(sends[4].at - sends[3].at <= RETRY_BASE * 2);
+    assert!(sends[3].at - sends[0].at <= RETRY_BASE + LINGER);
+    assert!(sends[4].at - sends[3].at <= RETRY_BASE * 2 + LINGER);
 }
 
 #[tokio::test(start_paused = true)]
@@ -756,7 +787,7 @@ async fn retries_back_off_with_full_jitter_up_to_thirty_seconds() {
         let cap = RETRY_BASE
             .saturating_mul(1 << attempt.min(16))
             .min(RETRY_CAP);
-        assert!(pair[1].at - pair[0].at <= cap, "attempt {attempt}");
+        assert!(pair[1].at - pair[0].at <= cap + LINGER, "attempt {attempt}");
     }
     assert_eq!(harness.ack.inflight_events(), 1);
 }
@@ -777,7 +808,11 @@ async fn missing_outcomes_are_retried() {
 #[tokio::test(start_paused = true)]
 async fn sink_calls_across_lanes_share_the_concurrency_bound() {
     for (concurrency, expected) in [(1, 1), (4, 4)] {
-        let mut sink = ScriptedSink::delivering();
+        let limits = SinkCapabilities {
+            max_batch_messages: 1,
+            ..LIMITS
+        };
+        let mut sink = ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered));
         sink.latency = Duration::from_millis(50);
         let mut harness = Harness::new(4, concurrency, sink).await;
         for lane in 0..4 {
@@ -882,6 +917,53 @@ async fn stop_with_zero_grace_aborts_at_once() {
     let started = Instant::now();
     assert!(!harness.lanes.stop(Duration::ZERO).await);
     assert_eq!(started.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopping_lanes_counts_a_call_still_in_flight_as_abandoned_before_stop_returns() {
+    let gate = WriteGate::new();
+    gate.open();
+    let mut held = ScriptedSink::delivering();
+    held.latency = Duration::from_secs(3600);
+    let sink: Arc<dyn Sink> = Arc::new(GatedSink::new(Arc::new(held), Arc::clone(&gate)));
+    let stores = Stores {
+        state: Arc::new(TestStore::default()),
+        payload: None,
+    };
+    let (reports, _receiver) = mpsc::unbounded_channel();
+    let settings = LaneSettings {
+        lanes: 1,
+        park_after: Duration::from_secs(30),
+        max_parked_events: 0,
+        store_concurrency: 4,
+    };
+    let lanes = Lanes::spawn(
+        settings,
+        &sink,
+        &stores,
+        &Arc::new(Semaphore::new(1)),
+        &reports,
+    );
+    let mut ack = AckTracker::new(Lsn(0));
+    ack.begin().unwrap();
+    let ticket = ack.track(10).unwrap();
+    ack.commit(Lsn(100)).unwrap();
+    lanes
+        .dispatch(Pending {
+            outbound: Outbound {
+                id: EventId::new(Lsn(0x10), 0),
+                order_key: OrderKeyId::of(b"k"),
+                attributes: Vec::new(),
+                body: Bytes::from_static(b"x"),
+            },
+            ticket,
+            committed_ms: None,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(gate.abandoned_writes(), 0);
+    assert!(!lanes.stop(Duration::ZERO).await);
+    assert_eq!(gate.abandoned_writes(), 1);
 }
 
 proptest! {
