@@ -1145,7 +1145,6 @@ impl Session<'_> {
         self.lanes.dispatch(Pending {
             outbound,
             ticket,
-            arrived: Instant::now(),
             committed_ms: self.committed_ms,
         })?;
         self.publish_inflight();

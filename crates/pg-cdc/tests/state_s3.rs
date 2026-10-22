@@ -1011,7 +1011,6 @@ impl Writer {
                 body: Bytes::from(format!(r#"{{"n":{ordinal}}}"#)),
             },
             ticket,
-            arrived: Instant::now(),
             committed_ms: None,
         })?;
         self.written.push((queue, id));

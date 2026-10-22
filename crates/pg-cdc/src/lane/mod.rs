@@ -42,7 +42,6 @@ pub const RETRY_CAP: Duration = Duration::from_secs(30);
 pub struct Pending {
     pub outbound: Outbound,
     pub ticket: Ticket,
-    pub arrived: Instant,
     pub committed_ms: Option<u64>,
 }
 

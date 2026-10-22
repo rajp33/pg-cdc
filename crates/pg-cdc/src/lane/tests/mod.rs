@@ -551,7 +551,6 @@ impl Harness {
                 body,
             },
             ticket,
-            arrived: Instant::now(),
             committed_ms: None,
         })
     }
@@ -958,7 +957,6 @@ async fn stopping_lanes_counts_a_call_still_in_flight_as_abandoned_before_stop_r
                 body: Bytes::from_static(b"x"),
             },
             ticket,
-            arrived: Instant::now(),
             committed_ms: None,
         })
         .unwrap();

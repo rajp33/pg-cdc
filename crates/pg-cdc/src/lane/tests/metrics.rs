@@ -107,7 +107,6 @@ fn send_labelled(
                 body: Bytes::from_static(b"x"),
             },
             ticket,
-            arrived: Instant::now(),
             committed_ms,
         })
         .unwrap();

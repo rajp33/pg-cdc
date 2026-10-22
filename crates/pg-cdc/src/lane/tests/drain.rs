@@ -204,7 +204,6 @@ impl Backlog {
                     body: Bytes::from_static(b"{}"),
                 },
                 ticket,
-                arrived: Instant::now(),
                 committed_ms: None,
             })
             .unwrap();
