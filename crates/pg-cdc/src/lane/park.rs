@@ -18,11 +18,13 @@ fn record_rejected() {
 
 impl Key {
     pub(super) fn record_failure(&mut self, error: &SinkError) {
-        let failure = self.failure.get_or_insert_with(|| Failure {
-            since: Instant::now(),
-            since_ms: now_ms(),
-            attempts: 0,
-            error: String::new(),
+        let failure = self.failure.get_or_insert_with(|| {
+            Box::new(Failure {
+                since: Instant::now(),
+                since_ms: now_ms(),
+                attempts: 0,
+                error: String::new(),
+            })
         });
         failure.attempts = failure.attempts.saturating_add(1);
         failure.error = error.to_string();
@@ -74,13 +76,13 @@ impl Lane {
             .failure
             .as_ref()
             .map_or_else(now_ms, |failure| failure.since_ms);
-        state.stored = Some(Stored {
+        state.stored = Some(Box::new(Stored {
             floor,
             current: floor,
             dead_on_append: dead,
             since_ms: Some(since_ms),
             ..Stored::default()
-        });
+        }));
         self.stats_dirty = true;
         tracing::warn!(order_key = %key, id = ?floor, dead, "parking an order key's events");
         self.to_append.insert(key);

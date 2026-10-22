@@ -47,7 +47,7 @@ impl Lane {
         };
         match state.stored.as_mut() {
             Some(stored) => stored.head = Some(pointer),
-            None => state.offloaded = Some(pointer),
+            None => state.offloaded = Some(Box::new(pointer)),
         }
         self.ready.push_back(key);
     }

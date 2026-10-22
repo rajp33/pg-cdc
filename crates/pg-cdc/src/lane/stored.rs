@@ -25,11 +25,11 @@ impl Lane {
         let key = head.order_key;
         let state = self.keys.entry(key).or_insert_with(Key::new);
         state.counted = state.counted.saturating_add(head.length);
-        state.stored = Some(Stored {
+        state.stored = Some(Box::new(Stored {
             floor: Some(head.head),
             current: Some(head.head),
             ..Stored::default()
-        });
+        }));
         self.stats_dirty = true;
         let queued = std::mem::take(&mut state.queue);
         let mut dropped = 0_u64;
