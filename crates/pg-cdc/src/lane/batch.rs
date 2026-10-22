@@ -1,14 +1,17 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
+use tracing::Instrument;
 
 use super::LINGER;
+use crate::metrics::{self, ErrorComponent, ErrorKind, Measurement, SinkOutcome};
 use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 
 #[derive(Debug)]
@@ -247,7 +250,17 @@ async fn call(
     slots: Vec<Slot>,
 ) -> Flushed {
     let _permit = permit;
-    let mut outcomes = inner.send(&batch).await;
+    let span = tracing::debug_span!(
+        "sink_send",
+        sink = inner.name(),
+        size = u64::try_from(batch.len()).unwrap_or(u64::MAX),
+        delivered = tracing::field::Empty,
+        retryable = tracing::field::Empty,
+        terminal = tracing::field::Empty,
+    );
+    let started = metrics::enabled().then(Instant::now);
+    let mut outcomes = inner.send(&batch).instrument(span.clone()).await;
+    let elapsed = started.map(|started| started.elapsed());
     if outcomes.len() != batch.len() {
         tracing::error!(
             sent = batch.len(),
@@ -258,5 +271,49 @@ async fn call(
     outcomes.resize_with(batch.len(), || {
         Outcome::Retryable(SinkError("the sink returned no outcome".to_owned()))
     });
+    record_sink_call(&span, &outcomes, elapsed);
     Flushed { slots, outcomes }
+}
+
+pub(super) fn record_sink_call(
+    span: &tracing::Span,
+    outcomes: &[Outcome],
+    elapsed: Option<Duration>,
+) {
+    if span.is_disabled() && elapsed.is_none() {
+        return;
+    }
+    let (mut delivered, mut retryable, mut terminal) = (0_u64, 0_u64, 0_u64);
+    for outcome in outcomes {
+        match outcome {
+            Outcome::Delivered => delivered += 1,
+            Outcome::Retryable(_) => retryable += 1,
+            Outcome::Terminal(_) => terminal += 1,
+        }
+    }
+    span.record("delivered", delivered);
+    span.record("retryable", retryable);
+    span.record("terminal", terminal);
+    if let Some(elapsed) = elapsed {
+        let outcome = if terminal > 0 {
+            SinkOutcome::Terminal
+        } else if retryable > 0 {
+            SinkOutcome::Retryable
+        } else {
+            SinkOutcome::Delivered
+        };
+        metrics::record(Measurement::Sink { outcome, elapsed });
+        for (kind, count) in [
+            (ErrorKind::Retryable, retryable),
+            (ErrorKind::Terminal, terminal),
+        ] {
+            if count > 0 {
+                metrics::record(Measurement::Error {
+                    component: ErrorComponent::Sink,
+                    kind,
+                    count,
+                });
+            }
+        }
+    }
 }

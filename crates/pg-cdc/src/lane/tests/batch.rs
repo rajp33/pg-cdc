@@ -1,8 +1,11 @@
+use super::metrics::{Seen, recording, sink_points};
 use super::*;
 use crate::capture::Capture;
-use crate::lane::batch::{Batcher, BatchingSink};
+use crate::lane::batch::{Batcher, BatchingSink, record_sink_call};
 use crate::leader::gate::{GatedSink, WriteGate};
+use crate::metrics::{ErrorComponent, ErrorKind, SinkOutcome};
 use tokio::task::JoinHandle;
+use tracing::Level;
 use tracing::level_filters::LevelFilter;
 
 fn entry(ordinal: u32, key: &[u8], body: usize) -> Outbound {
@@ -414,5 +417,112 @@ async fn aborting_the_batcher_drops_its_calls_in_flight_and_counts_them_as_aband
     assert_eq!(
         submission.await.unwrap(),
         vec![retryable("the sink batcher has stopped")]
+    );
+}
+
+#[test]
+fn the_worst_outcome_wins_terminal_over_retryable_over_delivered() {
+    let seen = recording();
+    let delivered = || Outcome::Delivered;
+    let retryable = || Outcome::Retryable(SinkError("throttled".to_owned()));
+    let terminal = || Outcome::Terminal(SinkError("rejected".to_owned()));
+    let elapsed = Duration::from_millis(7);
+    let cases = [
+        (vec![delivered(), delivered()], SinkOutcome::Delivered),
+        (vec![delivered(), retryable()], SinkOutcome::Retryable),
+        (vec![retryable(), delivered()], SinkOutcome::Retryable),
+        (vec![delivered(), terminal()], SinkOutcome::Terminal),
+        (vec![terminal(), retryable()], SinkOutcome::Terminal),
+        (
+            vec![retryable(), terminal(), delivered()],
+            SinkOutcome::Terminal,
+        ),
+    ];
+    for (outcomes, _) in &cases {
+        record_sink_call(&tracing::Span::none(), outcomes, Some(elapsed));
+    }
+    record_sink_call(&tracing::Span::none(), &[terminal()], None);
+    let expected: Vec<(SinkOutcome, Duration)> =
+        cases.iter().map(|(_, worst)| (*worst, elapsed)).collect();
+    assert_eq!(sink_points(&seen), expected);
+}
+
+#[test]
+fn failed_messages_count_as_sink_errors_of_their_kind() {
+    let seen = recording();
+    let retryable = || Outcome::Retryable(SinkError("throttled".to_owned()));
+    let terminal = || Outcome::Terminal(SinkError("rejected".to_owned()));
+    let elapsed = Some(Duration::from_millis(3));
+    record_sink_call(
+        &tracing::Span::none(),
+        &[Outcome::Delivered, retryable(), terminal(), retryable()],
+        elapsed,
+    );
+    record_sink_call(&tracing::Span::none(), &[Outcome::Delivered], elapsed);
+    record_sink_call(&tracing::Span::none(), &[terminal()], elapsed);
+    let errors: Vec<Seen> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| matches!(entry, Seen::Error(..)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        errors,
+        vec![
+            Seen::Error(ErrorComponent::Sink, ErrorKind::Retryable, 2),
+            Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1),
+            Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_inner_call_records_one_point_timed_over_the_call_not_the_linger_or_permit_wait() {
+    let seen = recording();
+    let mut sink = ScriptedSink::delivering();
+    sink.latency = Duration::from_millis(30);
+    let rig = Rig::with(sink, Arc::new(Semaphore::new(1)));
+    let first = rig.submit(vec![entry(0, b"a", 1)]);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let second = rig.submit(vec![entry(1, b"b", 1)]);
+    first.await.unwrap();
+    second.await.unwrap();
+    assert_eq!(rig.sink.batches(), vec![vec![0], vec![1]]);
+    assert_eq!(
+        sink_points(&seen),
+        vec![(SinkOutcome::Delivered, Duration::from_millis(30)); 2]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_sink_send_span_size_counts_the_entries_of_one_inner_call_across_submitters() {
+    let (capture, _guard) = Capture::install(LevelFilter::DEBUG);
+    let rig = Rig::new(LIMITS, 1);
+    let first = rig.submit(vec![entry(0, b"a", 1), entry(1, b"b", 1)]);
+    let second = rig.submit(vec![entry(2, b"c", 1)]);
+    first.await.unwrap();
+    second.await.unwrap();
+    let spans: Vec<_> = capture
+        .spans()
+        .into_iter()
+        .filter(|span| span.name == "sink_send")
+        .collect();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].level, Level::DEBUG);
+    let fields: Vec<(&str, &str)> = spans[0]
+        .fields
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            ("delivered", "3"),
+            ("retryable", "0"),
+            ("sink", "custom"),
+            ("size", "3"),
+            ("terminal", "0"),
+        ]
     );
 }

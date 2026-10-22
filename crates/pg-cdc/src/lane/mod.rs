@@ -23,7 +23,7 @@ use tracing::Instrument;
 
 use crate::ack::{Settled, Ticket};
 use crate::event::EventId;
-use crate::metrics::{self, ErrorComponent, ErrorKind, EventOutcome, Measurement, SinkOutcome};
+use crate::metrics::{self, EventOutcome, Measurement};
 use crate::order::OrderKeyId;
 use crate::payload::PayloadStore;
 use crate::sink::{Outbound, Outcome, Sink, SinkCapabilities, SinkError, metric_labels};
@@ -31,6 +31,7 @@ use crate::state::{PARTITIONS, ParkedHead, StateStore, now_ms};
 use crate::status::{LaneCounts, ParkedGauges, STATS_INTERVAL};
 use crate::supervisor::Backoff;
 
+use batch::record_sink_call;
 use operate::Operation;
 pub use operate::{OPERATION_QUEUE, OperateError, Operator};
 
@@ -677,44 +678,5 @@ fn record_delivered(outbound: &Outbound, committed_ms: Option<u64>) {
         metrics::record(Measurement::CommitToDelivery(Duration::from_millis(
             now_ms().saturating_sub(committed_ms),
         )));
-    }
-}
-
-fn record_sink_call(span: &tracing::Span, outcomes: &[Outcome], elapsed: Option<Duration>) {
-    if span.is_disabled() && elapsed.is_none() {
-        return;
-    }
-    let (mut delivered, mut retryable, mut terminal) = (0_u64, 0_u64, 0_u64);
-    for outcome in outcomes {
-        match outcome {
-            Outcome::Delivered => delivered += 1,
-            Outcome::Retryable(_) => retryable += 1,
-            Outcome::Terminal(_) => terminal += 1,
-        }
-    }
-    span.record("delivered", delivered);
-    span.record("retryable", retryable);
-    span.record("terminal", terminal);
-    if let Some(elapsed) = elapsed {
-        let outcome = if terminal > 0 {
-            SinkOutcome::Terminal
-        } else if retryable > 0 {
-            SinkOutcome::Retryable
-        } else {
-            SinkOutcome::Delivered
-        };
-        metrics::record(Measurement::Sink { outcome, elapsed });
-        for (kind, count) in [
-            (ErrorKind::Retryable, retryable),
-            (ErrorKind::Terminal, terminal),
-        ] {
-            if count > 0 {
-                metrics::record(Measurement::Error {
-                    component: ErrorComponent::Sink,
-                    kind,
-                    count,
-                });
-            }
-        }
     }
 }

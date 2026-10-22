@@ -6,7 +6,7 @@ use tracing::Level;
 use tracing::level_filters::LevelFilter;
 
 #[derive(Debug, Clone, PartialEq)]
-enum Seen {
+pub(super) enum Seen {
     Event {
         table: String,
         op: String,
@@ -49,7 +49,7 @@ impl Recorder for Collecting {
     }
 }
 
-fn recording() -> Arc<Mutex<Vec<Seen>>> {
+pub(super) fn recording() -> Arc<Mutex<Vec<Seen>>> {
     let seen = Arc::new(Mutex::new(Vec::new()));
     crate::metrics::install(Box::new(Collecting(Arc::clone(&seen)))).unwrap();
     seen
@@ -71,7 +71,7 @@ fn counted(seen: &Mutex<Vec<Seen>>, table: &str, outcome: EventOutcome) -> u64 {
         .sum()
 }
 
-fn sink_points(seen: &Mutex<Vec<Seen>>) -> Vec<(SinkOutcome, Duration)> {
+pub(super) fn sink_points(seen: &Mutex<Vec<Seen>>) -> Vec<(SinkOutcome, Duration)> {
     seen.lock()
         .unwrap()
         .iter()
@@ -424,63 +424,6 @@ async fn a_mixed_batch_records_its_worst_outcome() {
         .collect();
     assert_eq!(outcomes.first(), Some(&SinkOutcome::Terminal));
     assert_eq!(outcomes.len(), harness.sink.batches().len());
-}
-
-#[test]
-fn the_worst_outcome_wins_terminal_over_retryable_over_delivered() {
-    let seen = recording();
-    let delivered = || Outcome::Delivered;
-    let retryable = || Outcome::Retryable(SinkError("throttled".to_owned()));
-    let terminal = || Outcome::Terminal(SinkError("rejected".to_owned()));
-    let elapsed = Duration::from_millis(7);
-    let cases = [
-        (vec![delivered(), delivered()], SinkOutcome::Delivered),
-        (vec![delivered(), retryable()], SinkOutcome::Retryable),
-        (vec![retryable(), delivered()], SinkOutcome::Retryable),
-        (vec![delivered(), terminal()], SinkOutcome::Terminal),
-        (vec![terminal(), retryable()], SinkOutcome::Terminal),
-        (
-            vec![retryable(), terminal(), delivered()],
-            SinkOutcome::Terminal,
-        ),
-    ];
-    for (outcomes, _) in &cases {
-        record_sink_call(&tracing::Span::none(), outcomes, Some(elapsed));
-    }
-    record_sink_call(&tracing::Span::none(), &[terminal()], None);
-    let expected: Vec<(SinkOutcome, Duration)> =
-        cases.iter().map(|(_, worst)| (*worst, elapsed)).collect();
-    assert_eq!(sink_points(&seen), expected);
-}
-
-#[test]
-fn failed_messages_count_as_sink_errors_of_their_kind() {
-    let seen = recording();
-    let retryable = || Outcome::Retryable(SinkError("throttled".to_owned()));
-    let terminal = || Outcome::Terminal(SinkError("rejected".to_owned()));
-    let elapsed = Some(Duration::from_millis(3));
-    record_sink_call(
-        &tracing::Span::none(),
-        &[Outcome::Delivered, retryable(), terminal(), retryable()],
-        elapsed,
-    );
-    record_sink_call(&tracing::Span::none(), &[Outcome::Delivered], elapsed);
-    record_sink_call(&tracing::Span::none(), &[terminal()], elapsed);
-    let errors: Vec<Seen> = seen
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|entry| matches!(entry, Seen::Error(..)))
-        .cloned()
-        .collect();
-    assert_eq!(
-        errors,
-        vec![
-            Seen::Error(ErrorComponent::Sink, ErrorKind::Retryable, 2),
-            Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1),
-            Seen::Error(ErrorComponent::Sink, ErrorKind::Terminal, 1),
-        ]
-    );
 }
 
 const HOT_PATH_SPANS: [&str; 4] = ["sink_send", "park", "drain", "store"];
