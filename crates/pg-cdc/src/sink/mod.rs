@@ -96,7 +96,7 @@ impl Outbound {
             id: envelope.id,
             order_key,
             attributes,
-            body: Bytes::from(envelope.encode()?),
+            body: Bytes::from(envelope.encode()?.into_boxed_slice()),
         })
     }
 

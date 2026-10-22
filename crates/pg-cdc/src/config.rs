@@ -25,7 +25,7 @@ use crate::state::s3::S3_ATTEMPT_TIMEOUT;
 pub const ENV_PREFIX: &str = "PGCDC__";
 pub const DEFAULT_LANES: usize = 64;
 pub const MAX_LANES: usize = 4096;
-pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 << 20;
+pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 32 << 20;
 pub const DEFAULT_SINK_CONCURRENCY: usize = 32;
 pub const MAX_ATTRIBUTE_COLUMNS: usize = 7;
 pub const DEFAULT_PARK_AFTER: Duration = Duration::from_secs(30);
@@ -2097,7 +2097,7 @@ state_store:
         assert_eq!(config.delivery.order_by, OrderBy::Key);
         assert!(config.delivery.order_by_tables.is_empty());
         assert_eq!(config.delivery.lanes, 64);
-        assert_eq!(config.delivery.max_inflight_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.delivery.max_inflight_bytes, 32 * 1024 * 1024);
         assert_eq!(config.delivery.park_after, Duration::from_secs(30));
         assert_eq!(config.delivery.max_parked_events, 10_000_000);
     }

@@ -904,7 +904,7 @@ impl Session<'_> {
                 () = shutdown.cancelled() => return Ok(()),
                 report = settled.recv() => self.report(report, stream)?,
                 outcome = claimed(&mut self.leadership.pending) => self.claimed(outcome)?,
-                received = stream.recv(), if self.ack.inflight_bytes() < self.max_inflight_bytes => {
+                received = stream.recv(), if self.ack.has_room(self.max_inflight_bytes) => {
                     let event = next_event(received, &mut position)?;
                     let Some(handled) = shutdown.run_until_cancelled(self.handle(event)).await else {
                         return Ok(());
@@ -1130,7 +1130,7 @@ impl Session<'_> {
             );
         }
         let outbound = Outbound::encode(&built.envelope, key, self.attribute_columns)?;
-        let bytes = u64::try_from(outbound.body.len()).unwrap_or(u64::MAX);
+        let bytes = u64::try_from(outbound.encoded_len()).unwrap_or(u64::MAX);
         let ticket = self.ack.track(bytes)?;
         if metrics::enabled() {
             let (table, op) = metric_labels(&outbound.attributes);
