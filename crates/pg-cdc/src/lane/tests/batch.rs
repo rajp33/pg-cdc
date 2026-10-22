@@ -153,41 +153,64 @@ async fn a_partial_batch_flushes_when_its_oldest_entry_has_waited_the_linger() {
     assert_eq!(sends[2].at, later + LINGER);
 }
 
+#[derive(Debug, Default)]
+struct StaggeredSink {
+    finished: Mutex<Vec<u32>>,
+}
+
+#[async_trait]
+impl Sink for StaggeredSink {
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities {
+            max_batch_messages: 2,
+            ..LIMITS
+        }
+    }
+
+    async fn preflight(&self) -> Result<(), SinkError> {
+        Ok(())
+    }
+
+    async fn send(&self, batch: &[Outbound]) -> Vec<Outcome> {
+        let first = batch.first().map_or(0, |outbound| outbound.id.ordinal());
+        let latency = if first == 0 { 30 } else { 10 };
+        tokio::time::sleep(Duration::from_millis(latency)).await;
+        self.finished.lock().unwrap().push(first);
+        batch
+            .iter()
+            .map(|outbound| match outbound.id.ordinal() {
+                0 => Outcome::Delivered,
+                1 => retryable("1"),
+                ordinal => Outcome::Terminal(SinkError(ordinal.to_string())),
+            })
+            .collect()
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_submission_split_across_two_calls_gets_one_reply_in_submitted_order_after_both_calls() {
-    let script: Script = Box::new(|ordinal, _| {
-        if ordinal % 2 == 1 {
-            Outcome::Retryable(SinkError(ordinal.to_string()))
-        } else {
-            Outcome::Delivered
-        }
-    });
-    let limits = SinkCapabilities {
-        max_batch_messages: 2,
-        ..LIMITS
-    };
-    let mut sink = ScriptedSink::new(limits, script);
-    sink.latency = Duration::from_millis(10);
-    let rig = Rig::with(sink, Arc::new(Semaphore::new(2)));
+    let sink = Arc::new(StaggeredSink::default());
+    let inner: Arc<dyn Sink> = sink.clone();
+    let (batching, batcher) = BatchingSink::new(inner, Arc::new(Semaphore::new(2)));
+    let mut running = JoinSet::new();
+    running.spawn(batcher.run());
     let start = Instant::now();
-    let reply = rig
-        .submit(vec![
-            entry(0, b"a", 10),
-            entry(1, b"b", 10),
-            entry(2, b"c", 10),
-        ])
-        .await
-        .unwrap();
-    assert_eq!(Instant::now() - start, LINGER + Duration::from_millis(10));
+    let entries = vec![entry(0, b"a", 10), entry(1, b"b", 10), entry(2, b"c", 10)];
+    let reply = tokio::spawn(async move { (batching.send(&entries).await, Instant::now()) });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(*sink.finished.lock().unwrap(), vec![2]);
+    assert!(!reply.is_finished());
+    let (outcomes, replied) = reply.await.unwrap();
+    assert_eq!(*sink.finished.lock().unwrap(), vec![2, 0]);
+    assert_eq!(replied - start, Duration::from_millis(30));
     assert_eq!(
-        reply,
+        outcomes,
         vec![
             Outcome::Delivered,
-            Outcome::Retryable(SinkError("1".to_owned())),
-            Outcome::Delivered,
+            retryable("1"),
+            Outcome::Terminal(SinkError("2".to_owned())),
         ]
     );
-    assert_eq!(rig.sink.batches(), vec![vec![0, 1], vec![2]]);
 }
 
 #[tokio::test(start_paused = true)]
