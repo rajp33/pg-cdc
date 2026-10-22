@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 
 use super::LINGER;
@@ -133,15 +133,27 @@ impl Batcher {
             tokio::select! {
                 biased;
                 Some(flushed) = flights.next(), if !flights.is_empty() => self.complete(flushed),
-                () = std::future::ready(()), if due => {
+                permit = Arc::clone(&self.permits).acquire_owned(), if due => {
                     let (batch, slots) = self.take(count);
-                    flights.push(call(Arc::clone(&self.inner), batch, slots));
+                    match permit {
+                        Ok(permit) if !batch.is_empty() => {
+                            flights.push(call(Arc::clone(&self.inner), permit, batch, slots));
+                        }
+                        Ok(_) => {}
+                        Err(_) => self.complete(Flushed {
+                            outcomes: vec![
+                                Outcome::Retryable(SinkError("the sink is closed".to_owned()));
+                                slots.len()
+                            ],
+                            slots,
+                        }),
+                    }
                 }
                 received = self.receiver.recv(), if receiving => match received {
                     Some(submission) => self.enqueue(submission),
                     None => receiving = false,
                 },
-                () = timer => {}
+                () = timer, if !due => {}
             }
         }
     }
@@ -193,6 +205,15 @@ impl Batcher {
         let mut batch = Vec::with_capacity(count);
         let mut slots = Vec::with_capacity(count);
         for queued in self.queue.drain(..count) {
+            let submission = queued.slot.submission;
+            if self
+                .open
+                .get(&submission)
+                .is_none_or(|open| open.reply.is_closed())
+            {
+                self.open.remove(&submission);
+                continue;
+            }
             slots.push(queued.slot);
             batch.push(queued.outbound);
         }
@@ -219,7 +240,23 @@ impl Batcher {
     }
 }
 
-async fn call(inner: Arc<dyn Sink>, batch: Vec<Outbound>, slots: Vec<Slot>) -> Flushed {
-    let outcomes = inner.send(&batch).await;
+async fn call(
+    inner: Arc<dyn Sink>,
+    permit: OwnedSemaphorePermit,
+    batch: Vec<Outbound>,
+    slots: Vec<Slot>,
+) -> Flushed {
+    let _permit = permit;
+    let mut outcomes = inner.send(&batch).await;
+    if outcomes.len() != batch.len() {
+        tracing::error!(
+            sent = batch.len(),
+            outcomes = outcomes.len(),
+            "the sink broke its contract of one outcome per message"
+        );
+    }
+    outcomes.resize_with(batch.len(), || {
+        Outcome::Retryable(SinkError("the sink returned no outcome".to_owned()))
+    });
     Flushed { slots, outcomes }
 }
