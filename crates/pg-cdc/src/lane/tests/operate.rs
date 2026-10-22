@@ -449,7 +449,7 @@ async fn a_redriven_head_retries_from_the_start_of_the_backoff() {
     assert!(last.delivered);
     assert_eq!(sends.len(), 13);
     assert!(
-        last.at - redriven_at <= RETRY_BASE,
+        last.at - redriven_at <= RETRY_BASE + LINGER * 2,
         "{:?}",
         last.at - redriven_at
     );

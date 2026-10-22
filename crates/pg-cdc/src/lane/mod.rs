@@ -19,7 +19,6 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tracing::Instrument;
 
 use crate::ack::{Settled, Ticket};
 use crate::event::EventId;
@@ -31,7 +30,7 @@ use crate::state::{PARTITIONS, ParkedHead, StateStore, now_ms};
 use crate::status::{LaneCounts, ParkedGauges, STATS_INTERVAL};
 use crate::supervisor::Backoff;
 
-use batch::record_sink_call;
+use batch::BatchingSink;
 use operate::Operation;
 pub use operate::{OPERATION_QUEUE, OperateError, Operator};
 
@@ -96,6 +95,7 @@ pub struct Lanes {
     operation_queues: Vec<Arc<Semaphore>>,
     running: JoinSet<()>,
     loader: JoinSet<()>,
+    batcher: JoinSet<()>,
     gauges: Arc<ParkedGauges>,
 }
 
@@ -108,6 +108,10 @@ impl Lanes {
         reports: &mpsc::UnboundedSender<Report>,
     ) -> Self {
         let capabilities = sink.capabilities();
+        let (batching, batcher) = BatchingSink::new(Arc::clone(sink), Arc::clone(permits));
+        let sink: Arc<dyn Sink> = batching;
+        let mut batcher_task = JoinSet::new();
+        batcher_task.spawn(batcher.run());
         let parked = Arc::new(AtomicU64::new(0));
         let gauges = ParkedGauges::new(settings.lanes.max(1), Arc::clone(&parked));
         let mut running = JoinSet::new();
@@ -116,11 +120,10 @@ impl Lanes {
                 let (inbox, receiver) = mpsc::unbounded_channel();
                 let lane = Lane {
                     index,
-                    sink: Arc::clone(sink),
+                    sink: Arc::clone(&sink),
                     store: Arc::clone(&stores.state),
                     payload: stores.payload.clone(),
                     to_offload: VecDeque::new(),
-                    permits: Arc::clone(permits),
                     capabilities,
                     inbox: receiver,
                     reports: reports.clone(),
@@ -164,6 +167,7 @@ impl Lanes {
             inboxes,
             running,
             loader,
+            batcher: batcher_task,
             gauges,
         }
     }
@@ -202,6 +206,7 @@ impl Lanes {
             operation_queues: _,
             mut running,
             mut loader,
+            mut batcher,
             gauges: _,
         } = self;
         loader.shutdown().await;
@@ -214,6 +219,8 @@ impl Lanes {
         if !exited {
             running.shutdown().await;
         }
+        // The batcher must outlive the lanes, which need its replies during the grace; shutting it down drops the calls in flight so the gate counts them as abandoned before stop returns.
+        batcher.shutdown().await;
         exited
     }
 }
@@ -292,7 +299,6 @@ struct Lane {
     store: Arc<dyn StateStore>,
     payload: Option<Arc<dyn PayloadStore>>,
     to_offload: VecDeque<OrderKeyId>,
-    permits: Arc<Semaphore>,
     capabilities: SinkCapabilities,
     inbox: mpsc::UnboundedReceiver<Inbound>,
     reports: mpsc::UnboundedSender<Report>,
@@ -351,11 +357,8 @@ impl Lane {
                 self.offload().await;
                 continue;
             }
-            let (count, full) = self.plan_batch();
-            let linger = self.linger_deadline();
-            if let Some(deadline) = linger
-                && (full || Instant::now() >= deadline)
-            {
+            let count = self.plan_batch();
+            if count > 0 {
                 self.send_batch(count).await;
                 continue;
             }
@@ -364,7 +367,6 @@ impl Lane {
             }
             let next_retry = self.retries.peek().map(|Reverse((due, _))| *due);
             let until = [
-                linger,
                 next_retry,
                 self.store_wake(),
                 self.stats_wake(),
@@ -535,16 +537,7 @@ impl Lane {
         }
     }
 
-    fn linger_deadline(&self) -> Option<Instant> {
-        let key = self.ready.front()?;
-        let state = self.keys.get(key)?;
-        match &state.stored {
-            Some(_) => Some(Instant::now()),
-            None => Some(state.queue.front()?.arrived + LINGER),
-        }
-    }
-
-    fn plan_batch(&self) -> (usize, bool) {
+    fn plan_batch(&self) -> usize {
         let limits = self.capabilities;
         let mut count = 0;
         let mut bytes = 0_usize;
@@ -556,12 +549,12 @@ impl Lane {
             if count == limits.max_batch_messages
                 || (count > 0 && bytes.saturating_add(size) > limits.max_batch_bytes)
             {
-                return (count, true);
+                break;
             }
             count += 1;
             bytes = bytes.saturating_add(size);
         }
-        (count, count >= limits.max_batch_messages)
+        count
     }
 
     async fn wait(&mut self, until: Option<Instant>) -> bool {
@@ -589,27 +582,8 @@ impl Lane {
                 keys.push(key);
             }
         }
-        let (permits, sink) = (Arc::clone(&self.permits), Arc::clone(&self.sink));
-        let span = tracing::debug_span!(
-            "sink_send",
-            sink = sink.name(),
-            size = u64::try_from(batch.len()).unwrap_or(u64::MAX),
-            delivered = tracing::field::Empty,
-            retryable = tracing::field::Empty,
-            terminal = tracing::field::Empty,
-        );
-        let (mut outcomes, elapsed) = self
-            .publishing(async {
-                match permits.acquire().await {
-                    Ok(_permit) => {
-                        let started = metrics::enabled().then(Instant::now);
-                        let outcomes = sink.send(&batch).instrument(span.clone()).await;
-                        (outcomes, started.map(|started| started.elapsed()))
-                    }
-                    Err(_) => (Vec::new(), None),
-                }
-            })
-            .await;
+        let sink = Arc::clone(&self.sink);
+        let mut outcomes = self.publishing(sink.send(&batch)).await;
         if outcomes.len() != batch.len() {
             tracing::error!(
                 sent = batch.len(),
@@ -620,7 +594,6 @@ impl Lane {
         outcomes.resize_with(keys.len(), || {
             Outcome::Retryable(SinkError("the sink returned no outcome".to_owned()))
         });
-        record_sink_call(&span, &outcomes, elapsed);
         for (key, outcome) in keys.into_iter().zip(&outcomes) {
             self.complete(key, outcome);
         }
