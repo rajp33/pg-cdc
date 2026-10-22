@@ -555,6 +555,30 @@ mod tests {
     }
 
     #[test]
+    fn the_read_gate_reopens_once_a_settle_releases_bytes() {
+        let bound: u64 = 64 * 1024;
+        let mut ack = AckTracker::new(Lsn(0));
+        ack.begin().unwrap();
+        let mut tickets = Vec::new();
+        while ack.has_room(bound) {
+            tickets.push(ack.track(500).unwrap());
+        }
+        ack.settle(delivered(tickets.pop().unwrap())).unwrap();
+        assert!(ack.has_room(bound));
+    }
+
+    #[test]
+    fn one_event_larger_than_the_bound_is_admitted_while_usage_is_below_it() {
+        let bound: u64 = 64 * 1024;
+        let mut ack = AckTracker::new(Lsn(0));
+        ack.begin().unwrap();
+        ack.track(500).unwrap();
+        assert!(ack.has_room(bound));
+        ack.track(2 * bound).unwrap();
+        assert!(!ack.has_room(bound));
+    }
+
+    #[test]
     fn a_settlement_for_an_unknown_or_settled_transaction_is_an_error() {
         let mut source = AckTracker::new(Lsn(0));
         source.begin().unwrap();
