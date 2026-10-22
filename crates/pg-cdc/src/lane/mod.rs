@@ -1,3 +1,4 @@
+mod batch;
 mod loader;
 mod offload;
 mod operate;

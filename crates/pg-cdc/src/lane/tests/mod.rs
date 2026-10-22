@@ -1,3 +1,4 @@
+mod batch;
 mod drain;
 mod gauges;
 mod metrics;
