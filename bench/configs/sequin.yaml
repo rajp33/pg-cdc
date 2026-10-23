@@ -1,0 +1,31 @@
+account:
+  name: bench
+users:
+  - email: bench@example.com
+    password: benchbenchbench
+databases:
+  - name: src
+    hostname: {pg_host}
+    port: 5432
+    database: bench
+    username: postgres
+    password: postgres
+    slot:
+      name: {slot}
+    publication:
+      name: {publication}
+sinks:
+  - name: sns-sink
+    database: src
+    source:
+      include_tables:
+        - public.bench_events
+    batch_size: 10
+    destination:
+      type: sns
+      topic_arn: {topic_arn}
+      region: us-east-1
+      use_emulator: true
+      emulator_base_url: {sns_endpoint}
+      access_key_id: test
+      secret_access_key: test

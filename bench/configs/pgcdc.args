@@ -1,0 +1,17 @@
+listen
+--detector
+wal
+--db
+postgres://postgres:postgres@{pg_host}:5432/bench?sslmode=disable
+--publication
+{publication}
+--persistent-slot
+--slot-name
+{slot}
+--cooperative-checkpoint
+--bus-mode
+reliable
+-a
+webhook
+-u
+{webhook_url}
