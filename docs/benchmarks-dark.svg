@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="230" viewBox="0 0 800 230" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+<title id="t">CDC benchmark: CPU per event, latency and idle memory</title>
+<desc id="d">pg-cdc compared with Sequin, Debezium Server and pgcdc. Lower is better. One machine, SNS on moto. CPU and latency: mean of two runs; memory: median of six. Sequin's second memory segment is its own Postgres and Redis.</desc>
+<text x="136" y="74" font-size="13" text-anchor="end" font-weight="600" fill="#f0efec">pg-cdc</text>
+<text x="136" y="104" font-size="13" text-anchor="end" fill="#f0efec">Sequin</text>
+<text x="136" y="134" font-size="13" text-anchor="end" fill="#f0efec">Debezium Server</text>
+<text x="136" y="164" font-size="13" text-anchor="end" fill="#f0efec">pgcdc (webhook)</text>
+<text x="150" y="22" font-size="13" font-weight="600" fill="#f0efec">CPU per event</text>
+<text x="150" y="40" font-size="12" fill="#9a988f">500k-row backlog drain, µs</text>
+<line x1="150" y1="54" x2="150" y2="176" stroke="#383835" stroke-width="1"/>
+<path d="M150.0,62 h7.3 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-7.3 z" fill="#3987e5"/>
+<text x="167.3" y="74" font-size="12" font-weight="600" fill="#f0efec">22 µs</text>
+<path d="M150.0,92 h100.0 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-100.0 z" fill="#898781"/>
+<text x="260.0" y="104" font-size="12" fill="#c3c2b7">204 µs</text>
+<path d="M150.0,122 h45.5 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-45.5 z" fill="#898781"/>
+<text x="205.5" y="134" font-size="12" fill="#c3c2b7">97 µs</text>
+<path d="M150.0,152 h9.1 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-9.1 z" fill="#898781"/>
+<text x="169.1" y="164" font-size="12" fill="#c3c2b7">26 µs</text>
+<text x="372" y="22" font-size="13" font-weight="600" fill="#f0efec">Latency p50 at 3,000 rows/s</text>
+<text x="372" y="40" font-size="12" fill="#9a988f">commit to SNS acknowledgement</text>
+<line x1="372" y1="54" x2="372" y2="176" stroke="#383835" stroke-width="1"/>
+<path d="M372.0,62 h15.1 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-15.1 z" fill="#3987e5"/>
+<text x="397.1" y="74" font-size="12" font-weight="600" fill="#f0efec">5.9 ms</text>
+<path d="M372.0,92 h86.4 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-86.4 z" fill="#898781"/>
+<text x="468.4" y="104" font-size="12" fill="#c3c2b7">28 ms</text>
+<path d="M372.0,122 h100.0 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-100.0 z" fill="#898781"/>
+<path d="M462.0,140 l6,-20 M467.0,140 l6,-20" stroke="#0d1117" stroke-width="2.5"/>
+<text x="482.0" y="134" font-size="12" fill="#c3c2b7">17 s, fell behind</text>
+<text x="380" y="164" font-size="11.5" fill="#9a988f">not comparable: HTTP sink</text>
+<text x="594" y="22" font-size="13" font-weight="600" fill="#f0efec">Idle memory</text>
+<text x="594" y="40" font-size="12" fill="#9a988f">anonymous RSS, MiB</text>
+<line x1="594" y1="54" x2="594" y2="176" stroke="#383835" stroke-width="1"/>
+<path d="M594.0,62 h2.0 a1.9996823884389392,1.9996823884389392 0 0 1 1.9996823884389392,1.9996823884389392 v12.00063522312212 a1.9996823884389392,1.9996823884389392 0 0 1 -1.9996823884389392,1.9996823884389392 h-2.0 z" fill="#3987e5"/>
+<text x="604.0" y="74" font-size="12" font-weight="600" fill="#f0efec">12 MiB</text>
+<rect x="594.0" y="92" width="85.2" height="16" fill="#898781"/>
+<path d="M681.2,92 h10.5 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-10.5 z" fill="#52514e"/>
+<text x="701.7" y="104" font-size="12" fill="#c3c2b7">262 + 51 MiB</text>
+<path d="M594.0,122 h100.0 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-100.0 z" fill="#898781"/>
+<text x="704.0" y="134" font-size="12" fill="#c3c2b7">320 MiB</text>
+<path d="M594.0,152 h1.6 a1.6268064157535334,1.6268064157535334 0 0 1 1.6268064157535334,1.6268064157535334 v12.746387168492934 a1.6268064157535334,1.6268064157535334 0 0 1 -1.6268064157535334,1.6268064157535334 h-1.6 z" fill="#898781"/>
+<text x="603.3" y="164" font-size="12" fill="#c3c2b7">10 MiB</text>
+<text x="150" y="198" font-size="11.5" fill="#9a988f">Lower is better. One machine, SNS on moto. CPU and latency: mean of two runs; memory: median of six.</text>
+<text x="150" y="215" font-size="11.5" fill="#9a988f">Sequin's second memory segment is its own Postgres and Redis.</text>
+</svg>
