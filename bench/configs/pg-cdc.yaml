@@ -1,0 +1,20 @@
+pipeline: bench
+source:
+  host: {pg_host}
+  database: bench
+  user: postgres
+  credentials:
+    type: password
+  tls:
+    mode: disable
+  slot: {slot}
+  publication: {publication}
+sink:
+  type: sns
+  topic_arn: {topic_arn}
+state_store:
+  type: s3
+  bucket: pgcdc-state
+  prefix: bench/
+admin:
+  listen: 0.0.0.0:9187

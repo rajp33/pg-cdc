@@ -28,6 +28,17 @@ How it compares:
 
 Not yet supported: snapshots and backfills, sinks other than SNS (beyond stdout and discard for testing), transforms, more than one pipeline per process, and admin API authentication. See the [roadmap](docs/roadmap.md).
 
+## Performance
+
+On a local benchmark against Sequin, Debezium Server and [florinutz/pgcdc](https://github.com/florinutz/pgcdc), pg-cdc used the least CPU per event and the least memory of the SNS tools, and had the lowest latency at 3,000 rows/s. Its backlog drain rate tied Sequin's, because both were limited by the SNS emulator.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
+  <img src="docs/benchmarks-light.svg" width="800" alt="Three bar panels. CPU per event during a 500k-row backlog drain: pg-cdc 22 µs, Sequin 204 µs, Debezium Server 97 µs, pgcdc (webhook) 26 µs. Latency p50 at 3,000 rows/s: pg-cdc 5.9 ms, Sequin 28 ms, Debezium Server 17 s because it fell behind; pgcdc not comparable. Idle memory: pg-cdc 12 MiB, Sequin 262 MiB plus 51 MiB for its Postgres and Redis, Debezium Server 320 MiB, pgcdc 10 MiB.">
+</picture>
+
+These come from one machine with SNS emulated by moto, which caps throughput and shapes latency, and pgcdc delivers over HTTP rather than SNS; see [Benchmarks](docs/benchmarks.md) for the method, every result, where pg-cdc ties or loses, and the caveats.
+
 ## Quickstart
 
 Prepare Postgres: `wal_level = logical` (on RDS and Aurora, `rds.logical_replication = 1`), a role with `REPLICATION` (`rds_replication` on RDS), then the publication and slot. pg-cdc never creates or drops either. The [runbook](docs/runbook.md#1-setup) has the grants, IAM policy and S3 setup.
@@ -76,6 +87,7 @@ To try it locally without AWS, run the binary with `sink: { type: stdout }` and 
 - [Runbook](docs/runbook.md): setup, ECS deployment, handover, slot loss, parked events, alerts, the admin API and the container image.
 - [Design](docs/superpowers/specs/2026-10-14-pg-cdc-design.md): architecture, event model, ordering, parking and leadership.
 - [Roadmap](docs/roadmap.md): current limitations and planned work.
+- [Benchmarks](docs/benchmarks.md): pg-cdc against Sequin, Debezium Server and pgcdc, with the harness in [`bench/`](bench).
 - [Engineering](docs/engineering.md): building, testing and contributing.
 
 ## License

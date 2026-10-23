@@ -1,5 +1,5 @@
 include = ["**/*.toml"]
-exclude = ["target/**", "fuzz/target/**"]
+exclude = ["target/**", "fuzz/target/**", "bench/build/**"]
 
 [formatting]
 column_width = 100
