@@ -619,10 +619,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_status_clock_records_each_flushed_status_update() {
+        let since = SystemTime::now();
         let (stream, mut server) = fake::started(fake::config()).await;
         let clock = stream.status_clock();
         let cloned = stream.status_clock();
-        let since = SystemTime::now();
         server.read_status().await;
         assert_fresh(&clock, since);
 
